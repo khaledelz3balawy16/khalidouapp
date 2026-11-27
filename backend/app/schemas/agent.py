@@ -1,0 +1,99 @@
+from pydantic import BaseModel, Field
+from datetime import date, datetime, time
+from uuid import UUID
+
+
+class AgentDeviceInfo(BaseModel):
+    installation_id: str = Field(min_length=8, max_length=255)
+    device_name: str = Field(min_length=1, max_length=255)
+    operating_system: str = Field(min_length=1, max_length=255)
+    agent_version: str = Field(min_length=1, max_length=50)
+    windows_username: str | None = Field(default=None, max_length=255)
+    mac_address: str | None = Field(default=None, max_length=32)
+    timezone: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class AuthenticatedEnrollmentRequest(BaseModel):
+    device: AgentDeviceInfo
+
+
+class RefreshDeviceTokenRequest(BaseModel):
+    rotate_reason: str | None = Field(default=None, max_length=120)
+
+
+class AgentTimeAdjustmentRequestCreate(BaseModel):
+    requested_date: date | None = None
+    request_type: str = Field(
+        default="manual_time",
+        pattern="^(idle_time|early_leave|manual_time|delayed_break)$",
+    )
+    work_session_id: UUID | None = None
+    source_start_at: datetime | None = None
+    source_end_at: datetime | None = None
+    requested_leave_time: time | None = None
+    requested_minutes: int = Field(ge=1, le=720)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class AgentMeetingStart(BaseModel):
+    device_id: UUID
+    idempotency_key: str = Field(min_length=8, max_length=120)
+    title: str = Field(min_length=1, max_length=255)
+    reason: str = Field(min_length=3, max_length=1000)
+    expected_end_at: datetime
+    started_at: datetime | None = None
+    work_session_id: UUID | None = None
+    project_id: UUID | None = None
+    task_id: UUID | None = None
+
+
+class AgentMeetingEnd(BaseModel):
+    device_id: UUID
+    idempotency_key: str = Field(min_length=8, max_length=120)
+    ended_at: datetime | None = None
+
+
+class AgentLeaveRequestCreate(BaseModel):
+    start_date: date
+    end_date: date
+    leave_type: str = Field(default="annual", pattern="^(annual|sick|unpaid)$")
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class AgentTaskCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    project_id: UUID | None = None
+    description: str | None = Field(default=None, max_length=1000)
+    stage: str = Field(default="assigned", pattern="^assigned$")
+    start_date: date | None = None
+    deadline: date | None = None
+    estimated_minutes: int | None = Field(default=None, ge=1, le=100000)
+    priority: str = Field(default="medium", pattern="^(low|medium|high|urgent)$")
+
+
+class AgentTaskUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=1000)
+    stage: str | None = Field(
+        default=None,
+        pattern="^(assigned|in_progress|ready_for_review|blocked)$",
+    )
+    start_date: date | None = None
+    deadline: date | None = None
+    estimated_minutes: int | None = Field(default=None, ge=1, le=100000)
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class AgentChecklistItemCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+
+
+class AgentChecklistItemUpdate(BaseModel):
+    completed: bool | None = None
+
+
+class AgentShiftRescheduleCreate(BaseModel):
+    work_date: date
+    requested_start: time
+    requested_end: time
+    reason: str = Field(min_length=3, max_length=1000)

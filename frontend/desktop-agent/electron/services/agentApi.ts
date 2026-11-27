@@ -1,0 +1,1273 @@
+import { trackingNowDate } from "./trackingClock.js";
+import { observeServerTime } from "./trackingClock.js";
+import axiosLibrary from "axios";
+import type { AxiosError, InternalAxiosRequestConfig } from "axios";
+import FormData from "form-data";
+import http from "node:http";
+import https from "node:https";
+import { randomUUID } from "node:crypto";
+import os from "node:os";
+
+import {
+  getDeviceToken,
+  loadIdentity,
+  saveEnrollmentIdentity,
+} from "./identityStore.js";
+import { isReplayable, isTransientTransportError } from "./httpRetryPolicy.js";
+import type { InputIntegrityObservation } from "./inputIntegrity.js";
+
+// Connecting to the production host sometimes fails outright: a share of new
+// TCP connections from some networks never reach the server (confirmed by
+// packet capture on 2026-11-15 — the SYNs are dropped upstream, not refused).
+// A *fresh* connection almost always succeeds, so instead of letting the
+// default 15s client timeout strand each small call, we abandon a stalled
+// connection in ~6s and retry it on a brand-new socket. Uploads and downloads
+// keep a longer budget (see FAST_TIMEOUT_MS vs the per-call overrides).
+const FAST_TIMEOUT_MS = 6_000;
+const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 350;
+
+// Pooled sockets for the normal path (reused across calls); separate
+// keep-alive-off agents for retries, so a retry always opens a new connection
+// rather than grabbing a half-dead pooled socket.
+const pooledHttp = new http.Agent({ keepAlive: true, maxSockets: 16 });
+const pooledHttps = new https.Agent({ keepAlive: true, maxSockets: 16 });
+const freshHttp = new http.Agent({ keepAlive: false });
+const freshHttps = new https.Agent({ keepAlive: false });
+
+const axios = axiosLibrary.create({
+  timeout: FAST_TIMEOUT_MS,
+  httpAgent: pooledHttp,
+  httpsAgent: pooledHttps,
+});
+
+// Lightweight transport health, surfaced read-only in the diagnostics panel.
+// None of this changes tracking; it only describes connectivity.
+export type NetworkStats = {
+  requests: number;
+  failures: number;
+  retries: number;
+  recoveredByRetry: number;
+  lastSuccessAt: string | null;
+  lastFailureAt: string | null;
+  lastErrorCode: string | null;
+};
+
+const networkStats: NetworkStats = {
+  requests: 0,
+  failures: 0,
+  retries: 0,
+  recoveredByRetry: 0,
+  lastSuccessAt: null,
+  lastFailureAt: null,
+  lastErrorCode: null,
+};
+
+export function getNetworkStats(): NetworkStats {
+  return { ...networkStats };
+}
+
+type RetryableConfig = InternalAxiosRequestConfig & { __retryCount?: number };
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+axios.interceptors.response.use(
+  (response) => {
+    if (String(response.headers["content-type"]).includes("application/json")) {
+      observeServerTime(response.headers.date);
+    }
+    networkStats.requests += 1;
+    networkStats.lastSuccessAt = trackingNowDate().toISOString();
+    const config = response.config as RetryableConfig;
+    if (config.__retryCount) networkStats.recoveredByRetry += 1;
+    return response;
+  },
+  async (error: AxiosError) => {
+    const config = error.config as RetryableConfig | undefined;
+    if (
+      config &&
+      isTransientTransportError(error) &&
+      isReplayable(config) &&
+      (config.__retryCount ?? 0) < MAX_RETRIES
+    ) {
+      config.__retryCount = (config.__retryCount ?? 0) + 1;
+      networkStats.retries += 1;
+      // Force a new TCP connection for the retry.
+      config.httpAgent = freshHttp;
+      config.httpsAgent = freshHttps;
+      await delay(RETRY_DELAY_MS);
+      return axios(config);
+    }
+    networkStats.requests += 1;
+    networkStats.failures += 1;
+    networkStats.lastFailureAt = trackingNowDate().toISOString();
+    networkStats.lastErrorCode = error.code ?? error.message ?? "unknown";
+    return Promise.reject(error);
+  },
+);
+
+type ApiSuccess<T> = {
+  success: true;
+  data: T;
+  meta: Record<string, unknown>;
+};
+
+type EnrollmentResponse = {
+  company_id: string;
+  employee: {
+    id: string;
+    name: string;
+    email: string;
+    timezone: string;
+  };
+  device: {
+    id: string;
+    name: string;
+    installation_id: string;
+    status: string;
+    timezone: string | null;
+    country_code: string | null;
+    timezone_source: string | null;
+  };
+  device_token: string;
+  token_type: "bearer";
+  settings: Record<string, unknown>;
+};
+
+type EmployeeLoginResponse = {
+  access_token: string;
+  token_type: "bearer";
+  expires_in_seconds: number;
+};
+
+export type WorkSession = {
+  id: string;
+  company_id: string;
+  employee_id: string;
+  device_id: string;
+  team_id: string | null;
+  project_id: string | null;
+  task_id: string | null;
+  timezone: string | null;
+  started_at: string;
+  ended_at: string | null;
+  status: "active" | "idle" | "locked" | "sleeping" | "offline" | "ended";
+  active_seconds: number;
+  idle_seconds: number;
+  normal_seconds?: number;
+  extra_seconds?: number;
+  paid_pause_seconds?: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type PauseState = {
+  remaining_seconds: number;
+  active_pause: {
+    id: string;
+    scheduled_end_at: string;
+    requested_seconds: number;
+    remaining_seconds: number;
+    status: string;
+  } | null;
+};
+
+export type WorkdayState = {
+  work_date?: string;
+  required_normal_seconds: number;
+  normal_seconds: number;
+  normal_remaining_seconds: number;
+  extra_seconds: number;
+  overtime_enabled: boolean;
+  extra_time_status: "none" | "pending_overtime" | "recorded_not_counted";
+};
+
+export type SessionPayload = {
+  session: WorkSession;
+  workday?: WorkdayState | null;
+  pause?: PauseState | null;
+};
+
+export type AgentTask = {
+  id: string;
+  name: string;
+  description?: string | null;
+  stage:
+    | "new_requests"
+    | "backlog"
+    | "assigned"
+    | "in_progress"
+    | "ready_for_review"
+    | "completed"
+    | "blocked"
+    | "rejected"
+    | "cancelled";
+  can_update_stage: boolean;
+  project_id: string;
+  project_name: string;
+  team_id: string;
+  team_name: string;
+  review_note?: string | null;
+  completion_note?: string | null;
+  checklist: Array<{
+    id: string;
+    title: string;
+    completed: boolean;
+    position: number;
+    assignee_employee_id: string | null;
+  }>;
+  active_seconds: number;
+  idle_seconds: number;
+  tracked_seconds: number;
+  priority?: "low" | "medium" | "high" | "urgent" | null;
+  deadline?: string | null;
+};
+
+export type AgentRecentScreenshot = {
+  id: string;
+  captured_at: string;
+  mime_type: string;
+  display_name: string | null;
+};
+
+export type TrackingConfig = {
+  employee?: { id: string; name: string; email: string };
+  screenshot_enabled: boolean;
+  screenshot_interval_minutes: number;
+  screenshots_per_interval: number;
+  idle_threshold_minutes: number;
+  capture_during_idle: boolean;
+  offline_threshold_minutes: number;
+  screenshot_retention_days: number;
+  request_policy?: RequestPolicy;
+};
+
+export type RequestPolicy = {
+  timezone: string;
+  shift_start: string | null;
+  shift_end: string | null;
+  working_days: number[];
+  break_rules?: Array<{
+    name: string;
+    minutes: number;
+    paid: boolean;
+    start_time?: string | null;
+    end_time?: string | null;
+  }>;
+  approved_leave_today?: boolean;
+  approved_early_leave_from?: string | null;
+  // Flexible staff owe required_daily_minutes anywhere between shift_start and
+  // shift_end (their allowed window) and take break_bank_minutes of paid rest
+  // whenever they like. Older servers omit these fields (fixed shift).
+  schedule_type?: "fixed" | "flexible";
+  required_daily_minutes?: number;
+  break_bank_minutes?: number;
+  weekly_early_leave_minutes: number;
+  weekly_early_leave_used_minutes: number;
+  weekly_early_leave_remaining_minutes: number;
+};
+
+export type TimeAdjustmentRequest = {
+  id: string;
+  request_type: "idle_time" | "early_leave" | "manual_time" | "delayed_break";
+  requested_date: string;
+  source_start_at: string | null;
+  source_end_at: string | null;
+  work_session_id: string | null;
+  requested_minutes: number;
+  approved_minutes: number | null;
+  reason: string;
+  status: "pending" | "approved" | "rejected";
+  reviewed_at: string | null;
+  admin_note: string | null;
+  created_at: string;
+};
+
+export type LeaveRequest = {
+  id: string;
+  start_date: string;
+  end_date: string;
+  requested_days: number;
+  leave_type: "annual" | "sick" | "unpaid";
+  reason?: string | null;
+  status: "pending" | "approved" | "rejected";
+  reviewed_by_name?: string | null;
+  reviewed_at?: string | null;
+  created_at?: string;
+};
+
+export type LeaveBalance = {
+  year: number;
+  credit_days: number;
+  used_days: number;
+  pending_days: number;
+  remaining_days: number;
+};
+
+export type LeaveRequestsPayload = {
+  balance: LeaveBalance;
+  requests: LeaveRequest[];
+};
+
+export type AgentPeriodSummary = {
+  active_seconds: number;
+  tracked_active_seconds: number;
+  idle_seconds: number;
+  eligible_idle_seconds?: number;
+  tracked_seconds: number;
+  adjustment_seconds: number;
+  manual_approved_seconds: number;
+  manual_pending_seconds: number;
+  manual_rejected_seconds: number;
+  deducted_seconds: number;
+  screenshot_count: number;
+  points: number;
+};
+
+export type AgentWorkdayTimeline = {
+  date: string;
+  timezone: string;
+  first_started_at: string | null;
+  last_ended_at: string | null;
+  last_activity_at: string | null;
+  is_running: boolean;
+  continued_from_previous_day?: boolean;
+  continued_session_started_at?: string | null;
+  worked_seconds: number;
+  idle_seconds: number;
+  locked_seconds: number;
+  sleeping_seconds: number;
+  approved_leave?: boolean;
+  leave_seconds?: number;
+  intervals: Array<{
+    type: "worked" | "idle" | "locked" | "sleeping" | "break";
+    source?: "activity" | "manual_pause" | "scheduled_break";
+    started_at: string;
+    ended_at: string | null;
+    duration_seconds: number;
+    session_id: string | null;
+    project_name: string | null;
+    task_name: string | null;
+    is_current: boolean;
+    work_category?: "extra" | "break_work" | null;
+    break_paid?: boolean | null;
+    // Idle paid from the employee's saved break minutes.
+    saved_break_cover?: boolean;
+  }>;
+};
+
+export type AgentIdleRequestPeriod = {
+  work_session_id: string;
+  started_at: string;
+  ended_at: string;
+  duration_seconds: number;
+  available_seconds: number;
+  project_name: string | null;
+  task_name: string | null;
+};
+
+export type AgentBreakBank = {
+  policy_active: boolean;
+  worked_break_seconds: number;
+  earned_seconds: number;
+  approved_seconds: number;
+  reserved_seconds: number;
+  remaining_seconds: number;
+  paid_late_allowance_seconds: number;
+};
+
+export type AgentFlexibleDay = {
+  required_seconds: number;
+  normal_seconds: number;
+  paid_break_seconds: number;
+  payable_seconds: number;
+  extra_seconds: number;
+  break_bank_seconds: number;
+  break_bank_remaining_seconds: number;
+  target_reached_at: string | null;
+  window_start: string;
+  window_end: string;
+};
+
+export type AgentAttendanceDay = {
+  date: string;
+  start_time: string | null;
+  end_time: string | null;
+  session_count: number;
+  active_seconds: number;
+  idle_seconds: number;
+  payable_seconds: number;
+  leave_status: string | null;
+  status: string | null;
+  raw_late_seconds: number;
+  deductible_late_seconds: number;
+  sign_out_at: string | null;
+};
+
+export type AgentAttendanceWeek = {
+  week_start: string;
+  week_end: string;
+  month_start: string;
+  month_end: string;
+  late_grace_minutes: number;
+  working_days: number[] | null;
+  enrolled_at: string | null;
+  days: AgentAttendanceDay[];
+};
+
+export type AgentSummary = {
+  employee: { id: string; name: string; avatar_url: string | null };
+  daily_target_seconds: number;
+  daily_target_progress_percent: number;
+  activity_percent: number;
+  today: AgentPeriodSummary;
+  today_timeline: AgentWorkdayTimeline;
+  idle_request_periods?: AgentIdleRequestPeriod[];
+  break_bank?: AgentBreakBank;
+  flexible_day?: AgentFlexibleDay | null;
+  week: AgentPeriodSummary;
+  month: AgentPeriodSummary;
+  /** Missing on servers older than 1.1.109. */
+  attendance_week?: AgentAttendanceWeek;
+};
+
+export function getApiBaseUrl() {
+  return process.env.VITE_API_BASE_URL ?? "http://localhost:8000/api/v1";
+}
+
+export function getLocalNetworkInfo() {
+  const interfaces = os.networkInterfaces();
+  const entries = Object.values(interfaces).flatMap((items) => items ?? []);
+  const macAddress = entries
+    .map((entry) => entry.mac?.toUpperCase() ?? "")
+    .find((mac) => mac && mac !== "00:00:00:00:00:00") ?? null;
+  const ipAddress =
+    entries.find((entry) => !entry.internal && entry.family === "IPv4")?.address ??
+    entries.find((entry) => !entry.internal)?.address ??
+    null;
+  return { macAddress, ipAddress };
+}
+
+function getDeviceInfo(agentVersion: string) {
+  const identity = loadIdentity();
+  const { macAddress } = getLocalNetworkInfo();
+  return {
+    installation_id: identity.installationId,
+    device_name: os.hostname(),
+    operating_system: `Windows ${os.release()}`,
+    agent_version: agentVersion,
+    windows_username: os.userInfo().username,
+    mac_address: macAddress,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+  };
+}
+
+function getAuthHeaders() {
+  const token = getDeviceToken();
+  if (!token) {
+    throw new Error("Device is not enrolled.");
+  }
+  return {
+    Authorization: `Bearer ${token}`,
+  };
+}
+
+/**
+ * Records that the on-device diagnostics panel was opened, so the action lands
+ * in the company audit log against this device. Transparent by design: this is
+ * a support tool, not a covert channel. Best-effort — a diagnostics session is
+ * still useful offline, so a failure here is swallowed by the caller.
+ */
+export async function recordDiagnosticsOpen(details: {
+  appVersion: string;
+  network: NetworkStats;
+  unsynced: Record<string, number>;
+}) {
+  const response = await axios.post<ApiSuccess<Record<string, unknown>>>(
+    `${getApiBaseUrl()}/agent/diagnostics/open`,
+    {
+      app_version: details.appVersion,
+      network: details.network,
+      unsynced: details.unsynced,
+    },
+    { headers: getAuthHeaders(), timeout: 10_000 },
+  );
+  return response.data.data;
+}
+
+/**
+ * Authenticates the employee, immediately exchanges that short-lived portal
+ * session for a device token, and persists only the encrypted device token.
+ * The password and employee access token never leave the Electron main process
+ * after this function returns.
+ *
+ * POST /agent/enroll-authenticated validates the employee bearer token and
+ * returns a device-scoped token for subsequent tracking requests.
+ */
+export async function enrollDeviceWithCredentials(
+  email: string,
+  password: string,
+  agentVersion: string,
+  // Ownership predicate captured by the caller when the request began. It is
+  // re-evaluated immediately BEFORE credentials are persisted so an enrollment
+  // that a later sign-out / re-enrollment invalidated cannot write identity to
+  // disk (H1). A network round-trip elapses inside this function, during which a
+  // logout can start and finish; a check only after this function returns is too
+  // late because persistence has already happened.
+  ensureStillAuthorized: () => boolean = () => true,
+) {
+  // Sign-in and enrollment are one-off and non-idempotent, so they are not
+  // auto-retried; give them a longer budget than a routine call instead.
+  const loginResponse = await axios.post<ApiSuccess<EmployeeLoginResponse>>(
+    `${getApiBaseUrl()}/employee-auth/login`,
+    {
+      email: email.trim(),
+      password,
+    },
+    { timeout: 20_000 },
+  );
+
+  const employeeAccessToken = loginResponse.data.data.access_token;
+  const response = await axios.post<ApiSuccess<EnrollmentResponse>>(
+    `${getApiBaseUrl()}/agent/enroll-authenticated`,
+    { device: getDeviceInfo(agentVersion) },
+    {
+      headers: {
+        Authorization: `Bearer ${employeeAccessToken}`,
+      },
+      timeout: 20_000,
+    },
+  );
+
+  if (!ensureStillAuthorized()) {
+    // A superseding sign-out / enrollment invalidated this request while its
+    // HTTP calls were in flight. Do not persist; report an explicit, benign
+    // cancellation the caller can distinguish from a genuine enrollment error.
+    const superseded = new Error(
+      "Enrollment was superseded by a sign-out or a newer enrollment.",
+    );
+    (superseded as { code?: string }).code = "ENROLLMENT_SUPERSEDED";
+    throw superseded;
+  }
+
+  const data = response.data.data;
+  return saveEnrollmentIdentity({
+    companyId: data.company_id,
+    employeeId: data.employee.id,
+    employeeName: data.employee.name,
+    employeeEmail: data.employee.email,
+    deviceId: data.device.id,
+    deviceName: data.device.name,
+    deviceToken: data.device_token,
+  });
+}
+
+export async function getCurrentSession() {
+  const response = await axios.get<
+    ApiSuccess<{
+      session: WorkSession | null;
+      workday?: WorkdayState | null;
+      pause?: PauseState | null;
+    }>
+  >(`${getApiBaseUrl()}/agent/sessions/current`, { headers: getAuthHeaders() });
+  return response.data.data;
+}
+
+export async function getAgentTodaySummary() {
+  const response = await axios.get<ApiSuccess<{ active_seconds: number }>>(
+    `${getApiBaseUrl()}/agent/time-summary/today`,
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function getAgentSummary() {
+  const response = await axios.get<ApiSuccess<AgentSummary>>(
+    `${getApiBaseUrl()}/agent/summary`,
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function getAgentConfig() {
+  const response = await axios.get<ApiSuccess<TrackingConfig>>(
+    `${getApiBaseUrl()}/agent/config`,
+    {
+      headers: getAuthHeaders(),
+    },
+  );
+  return response.data.data;
+}
+
+export async function listAgentTasks() {
+  const response = await axios.get<ApiSuccess<AgentTask[]>>(
+    `${getApiBaseUrl()}/agent/tasks`,
+    {
+      headers: getAuthHeaders(),
+    },
+  );
+  return response.data.data;
+}
+
+export async function listAgentRecentTasks(limit = 3) {
+  const response = await axios.get<ApiSuccess<AgentTask[]>>(
+    `${getApiBaseUrl()}/agent/tasks/recent`,
+    {
+      headers: getAuthHeaders(),
+      params: { limit: Math.max(1, Math.min(8, limit)) },
+    },
+  );
+  return response.data.data;
+}
+
+export async function listAgentRecentScreenshots(limit = 4) {
+  const response = await axios.get<ApiSuccess<AgentRecentScreenshot[]>>(
+    `${getApiBaseUrl()}/agent/screenshots/recent`,
+    {
+      headers: getAuthHeaders(),
+      params: { limit: Math.max(1, Math.min(4, limit)) },
+    },
+  );
+  return response.data.data;
+}
+
+export async function downloadAgentScreenshot(screenshotId: string) {
+  const response = await axios.get<ArrayBuffer>(
+    `${getApiBaseUrl()}/agent/screenshots/${screenshotId}/preview`,
+    {
+      headers: getAuthHeaders(),
+      responseType: "arraybuffer",
+      timeout: 20_000,
+    },
+  );
+  return {
+    content: Buffer.from(response.data),
+    mimeType: response.headers["content-type"] ?? "image/jpeg",
+  };
+}
+
+export type AgentProject = {
+  id: string;
+  name: string;
+  team_id: string;
+  team_name: string;
+};
+
+export async function listAgentProjects() {
+  const response = await axios.get<ApiSuccess<AgentProject[]>>(
+    `${getApiBaseUrl()}/agent/projects`,
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function createAgentTask(options: {
+  name: string;
+  projectId?: string;
+  description?: string;
+  stage?: "assigned";
+  startDate?: string;
+  deadline?: string;
+  estimatedMinutes?: number;
+  priority?: "low" | "medium" | "high" | "urgent";
+}) {
+  const response = await axios.post<ApiSuccess<AgentTask>>(
+    `${getApiBaseUrl()}/agent/tasks`,
+    {
+      name: options.name,
+      project_id: options.projectId ?? null,
+      description: options.description ?? null,
+      stage: "assigned",
+      start_date: options.startDate || null,
+      deadline: options.deadline || null,
+      estimated_minutes: options.estimatedMinutes ?? null,
+      priority: options.priority ?? "medium",
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function updateAgentTaskStage(
+  taskId: string,
+  stage: string,
+  note?: string,
+) {
+  const response = await axios.patch<ApiSuccess<AgentTask>>(
+    `${getApiBaseUrl()}/agent/tasks/${taskId}`,
+    { stage, note: note ?? null },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function createAgentTaskChecklistItem(
+  taskId: string,
+  title: string,
+) {
+  const response = await axios.post<ApiSuccess<AgentTask>>(
+    `${getApiBaseUrl()}/agent/tasks/${taskId}/checklist`,
+    { title },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function updateAgentTaskChecklistItem(
+  taskId: string,
+  itemId: string,
+  completed: boolean,
+) {
+  const response = await axios.patch<ApiSuccess<AgentTask>>(
+    `${getApiBaseUrl()}/agent/tasks/${taskId}/checklist/${itemId}`,
+    { completed },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function deleteAgentTaskChecklistItem(
+  taskId: string,
+  itemId: string,
+) {
+  const response = await axios.delete<ApiSuccess<{ deleted: boolean }>>(
+    `${getApiBaseUrl()}/agent/tasks/${taskId}/checklist/${itemId}`,
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function recoverClosedSession(options: {
+  offlineRecoveryId: string;
+  startedAt: string;
+  endedAt: string;
+  activeSeconds: number;
+  idleSeconds: number;
+  agentVersion: string;
+  events: Array<{
+    event_id: string;
+    event_type: string;
+    event_timestamp: string;
+  }>;
+}) {
+  const response = await axios.post<ApiSuccess<{ session_id: string; duplicate: boolean }>>(
+    `${getApiBaseUrl()}/agent/sessions/recover-closed`,
+    {
+      offline_recovery_id: options.offlineRecoveryId,
+      started_at: options.startedAt,
+      ended_at: options.endedAt,
+      active_seconds: options.activeSeconds,
+      idle_seconds: options.idleSeconds,
+      agent_version: options.agentVersion,
+      events: options.events,
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function startSession(options: {
+  startedAt?: string;
+  offlineRecovery?: boolean;
+  offlineRecoveryId?: string;
+} = {}) {
+  const response = await axios.post<
+    ApiSuccess<SessionPayload & { created: boolean }>
+  >(
+    `${getApiBaseUrl()}/agent/sessions/start`,
+    {
+      started_at: options.startedAt ?? trackingNowDate().toISOString(),
+      offline_recovery: options.offlineRecovery ?? false,
+      offline_recovery_id: options.offlineRecoveryId ?? null,
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function endSession(options: {
+  sessionId: string;
+  activeSeconds: number;
+  idleSeconds: number;
+  reason: string;
+  endedAt?: string;
+  eventId?: string;
+  // Operation-bound credential: when closing a session that belongs to a specific
+  // enrollment (e.g. cleaning up an orphaned stale-startup session under its
+  // ORIGINAL identity), pass the token captured when that operation began. Using
+  // it instead of the global current token prevents A's cleanup from authenticating
+  // as a newer identity B — the server rejects a foreign device (403/404) or a
+  // revoked token (401), which the caller handles distinctly (Gap 3).
+  authToken?: string;
+}) {
+  const headers = options.authToken
+    ? { Authorization: `Bearer ${options.authToken}` }
+    : getAuthHeaders();
+  const response = await axios.post<ApiSuccess<SessionPayload>>(
+    `${getApiBaseUrl()}/agent/sessions/${options.sessionId}/end`,
+    {
+      event_id: options.eventId ?? randomUUID(),
+      ended_at: options.endedAt ?? trackingNowDate().toISOString(),
+      active_seconds: options.activeSeconds,
+      idle_seconds: options.idleSeconds,
+      reason: options.reason,
+    },
+    { headers },
+  );
+  return response.data.data;
+}
+
+export async function startPaidPause(options: {
+  sessionId: string;
+  requestedMinutes: number;
+  reason?: string;
+  idempotencyKey?: string;
+}) {
+  const response = await axios.post<
+    ApiSuccess<SessionPayload & { pause: PauseState }>
+  >(
+    `${getApiBaseUrl()}/agent/sessions/${options.sessionId}/pause`,
+    {
+      requested_minutes: options.requestedMinutes,
+      reason: options.reason ?? null,
+      idempotency_key: options.idempotencyKey ?? randomUUID(),
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function resumePaidPause(sessionId: string) {
+  const response = await axios.post<
+    ApiSuccess<SessionPayload & { pause: PauseState }>
+  >(
+    `${getApiBaseUrl()}/agent/sessions/${sessionId}/resume`,
+    {},
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function updateSessionTask(
+  sessionId: string,
+  taskId: string | null,
+) {
+  const response = await axios.post<ApiSuccess<SessionPayload>>(
+    `${getApiBaseUrl()}/agent/sessions/${sessionId}/task`,
+    { task_id: taskId },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function sendHeartbeat(options: {
+  sessionId: string;
+  eventId: string;
+  status: "active" | "idle" | "locked" | "offline" | "sleeping";
+  idleSeconds: number;
+  activeSeconds: number;
+  counterDate: string;
+  agentVersion: string;
+  timestamp?: string;
+  inputIntegrity?: InputIntegrityObservation;
+}) {
+  const response = await axios.post<
+    ApiSuccess<
+      SessionPayload & {
+        duplicate: boolean;
+        update_required?: boolean;
+        ignore_reason?: string;
+        moved_to_device_name?: string;
+      }
+    >
+  >(
+    `${getApiBaseUrl()}/agent/sessions/${options.sessionId}/heartbeat`,
+    {
+      event_id: options.eventId,
+      timestamp: options.timestamp ?? trackingNowDate().toISOString(),
+      status: options.status,
+      idle_seconds: options.idleSeconds,
+      active_seconds: options.activeSeconds,
+      counter_date: options.counterDate,
+      agent_version: options.agentVersion,
+      mac_address: getDeviceInfo(options.agentVersion).mac_address,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+      input_integrity: options.inputIntegrity ?? null,
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function sendActivityEvent(options: {
+  sessionId: string;
+  eventId: string;
+  eventType: string;
+  eventTimestamp?: string;
+  payload?: Record<string, unknown>;
+}) {
+  const response = await axios.post<
+    ApiSuccess<SessionPayload & { duplicate: boolean }>
+  >(
+    `${getApiBaseUrl()}/agent/sessions/${options.sessionId}/events`,
+    {
+      event_id: options.eventId,
+      event_type: options.eventType,
+      event_timestamp: options.eventTimestamp ?? trackingNowDate().toISOString(),
+      payload: options.payload ?? {},
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function sendQueuedRequest(
+  method: string,
+  endpoint: string,
+  payload: Record<string, unknown>,
+) {
+  const response = await axios.request<ApiSuccess<Record<string, unknown>>>({
+    method,
+    url: `${getApiBaseUrl()}${endpoint}`,
+    data: payload,
+    headers: getAuthHeaders(),
+  });
+  return response.data.data;
+}
+
+export type ScreenshotMetadata = {
+  screenshotId: string;
+  sessionId?: string | null;
+  // The local (offline) tracking session this capture belonged to, when it was
+  // taken before a server session existed. Client-only: it is resolved to the
+  // recovered server session id at upload time and is never sent to the backend.
+  localSessionId?: string | null;
+  capturedAt: string;
+  width: number;
+  height: number;
+  fileSize: number;
+  mimeType: "image/jpeg" | "image/webp";
+  checksum: string;
+  displayId?: string;
+  displayName?: string;
+  displayCount?: number;
+  powerSource?: "ac" | "battery" | "unknown";
+  trackingStatus?: string | null;
+};
+
+export async function initiateScreenshot(metadata: ScreenshotMetadata) {
+  const response = await axios.post<
+    ApiSuccess<{ upload_url: string; duplicate: boolean }>
+  >(
+    `${getApiBaseUrl()}/agent/screenshots/initiate`,
+    {
+      screenshot_id: metadata.screenshotId,
+      session_id: metadata.sessionId,
+      captured_at: metadata.capturedAt,
+      width: metadata.width,
+      height: metadata.height,
+      file_size: metadata.fileSize,
+      mime_type: metadata.mimeType,
+      checksum: metadata.checksum,
+      display_id: metadata.displayId,
+      display_name: metadata.displayName,
+      display_count: metadata.displayCount ?? 1,
+      power_source: metadata.powerSource ?? "unknown",
+      tracking_status: metadata.trackingStatus,
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function reportScreenshotSkip(options: {
+  eventId: string;
+  sessionId?: string | null;
+  occurredAt: string;
+  reason: string;
+  powerSource: "ac" | "battery" | "unknown";
+  trackingStatus?: string | null;
+}) {
+  const response = await axios.post<ApiSuccess<Record<string, unknown>>>(
+    `${getApiBaseUrl()}/agent/screenshots/skips`,
+    {
+      event_id: options.eventId,
+      session_id: options.sessionId,
+      occurred_at: options.occurredAt,
+      reason: options.reason,
+      power_source: options.powerSource,
+      tracking_status: options.trackingStatus,
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function uploadScreenshot(
+  screenshotId: string,
+  content: Buffer,
+  mimeType: "image/jpeg" | "image/webp",
+) {
+  const form = new FormData();
+  form.append("file", content, {
+    filename: `${screenshotId}.jpg`,
+    contentType: mimeType,
+    knownLength: content.length,
+  });
+
+  const response = await axios.post<ApiSuccess<Record<string, unknown>>>(
+    `${getApiBaseUrl()}/agent/screenshots/${screenshotId}/upload`,
+    form,
+    {
+      headers: {
+        ...getAuthHeaders(),
+        ...form.getHeaders(),
+      },
+      maxBodyLength: Infinity,
+      timeout: 30_000,
+    },
+  );
+  return response.data.data;
+}
+
+export async function completeScreenshot(options: {
+  screenshotId: string;
+  checksum: string;
+  fileSize: number;
+}) {
+  const response = await axios.post<ApiSuccess<Record<string, unknown>>>(
+    `${getApiBaseUrl()}/agent/screenshots/${options.screenshotId}/complete`,
+    {
+      checksum: options.checksum,
+      file_size: options.fileSize,
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function listTimeAdjustmentRequests() {
+  const response = await axios.get<ApiSuccess<TimeAdjustmentRequest[]>>(
+    `${getApiBaseUrl()}/agent/time-adjustment-requests`,
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function createEmployeePortalHandoff() {
+  const response = await axios.post<
+    ApiSuccess<{ handoff_token: string; expires_in_seconds: number }>
+  >(
+    `${getApiBaseUrl()}/agent/employee-portal-handoff`,
+    {},
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function createTimeAdjustmentRequest(options: {
+  requestedMinutes: number;
+  reason: string;
+  requestType?: "idle_time" | "early_leave" | "manual_time" | "delayed_break";
+  requestedDate?: string;
+  workSessionId?: string;
+  sourceStartAt?: string;
+  sourceEndAt?: string;
+  requestedLeaveTime?: string;
+}) {
+  const response = await axios.post<ApiSuccess<TimeAdjustmentRequest>>(
+    `${getApiBaseUrl()}/agent/time-adjustment-requests`,
+    {
+      requested_minutes: options.requestedMinutes,
+      reason: options.reason,
+      request_type: options.requestType,
+      requested_date: options.requestedDate,
+      work_session_id: options.workSessionId,
+      source_start_at: options.sourceStartAt,
+      source_end_at: options.sourceEndAt,
+      requested_leave_time: options.requestedLeaveTime,
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export type AgentMeeting = {
+  id: string;
+  idempotency_key?: string | null;
+  title: string;
+  reason: string;
+  started_at: string;
+  expected_end_at: string;
+  ended_at: string | null;
+  lifecycle_state: "active" | "ended";
+  status: "pending" | "approved" | "rejected";
+  recorded_seconds: number;
+  approved_seconds: number | null;
+};
+
+export async function listMeetings() {
+  const response = await axios.get<ApiSuccess<AgentMeeting[]>>(
+    `${getApiBaseUrl()}/agent/meetings`,
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+// Start/End are delivered directly (not via the generic outbox) so the desktop
+// can capture the server's meeting record and confirm acceptance before showing
+// "synced"/"Pending review". Both are idempotent by idempotency_key on the
+// backend, so a retry or replay returns the same meeting.
+export async function startMeeting(payload: {
+  deviceId: string;
+  idempotencyKey: string;
+  title: string;
+  reason: string;
+  startedAt: string;
+  expectedEndAt: string;
+  workSessionId?: string | null;
+  projectId?: string | null;
+  taskId?: string | null;
+}) {
+  const response = await axios.post<ApiSuccess<AgentMeeting>>(
+    `${getApiBaseUrl()}/agent/meetings`,
+    {
+      device_id: payload.deviceId,
+      idempotency_key: payload.idempotencyKey,
+      title: payload.title,
+      reason: payload.reason,
+      started_at: payload.startedAt,
+      expected_end_at: payload.expectedEndAt,
+      work_session_id: payload.workSessionId ?? undefined,
+      project_id: payload.projectId ?? undefined,
+      task_id: payload.taskId ?? undefined,
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function endMeeting(payload: {
+  deviceId: string;
+  idempotencyKey: string;
+  endedAt: string;
+}) {
+  const response = await axios.post<ApiSuccess<AgentMeeting>>(
+    `${getApiBaseUrl()}/agent/meetings/end`,
+    {
+      device_id: payload.deviceId,
+      idempotency_key: payload.idempotencyKey,
+      ended_at: payload.endedAt,
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function listLeaveRequests() {
+  const response = await axios.get<ApiSuccess<LeaveRequestsPayload>>(
+    `${getApiBaseUrl()}/agent/leave-requests`,
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function createLeaveRequest(options: {
+  startDate: string;
+  endDate: string;
+  leaveType: "annual" | "sick" | "unpaid";
+  reason?: string;
+}) {
+  const response = await axios.post<ApiSuccess<LeaveRequest>>(
+    `${getApiBaseUrl()}/agent/leave-requests`,
+    {
+      start_date: options.startDate,
+      end_date: options.endDate,
+      leave_type: options.leaveType,
+      reason: options.reason,
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export type ShiftRescheduleRequest = {
+  id: string;
+  employee_id: string;
+  work_date: string;
+  requested_start: string;
+  requested_end: string;
+  original_start: string;
+  original_end: string;
+  duration_minutes: number;
+  reason: string;
+  status: "pending" | "approved" | "rejected" | "cancelled" | "expired";
+  source: "employee" | "admin";
+  reviewed_by_name: string | null;
+  reviewed_at: string | null;
+  review_reason: string | null;
+  created_at: string | null;
+};
+
+export type ShiftReschedulesPayload = {
+  policy: {
+    timezone: string;
+    notice_days: number;
+    earliest_date: string;
+    working_days: number[];
+    weekly_off_days: number[];
+  };
+  requests: ShiftRescheduleRequest[];
+};
+
+export type ShiftRescheduleDay = {
+  date: string;
+  scheduled_day: boolean;
+  shift_start: string | null;
+  shift_end: string | null;
+  shift_minutes: number;
+};
+
+export async function listShiftReschedules() {
+  const response = await axios.get<ApiSuccess<ShiftReschedulesPayload>>(
+    `${getApiBaseUrl()}/agent/shift-reschedules`,
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function getShiftRescheduleDay(workDate: string) {
+  const response = await axios.get<ApiSuccess<ShiftRescheduleDay>>(
+    `${getApiBaseUrl()}/agent/shift-reschedules/day`,
+    { headers: getAuthHeaders(), params: { date: workDate } },
+  );
+  return response.data.data;
+}
+
+export async function createShiftReschedule(options: {
+  workDate: string;
+  requestedStart: string;
+  requestedEnd: string;
+  reason: string;
+}) {
+  const response = await axios.post<ApiSuccess<ShiftRescheduleRequest>>(
+    `${getApiBaseUrl()}/agent/shift-reschedules`,
+    {
+      work_date: options.workDate,
+      requested_start: options.requestedStart,
+      requested_end: options.requestedEnd,
+      reason: options.reason,
+    },
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}
+
+export async function cancelShiftReschedule(requestId: string) {
+  const response = await axios.post<ApiSuccess<ShiftRescheduleRequest>>(
+    `${getApiBaseUrl()}/agent/shift-reschedules/${encodeURIComponent(requestId)}/cancel`,
+    {},
+    { headers: getAuthHeaders() },
+  );
+  return response.data.data;
+}

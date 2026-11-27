@@ -1,0 +1,5530 @@
+import { trackingNowMs, trackingNowDate } from "../electron/services/trackingClock";
+import { observeServerTime } from "../electron/services/trackingClock";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
+import Swal, { type SweetAlertResult } from "sweetalert2";
+import type {
+  AgentProject,
+  AgentStatus,
+  AgentTask,
+  AttendanceDay,
+  IdleAlert,
+  MeetingSummary,
+  RecentScreenshot,
+  WorkdayTimeline,
+} from "./types/electron";
+import { Backdrop } from "./ui/shell/Backdrop";
+import { DiagnosticsPanel } from "./ui/shell/DiagnosticsPanel";
+import { StatusBar } from "./ui/shell/StatusBar";
+import { ToastStack } from "./ui/shell/ToastStack";
+import { useToasts } from "./ui/shell/toastQueue";
+import { TopBar, type ShellTone } from "./ui/shell/TopBar";
+import { SKINS, useSkin, type Skin } from "./ui/theme/skin";
+import { TIMER_STYLES, useTimerStyle, type TimerStyle } from "./ui/tracker/timerStyle";
+import {
+  BreakdownCard,
+  HeroCard,
+  QuickBar,
+  RecentTasksCard,
+  ShotCard,
+  StatTiles,
+  TimelineCard,
+  WorkdayStrip,
+  type HeroMode,
+  type TimelineRow,
+} from "./ui/tracker/TrackerCards";
+import {
+  TIMELINE_LABELS,
+  timelineIntervalsForDisplay,
+  timelineIntervalPresentation,
+  timelineDisplayType,
+  workdayTimingState,
+} from "./timelinePresentation";
+import {
+  idleRequestKeyForIdleStart,
+  requestableIdleMinutes,
+  totalRequestableIdleMinutes,
+} from "./idleRequests";
+import { OperationTimeoutError, withOperationTimeout } from "./promiseTimeout";
+import { toValidDate } from "./safeDate";
+import { ShiftRescheduleCard } from "./ShiftRescheduleCard";
+import { breakStatusAt, todaysBreaks } from "./breakSchedule";
+import {
+  screenshotSyncLabel,
+  shouldReloadScreenshotsAfterRecovery,
+} from "./screenshotRecovery";
+import {
+  mainTimerSeconds,
+  paidBreakSecondsToday,
+  reconciledNormalTodaySeconds,
+} from "./timerDisplay";
+import "sweetalert2/dist/sweetalert2.min.css";
+import "./App.css";
+
+const fallbackStatus: AgentStatus = {
+  enrolled: false,
+  employeeName: "Not enrolled",
+  employeeEmail: null,
+  employeeAvatarUrl: null,
+  deviceName: "Windows device",
+  deviceId: null,
+  macAddress: null,
+  localIpAddress: null,
+  trackingStatus: "starting",
+  trackingPaused: false,
+  sessionStartedAt: null,
+  workedTodaySeconds: 0,
+  activeSeconds: 0,
+  idleSeconds: 0,
+  currentIdleSeconds: 0,
+  eligibleIdleSeconds: 0,
+  paidPauseEndsAt: null,
+  paidPauseRemainingSeconds: 0,
+  paidPauseBalanceRemainingSeconds: null,
+  connectionStatus: "offline",
+  lastScreenshotAt: null,
+  screenshotMonitoringEnabled: true,
+  screenshotCaptureActive: false,
+  powerSource: "ac",
+  lastSuccessfulSyncAt: null,
+  agentVersion: "1.0.0",
+  tasks: [],
+  projects: [],
+  selectedTask: null,
+  timeAdjustmentRequests: [],
+  leaveRequests: null,
+  requestPolicy: null,
+  timeSummary: null,
+  dailyTargetSeconds: 8 * 60 * 60,
+  dailyTargetProgressPercent: 0,
+  activityPercent: 0,
+  normalSeconds: 0,
+  extraSeconds: 0,
+  overtimeEnabled: false,
+  extraTimeStatus: "none",
+  recentTasks: [],
+  todayTimeline: null,
+  idleRequestPeriods: [],
+  lastIdleAlert: null,
+  locallyEndedIdleAt: null,
+  updateStatus: "idle",
+  updateVersion: null,
+  updatePercent: null,
+  activeMeeting: null,
+  meetings: [],
+  breakBank: null,
+  privacyNotice:
+    "While work tracking is active, Khaliduo records the foreground application name and, for supported browsers, the website domain. Company policy may also capture periodic workplace screenshots while this enrolled device is active, unlocked, and connected to AC power. Full URLs, page titles, typed text, passwords, webcam, microphone, and personal files are not recorded.",
+};
+
+const TRACKABLE_TASK_STAGES = new Set(["backlog", "assigned", "in_progress"]);
+const THEME_STORAGE_KEY = "khaliduo-theme";
+const DARK_DEFAULT_RESET_KEY = "khaliduo-desktop-dark-default-applied";
+const TRACKING_CONTROL_TIMEOUT_MS = 20_000;
+
+type IdleRequestOption = {
+  key: string;
+  sessionId: string;
+  startedAt: string;
+  endedAt: string;
+  durationSeconds: number;
+  availableSeconds: number;
+  projectName: string | null;
+  taskName: string | null;
+};
+
+function initialTheme(): "light" | "dark" {
+  if (window.localStorage.getItem(DARK_DEFAULT_RESET_KEY) !== "1") {
+    window.localStorage.removeItem(THEME_STORAGE_KEY);
+    window.localStorage.setItem(DARK_DEFAULT_RESET_KEY, "1");
+    return "dark";
+  }
+  return window.localStorage.getItem(THEME_STORAGE_KEY) === "light"
+    ? "light"
+    : "dark";
+}
+
+/** "12m" or "1h 05m" for the saved-break counter. */
+function formatSavedMinutes(totalSeconds: number) {
+  const minutes = Math.floor(Math.max(0, totalSeconds) / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+/** "1h 29m" / "45m", for compact tracked-time cells. */
+function formatHoursMinutes(totalSeconds: number) {
+  const minutes = Math.max(0, Math.floor(totalSeconds / 60));
+  const hours = Math.floor(minutes / 60);
+  return hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
+}
+
+function formatDuration(totalSeconds: number) {
+  const safeSeconds = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(safeSeconds / 3600)
+    .toString()
+    .padStart(2, "0");
+  const minutes = Math.floor((safeSeconds % 3600) / 60)
+    .toString()
+    .padStart(2, "0");
+  const seconds = Math.floor(safeSeconds % 60)
+    .toString()
+    .padStart(2, "0");
+  return `${hours}:${minutes}:${seconds}`;
+}
+
+type KIconName =
+  | "timer"
+  | "tasks"
+  | "more"
+  | "dashboard"
+  | "calendar"
+  | "briefcase"
+  | "worked"
+  | "idle"
+  | "break"
+  | "manual"
+  | "locked"
+  | "sleeping"
+  | "untracked"
+  | "settings"
+  | "meeting"
+  | "update"
+  | "sun"
+  | "moon";
+
+function KIcon({
+  name,
+  className = "",
+}: {
+  name: KIconName;
+  className?: string;
+}) {
+  const paths: Record<KIconName, ReactNode> = {
+    timer: (
+      <>
+        <path d="M12 7v5l3 2" />
+        <path d="M9 2h6" />
+        <path d="M12 22a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z" />
+      </>
+    ),
+    tasks: (
+      <>
+        <path d="m5 12 3 3 5-6" />
+        <path d="M4 5h16" />
+        <path d="M4 19h16" />
+      </>
+    ),
+    more: (
+      <>
+        <path d="M12 6h.01" />
+        <path d="M12 12h.01" />
+        <path d="M12 18h.01" />
+      </>
+    ),
+    dashboard: (
+      <>
+        <path d="M4 5h16v14H4z" />
+        <path d="M8 15v-4" />
+        <path d="M12 15V9" />
+        <path d="M16 15v-2" />
+      </>
+    ),
+    calendar: (
+      <>
+        <path d="M6 3v3M18 3v3" />
+        <path d="M4 7h16v13H4z" />
+        <path d="M4 11h16" />
+        <path d="m9 15 2 2 4-4" />
+      </>
+    ),
+    briefcase: (
+      <>
+        <path d="M9 7V5.8A1.8 1.8 0 0 1 10.8 4h2.4A1.8 1.8 0 0 1 15 5.8V7" />
+        <path d="M4 8h16v10.2A1.8 1.8 0 0 1 18.2 20H5.8A1.8 1.8 0 0 1 4 18.2Z" />
+        <path d="M4 12h16" />
+        <path d="M10 12v2h4v-2" />
+      </>
+    ),
+    meeting: (
+      <>
+        <path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h9A1.5 1.5 0 0 1 15 7.5v9A1.5 1.5 0 0 1 13.5 18h-9A1.5 1.5 0 0 1 3 16.5Z" />
+        <path d="M15 10.5 21 7v10l-6-3.5" />
+      </>
+    ),
+    worked: (
+      <>
+        <path d="M9 7V5.8A1.8 1.8 0 0 1 10.8 4h2.4A1.8 1.8 0 0 1 15 5.8V7" />
+        <path d="M4 8h16v10.2A1.8 1.8 0 0 1 18.2 20H5.8A1.8 1.8 0 0 1 4 18.2Z" />
+        <path d="M8 13h8" />
+      </>
+    ),
+    idle: (
+      <>
+        <path d="M12 7v5" />
+        <path d="M8 17h8" />
+        <path d="M12 22a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z" />
+      </>
+    ),
+    break: (
+      <>
+        <path d="M5 8h11v6a5 5 0 0 1-5 5H10a5 5 0 0 1-5-5Z" />
+        <path d="M16 10h1a3 3 0 0 1 0 6h-2" />
+        <path d="M8 3v2M12 3v2" />
+      </>
+    ),
+    manual: (
+      <>
+        <path d="M9 12l2 2 4-5" />
+        <circle cx="12" cy="12" r="9" />
+      </>
+    ),
+    locked: (
+      <>
+        <path d="M7 11V8a5 5 0 0 1 10 0v3" />
+        <path d="M6 11h12v9H6z" />
+      </>
+    ),
+    sleeping: (
+      <>
+        <path d="M18 15.5A7 7 0 0 1 8.5 6a7 7 0 1 0 9.5 9.5Z" />
+        <path d="M15 4h4l-4 5h4" />
+      </>
+    ),
+    untracked: (
+      <>
+        <path d="M5 5 19 19" />
+        <path d="M8.5 8.5A8.5 8.5 0 0 1 20 10" />
+        <path d="M4 10a8.5 8.5 0 0 1 1.3-2.8" />
+        <path d="M7 14a5 5 0 0 1 7.4-4.4" />
+        <path d="M10 18a2.8 2.8 0 0 1 4.2-2.4" />
+      </>
+    ),
+    settings: (
+      <>
+        <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
+        <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z" />
+      </>
+    ),
+    update: (
+      <>
+        <path d="M20 7v5h-5" />
+        <path d="M4 17v-5h5" />
+        <path d="M6.1 8.2A7 7 0 0 1 18.7 7L20 12" />
+        <path d="M17.9 15.8A7 7 0 0 1 5.3 17L4 12" />
+      </>
+    ),
+    sun: (
+      <>
+        <circle cx="12" cy="12" r="3.5" />
+        <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+      </>
+    ),
+    moon: <path d="M20 15.2A8 8 0 0 1 8.8 4a8 8 0 1 0 11.2 11.2Z" />,
+  };
+
+  return (
+    <svg
+      className={`k-icon ${className}`}
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      focusable="false"
+    >
+      {paths[name]}
+    </svg>
+  );
+}
+
+// An IPC call can REJECT (main-process error / preload failure) rather than
+// resolving a {success:false} result. Handlers must surface that instead of
+// swallowing it in a catch-less try/finally, which would clear the spinner but
+// show no error and silently drop the user's action.
+function ipcErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
+let displayTimezone = "UTC";
+
+function observeAgentStatus(status: AgentStatus) {
+  observeServerTime(status.serverTime);
+  displayTimezone = status.requestPolicy?.timezone || "UTC";
+}
+
+function formatTimestamp(value: string | null) {
+  const date = toValidDate(value);
+  if (!date) return "Not available";
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: displayTimezone,
+  }).format(date);
+}
+
+function formatClock(value: string | null, timezone: string) {
+  const date = toValidDate(value);
+  if (!date) return "-";
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: timezone,
+  }).format(date);
+}
+
+function formatTimelineStart(timeline: WorkdayTimeline) {
+  if (timeline.first_started_at || !timeline.continued_from_previous_day) {
+    return formatClock(timeline.first_started_at, timeline.timezone);
+  }
+  const originalStart =
+    timeline.continued_session_started_at ?? timeline.first_started_at;
+  const startedAt = toValidDate(originalStart);
+  if (!startedAt) {
+    return "Continued from previous day";
+  }
+  const day = new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    timeZone: timeline.timezone,
+  }).format(startedAt);
+  return `Continued from ${day}, ${formatClock(originalStart, timeline.timezone)}`;
+}
+
+function localDateKey(value = trackingNowDate()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: displayTimezone, year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(value);
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((item) => item.type === type)?.value ?? "";
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
+function timeToMinutes(value: string | null | undefined) {
+  if (!value) return null;
+  const [hours, minutes] = value.split(":").map(Number);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+  return hours * 60 + minutes;
+}
+
+function minutesToTime(totalMinutes: number) {
+  const safe = Math.max(0, Math.min(23 * 60 + 59, totalMinutes));
+  return `${String(Math.floor(safe / 60)).padStart(2, "0")}:${String(safe % 60).padStart(2, "0")}`;
+}
+
+function formatScheduledTime(value: string | null | undefined) {
+  const minutes = timeToMinutes(value);
+  if (minutes === null) return "Not configured";
+  const date = new Date(2000, 0, 1, Math.floor(minutes / 60), minutes % 60);
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(date);
+}
+
+function localMinutesAt(value: string, timezone: string) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(value));
+  const hours = Number(parts.find((part) => part.type === "hour")?.value ?? 0);
+  const minutes = Number(
+    parts.find((part) => part.type === "minute")?.value ?? 0,
+  );
+  return hours * 60 + minutes;
+}
+
+function localDateAt(value: string, timezone: string) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(value));
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((entry) => entry.type === type)?.value ?? "";
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
+function weekdayIndex(dateKey: string) {
+  const day = new Date(`${dateKey}T12:00:00`).getDay();
+  return (day + 6) % 7;
+}
+
+function currentScheduleBucket(
+  policy: AgentStatus["requestPolicy"],
+  at = trackingNowDate(),
+): "normal" | "extra" {
+  if (!policy) return "normal";
+  const shiftStart = timeToMinutes(policy.shift_start);
+  const shiftEnd = timeToMinutes(policy.shift_end);
+  if (shiftStart === null || shiftEnd === null || shiftEnd <= shiftStart) {
+    return "extra";
+  }
+  const localDate = localDateAt(at.toISOString(), policy.timezone);
+  const minuteOfDay = localMinutesAt(at.toISOString(), policy.timezone);
+  const approvedEarlyLeave = timeToMinutes(policy.approved_early_leave_from);
+  const isScheduledDay = policy.working_days.includes(weekdayIndex(localDate));
+  const isInsideShift =
+    minuteOfDay >= shiftStart &&
+    minuteOfDay < shiftEnd &&
+    (approvedEarlyLeave === null || minuteOfDay < approvedEarlyLeave);
+  return isScheduledDay && !policy.approved_leave_today && isInsideShift
+    ? "normal"
+    : "extra";
+}
+
+// Flexible staff work their daily hours at any time inside an allowed window;
+// the server sends that window as shift_start/shift_end ("00:00"-"23:59" when
+// any hour counts) and no break windows.
+function isFlexibleSchedule(policy: AgentStatus["requestPolicy"]) {
+  return policy?.schedule_type === "flexible";
+}
+
+// Mirrors the main process: normal time ends once today's work plus the break
+// bank already paid reaches the daily hours.
+function flexibleTargetMet(status: AgentStatus) {
+  if (!isFlexibleSchedule(status.requestPolicy)) return false;
+  const requiredSeconds = (status.requestPolicy?.required_daily_minutes ?? 480) * 60;
+  const paidRestSeconds = status.flexibleDay?.paid_break_seconds ?? 0;
+  return status.normalSeconds + paidRestSeconds >= requiredSeconds;
+}
+
+function flexibleScheduleLabel(policy: AgentStatus["requestPolicy"]) {
+  const hours = formatSavedMinutes((policy?.required_daily_minutes ?? 480) * 60);
+  const anyTime =
+    (policy?.shift_start ?? "00:00").startsWith("00:00") &&
+    (policy?.shift_end ?? "23:59").startsWith("23:59");
+  return anyTime
+    ? `${hours} a day · any time`
+    : `${hours} a day · ${formatScheduledTime(policy?.shift_start)}–${formatScheduledTime(policy?.shift_end)}`;
+}
+
+function countWorkingDays(start: string, end: string, workingDays: number[]) {
+  if (!start || !end || end < start) return 0;
+  let count = 0;
+  const cursor = new Date(`${start}T12:00:00`);
+  const limit = new Date(`${end}T12:00:00`);
+  while (cursor <= limit) {
+    if (workingDays.includes((cursor.getDay() + 6) % 7)) count += 1;
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return count;
+}
+
+function initials(name: string) {
+  return (
+    name
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((part) => part[0])
+      .join("")
+      .toUpperCase() || "KD"
+  );
+}
+
+function App() {
+  const [status, setStatus] = useState<AgentStatus>(fallbackStatus);
+  const [employeeEmail, setEmployeeEmail] = useState("");
+  const [employeePassword, setEmployeePassword] = useState("");
+  const [enrollmentError, setEnrollmentError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [activeView, setActiveView] = useState<
+    "home" | "tasks" | "requests" | "meeting" | "insights" | "settings"
+  >("home");
+  const [projectFilterId, setProjectFilterId] = useState("");
+  const [sessionNote, setSessionNote] = useState("");
+  const [timeRequestReason, setTimeRequestReason] = useState("");
+  const [selectedIdleRequestKey, setSelectedIdleRequestKey] = useState("");
+  const [earlyLeaveDate, setEarlyLeaveDate] = useState(localDateKey());
+  const [earlyLeaveTime, setEarlyLeaveTime] = useState("");
+  const [earlyLeaveReason, setEarlyLeaveReason] = useState("");
+  const [expandedRequest, setExpandedRequest] = useState<
+    "idle" | "early" | "leave" | null
+  >(null);
+  const [timeRequestError, setTimeRequestError] = useState<string | null>(null);
+  const [timeRequestSuccess, setTimeRequestSuccess] = useState<string | null>(
+    null,
+  );
+  const [leaveStartDate, setLeaveStartDate] = useState("");
+  const [leaveEndDate, setLeaveEndDate] = useState("");
+  const [leaveReason, setLeaveReason] = useState("");
+  const [leaveRequestError, setLeaveRequestError] = useState<string | null>(
+    null,
+  );
+  const [leaveRequestSuccess, setLeaveRequestSuccess] = useState<string | null>(
+    null,
+  );
+  const [isSubmittingLeaveRequest, setIsSubmittingLeaveRequest] =
+    useState(false);
+  const [isSubmittingTimeRequest, setIsSubmittingTimeRequest] = useState(false);
+  const [taskError, setTaskError] = useState<string | null>(null);
+  const [isSubmittingTask, setIsSubmittingTask] = useState(false);
+  const [newTaskName, setNewTaskName] = useState("");
+  const [newTaskDescription, setNewTaskDescription] = useState("");
+  const [newTaskTeamId, setNewTaskTeamId] = useState("");
+  const [newTaskProjectId, setNewTaskProjectId] = useState("");
+  const [newTaskStartDate, setNewTaskStartDate] = useState("");
+  const [newTaskDeadline, setNewTaskDeadline] = useState("");
+  const [taskCompletionNote, setTaskCompletionNote] = useState("");
+  const [newChecklistTitle, setNewChecklistTitle] = useState("");
+  const [trackingControlMessage, setTrackingControlMessage] = useState<
+    string | null
+  >(null);
+  const [isChangingTracking, setIsChangingTracking] = useState(false);
+  const [dashboardError, setDashboardError] = useState<string | null>(null);
+  const [isOpeningDashboard, setIsOpeningDashboard] = useState(false);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  const [recentScreenshots, setRecentScreenshots] = useState<
+    RecentScreenshot[] | null
+  >(null);
+  const [isLoadingScreenshots, setIsLoadingScreenshots] = useState(false);
+  const [screenshotError, setScreenshotError] = useState<string | null>(null);
+  const [theme, setTheme] = useState<"light" | "dark">(initialTheme);
+  const { skin, setSkin } = useSkin(theme);
+  const [timerStyle, setTimerStyle] = useTimerStyle();
+  const { toasts, push: pushToast, dismiss: dismissToast } = useToasts();
+  // Appearance changes confirm themselves with a toast, as in his app.
+  const changeTimerStyle = useCallback(
+    (style: TimerStyle) => {
+      setTimerStyle(style);
+      const face = TIMER_STYLES.find((item) => item.key === style);
+      if (face) pushToast(`Timer style · ${face.label}`);
+    },
+    [setTimerStyle, pushToast],
+  );
+  const changeSkin = useCallback(
+    (next: Skin) => {
+      setSkin(next);
+      const item = SKINS.find((entry) => entry.key === next);
+      if (item) pushToast(`Theme · ${item.label}`);
+    },
+    [setSkin, pushToast],
+  );
+  const changeTheme = useCallback(
+    (mode: "light" | "dark") => {
+      setTheme(mode);
+      pushToast(mode === "dark" ? "Dark mode on" : "Light mode on");
+    },
+    [pushToast],
+  );
+  const shownIdleAlertId = useRef<string | null>(null);
+  const screenshotsLoadedForEnrollment = useRef(false);
+  const lastLoadedScreenshotAt = useRef<string | null>(null);
+  const previousScreenshotConnectionStatus = useRef(status.connectionStatus);
+  const isDesktopRuntime = Boolean(window.khaliduo);
+  const desktopRuntimeMessage =
+    "Open Khaliduo desktop app to enroll this device. The browser preview cannot access the secure desktop identity store.";
+
+  useEffect(() => {
+    let mounted = true;
+
+    async function loadStatus() {
+      const nextStatus = await window.khaliduo?.getAgentStatus();
+      if (mounted && nextStatus) {
+        observeAgentStatus(nextStatus);
+        setStatus(nextStatus);
+        if (nextStatus.lastIdleAlert) {
+          void showIdleAlert(nextStatus.lastIdleAlert);
+        }
+      }
+    }
+
+    if (!window.khaliduo) {
+      setEnrollmentError(desktopRuntimeMessage);
+      return undefined;
+    }
+
+    void loadStatus();
+    const removeIdleAlertListener =
+      window.khaliduo.onIdleAlert?.((alert) => {
+        void showIdleAlert(alert);
+      }) ?? (() => undefined);
+    const removeStatusChangedListener =
+      window.khaliduo.onStatusChanged?.((nextStatus) => {
+        if (!mounted) return;
+        observeAgentStatus(nextStatus);
+        setStatus(nextStatus);
+        // The native event and the status snapshot can race when the mouse
+        // becomes active again. Re-open the mandatory idle review from either
+        // source so it cannot be missed or appear behind another window.
+        if (nextStatus.lastIdleAlert) {
+          void showIdleAlert(nextStatus.lastIdleAlert);
+        }
+      }) ?? (() => undefined);
+    const interval = window.setInterval(() => void loadStatus(), 1000);
+
+    return () => {
+      mounted = false;
+      removeIdleAlertListener();
+      removeStatusChangedListener();
+      window.clearInterval(interval);
+    };
+  }, [desktopRuntimeMessage]);
+
+  useEffect(() => {
+    if (status.selectedTask?.projectId) {
+      setProjectFilterId(status.selectedTask.projectId);
+    }
+  }, [status.selectedTask?.projectId]);
+
+  useEffect(() => {
+    if (
+      projectFilterId ||
+      status.selectedTask ||
+      status.projects.length === 0
+    ) {
+      return;
+    }
+    const defaultProject =
+      status.projects.find(
+        (project) => project.name.trim().toLowerCase() === "general work",
+      ) ?? status.projects[0];
+    setProjectFilterId(defaultProject.id);
+  }, [projectFilterId, status.projects, status.selectedTask]);
+
+  useEffect(() => {
+    setTaskCompletionNote("");
+    setNewChecklistTitle("");
+  }, [status.selectedTask?.id]);
+
+  useEffect(() => {
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
+
+  // Toasts echo the messages the app already sets; the inline messages stay.
+  useEffect(() => {
+    if (trackingControlMessage) pushToast(trackingControlMessage, "success");
+  }, [trackingControlMessage, pushToast]);
+  useEffect(() => {
+    if (timeRequestSuccess) pushToast(timeRequestSuccess, "success");
+  }, [timeRequestSuccess, pushToast]);
+  useEffect(() => {
+    if (leaveRequestSuccess) pushToast(leaveRequestSuccess, "success");
+  }, [leaveRequestSuccess, pushToast]);
+  useEffect(() => {
+    for (const error of [taskError, timeRequestError, leaveRequestError, dashboardError, screenshotError]) {
+      if (error) pushToast(error, "error");
+    }
+  }, [taskError, timeRequestError, leaveRequestError, dashboardError, screenshotError, pushToast]);
+
+  const taskTeams = useMemo(
+    () =>
+      Array.from(
+        new Map(
+          status.projects.map((project) => [
+            project.team_id,
+            project.team_name,
+          ]),
+        ).entries(),
+      ),
+    [status.projects],
+  );
+
+  const trackableTasks = useMemo(
+    () => status.tasks.filter((task) => TRACKABLE_TASK_STAGES.has(task.stage)),
+    [status.tasks],
+  );
+
+  const visibleTasks = useMemo(
+    () =>
+      projectFilterId
+        ? trackableTasks.filter((task) => task.projectId === projectFilterId)
+        : trackableTasks,
+    [projectFilterId, trackableTasks],
+  );
+
+  const selectedProject = useMemo(
+    () =>
+      status.projects.find((project) => project.id === projectFilterId) ??
+      status.projects.find(
+        (project) => project.id === status.selectedTask?.projectId,
+      ) ??
+      null,
+    [projectFilterId, status.projects, status.selectedTask?.projectId],
+  );
+
+  const manualApprovedTodaySeconds =
+    status.timeSummary?.today.manual_approved_seconds ?? 0;
+  const trackedTodaySeconds = Math.max(
+    status.timeSummary?.today.active_seconds ?? 0,
+    (status.timeSummary?.today.tracked_active_seconds ?? 0) +
+      manualApprovedTodaySeconds,
+    status.normalSeconds + status.extraSeconds + manualApprovedTodaySeconds,
+    status.workedTodaySeconds + manualApprovedTodaySeconds,
+  );
+  const normalSeconds = status.enrolled
+    ? reconciledNormalTodaySeconds({
+        normalSeconds: status.normalSeconds,
+        extraSeconds: status.extraSeconds,
+        manualApprovedSeconds: manualApprovedTodaySeconds,
+        trackedTodaySeconds,
+      })
+    : status.normalSeconds;
+  const extraSeconds = status.extraSeconds;
+
+  const timeBreakdown = useMemo(() => {
+    const period = status.timeSummary?.today;
+    const visibleIdleSeconds = Math.max(
+      period?.idle_seconds ?? 0,
+      status.todayTimeline?.idle_seconds ?? 0,
+      status.eligibleIdleSeconds,
+    );
+    const segments = [
+      {
+        label: "Normal shift work",
+        seconds: normalSeconds,
+        className: "worked",
+        counted: true,
+      },
+      {
+        label: "Extra recorded",
+        seconds: status.extraSeconds,
+        className: "overtime",
+        counted: false,
+      },
+      {
+        label: "Idle",
+        seconds: visibleIdleSeconds,
+        className: "idle",
+        counted: false,
+      },
+      {
+        label: "Manual approved",
+        seconds: period?.manual_approved_seconds ?? 0,
+        className: "approved",
+        counted: true,
+      },
+      {
+        label: "Manual pending",
+        seconds: period?.manual_pending_seconds ?? 0,
+        className: "pending",
+        counted: false,
+      },
+      {
+        label: "Manual rejected",
+        seconds: period?.manual_rejected_seconds ?? 0,
+        className: "rejected",
+        counted: false,
+      },
+    ];
+    return {
+      segments,
+      total: Math.max(
+        1,
+        segments.reduce((total, segment) => total + segment.seconds, 0),
+      ),
+    };
+  }, [
+    status.extraSeconds,
+    status.eligibleIdleSeconds,
+    status.todayTimeline?.idle_seconds,
+    status.timeSummary,
+    normalSeconds,
+  ]);
+
+  const idleRequestOptions = useMemo<IdleRequestOption[]>(() => {
+    return (status.idleRequestPeriods ?? [])
+      .map((period) => ({
+        key: `${period.work_session_id}|${period.started_at}|${period.ended_at}`,
+        sessionId: period.work_session_id,
+        startedAt: period.started_at,
+        endedAt: period.ended_at,
+        durationSeconds: period.duration_seconds,
+        availableSeconds: period.available_seconds,
+        projectName: period.project_name,
+        taskName: period.task_name,
+      }))
+      .filter((option) => option.availableSeconds >= 60)
+      .reverse();
+  }, [status.idleRequestPeriods]);
+
+  const selectedIdleRequest =
+    idleRequestOptions.find(
+      (option) => option.key === selectedIdleRequestKey,
+    ) ??
+    idleRequestOptions[0] ??
+    null;
+
+  useEffect(() => {
+    if (!idleRequestOptions.length) {
+      setSelectedIdleRequestKey("");
+      return;
+    }
+    if (
+      !selectedIdleRequestKey ||
+      !idleRequestOptions.some(
+        (option) => option.key === selectedIdleRequestKey,
+      )
+    ) {
+      setSelectedIdleRequestKey(idleRequestOptions[0].key);
+    }
+  }, [idleRequestOptions, selectedIdleRequestKey]);
+
+  useEffect(() => {
+    const shiftEnd = timeToMinutes(status.requestPolicy?.shift_end);
+    if (shiftEnd === null) return;
+    setEarlyLeaveTime(
+      (current) => current || minutesToTime(Math.max(0, shiftEnd - 30)),
+    );
+  }, [status.requestPolicy?.shift_end]);
+
+  useEffect(() => {
+    if (status.todayTimeline?.date) {
+      setEarlyLeaveDate((current) => current || status.todayTimeline!.date);
+    }
+  }, [status.todayTimeline?.date]);
+
+  const earlyLeaveMinutes = useMemo(() => {
+    const shiftEnd = timeToMinutes(status.requestPolicy?.shift_end);
+    const leavingTime = timeToMinutes(earlyLeaveTime);
+    if (shiftEnd === null || leavingTime === null) return 0;
+    return Math.max(0, shiftEnd - leavingTime);
+  }, [earlyLeaveTime, status.requestPolicy?.shift_end]);
+
+  const countedTodaySeconds = timeBreakdown.segments
+    .filter((segment) => segment.counted)
+    .reduce((total, segment) => total + segment.seconds, 0);
+  const targetProgress = Math.max(
+    0,
+    Math.min(
+      100,
+      Math.round(
+        (countedTodaySeconds / Math.max(1, status.dailyTargetSeconds)) * 100,
+      ),
+    ),
+  );
+  const isPaused = status.trackingPaused || status.trackingStatus === "paused";
+  const isTracking =
+    status.enrolled &&
+    !isPaused &&
+    ["active", "idle", "locked", "sleeping", "starting"].includes(
+      status.trackingStatus,
+    );
+  const isRunning =
+    isTracking && ["active", "starting"].includes(status.trackingStatus);
+  const isFlexible = isFlexibleSchedule(status.requestPolicy);
+  const flexibleDone = flexibleTargetMet(status);
+  const isExtraTime =
+    currentScheduleBucket(status.requestPolicy) === "extra" || flexibleDone;
+  const isIdleState = ["idle", "locked", "sleeping"].includes(
+    status.trackingStatus,
+  );
+  const isNotWorkingOutsideShift =
+    isExtraTime && (isPaused || isIdleState || !isTracking);
+  // Away during a scheduled break: paid break time, never shown as idle.
+  const onScheduledBreak =
+    isTracking && isIdleState && !isPaused && Boolean(status.scheduledBreak);
+  // Away while saved break minutes pay for it: also not shown as idle.
+  const onSavedBreak =
+    isTracking && isIdleState && !isPaused && Boolean(status.savedBreakCover);
+  const savedBreakEndsAtMs = status.savedBreakCover
+    ? Date.parse(status.savedBreakCover.endsAt)
+    : null;
+  const timerTone = isPaused
+    ? "paused"
+    : isTracking && isExtraTime
+      ? "overtime"
+      : isRunning
+        ? "running"
+        : isIdleState
+          ? "paused"
+          : "stopped";
+  const statusText = onScheduledBreak
+    ? `On break · ${status.scheduledBreak?.name ?? "Break"}`
+    : onSavedBreak && savedBreakEndsAtMs !== null
+    ? `Saved break · ${Math.max(0, Math.ceil((savedBreakEndsAtMs - trackingNowMs()) / 60_000))} min left`
+    : isNotWorkingOutsideShift
+    ? isFlexible
+      ? flexibleDone
+        ? "Daily hours done"
+        : "Outside allowed hours"
+      : "Off shift"
+    : isPaused && status.trackingMovedToDevice
+      ? `Tracking on ${status.trackingMovedToDevice}`
+    : isPaused
+      ? "Paused"
+      : isTracking
+        ? isExtraTime
+          ? "Extra time"
+          : isIdleState
+            ? isFlexible
+              ? "Idle"
+              : "Shift idle"
+            : isFlexible
+              ? "Daily hours"
+              : "Paid shift"
+        : "No timer running";
+  const runningBreakEndsAtMs = status.scheduledBreak
+    ? Date.parse(status.scheduledBreak.endsAt)
+    : null;
+  // The main timer shows the idle counter only for automatic idle outside
+  // any break; the tracker card's idle face follows the same flag.
+  const timerShowsIdle =
+    status.trackingStatus === "idle" &&
+    !isPaused &&
+    !onScheduledBreak &&
+    !onSavedBreak;
+  const displayedTimerSeconds = mainTimerSeconds({
+    isAutomaticIdle: timerShowsIdle,
+    isExtraTime,
+    currentIdleSeconds: status.currentIdleSeconds,
+    extraSeconds,
+    trackedTodaySeconds,
+    paidBreakSeconds: paidBreakSecondsToday(
+      status.todayTimeline?.intervals ?? [],
+      trackingNowMs(),
+      Number.isFinite(runningBreakEndsAtMs) ? runningBreakEndsAtMs : null,
+      savedBreakEndsAtMs !== null && Number.isFinite(savedBreakEndsAtMs)
+        ? savedBreakEndsAtMs
+        : null,
+    ),
+  });
+
+  async function refreshStatusAfterEnrollment() {
+    if (status.enrolled) {
+      await window.khaliduo?.syncNow();
+    }
+    const nextStatus = await window.khaliduo?.getAgentStatus();
+    if (nextStatus) setStatus(nextStatus);
+  }
+
+  async function handleCredentialEnrollment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setEnrollmentError(null);
+    if (!window.khaliduo) {
+      setEnrollmentError(desktopRuntimeMessage);
+      return;
+    }
+
+    setIsSubmitting(true);
+    const password = employeePassword;
+    setEmployeePassword("");
+    try {
+      const result = await window.khaliduo.enrollWithCredentials(
+        employeeEmail,
+        password,
+      );
+      if (!result.success) {
+        setEnrollmentError(result.message ?? "Sign-in and setup failed.");
+        return;
+      }
+
+      setEmployeeEmail("");
+      await refreshStatusAfterEnrollment();
+    } catch (error) {
+      // The IPC can reject (main-process error) rather than resolving a
+      // {success:false}; without this the spinner clears with no feedback and
+      // the wiped password field leaves the user with a silent dead-stop.
+      setEnrollmentError(
+        error instanceof Error
+          ? error.message
+          : "Sign-in and setup failed. Please try again.",
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleIdleTimeRequest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setTimeRequestError(null);
+    setTimeRequestSuccess(null);
+    if (!window.khaliduo || !status.enrolled) {
+      setTimeRequestError("Device must be enrolled before sending a request.");
+      return;
+    }
+    if (!selectedIdleRequest) {
+      setTimeRequestError("No completed idle period is available to request.");
+      return;
+    }
+    const requestedMinutes = requestableIdleMinutes(selectedIdleRequest);
+    if (requestedMinutes < 1) {
+      setTimeRequestError(
+        "This idle period has no whole minutes remaining to request.",
+      );
+      return;
+    }
+    if (timeRequestReason.trim().length < 10) {
+      setTimeRequestError(
+        "Write a clear description of what you were doing during this idle time.",
+      );
+      return;
+    }
+
+    setIsSubmittingTimeRequest(true);
+    try {
+      const result = await window.khaliduo.createTimeAdjustmentRequest({
+        requestedMinutes,
+        reason: timeRequestReason,
+        requestType: "idle_time",
+        requestedDate: status.todayTimeline?.date ?? localDateKey(),
+        workSessionId: selectedIdleRequest.sessionId,
+        sourceStartAt: selectedIdleRequest.startedAt,
+        sourceEndAt: selectedIdleRequest.endedAt,
+      });
+      if (!result.success) {
+        setTimeRequestError(result.message ?? "Request failed.");
+        return;
+      }
+      setTimeRequestReason("");
+      setTimeRequestSuccess(
+        `The full idle period (${requestedMinutes} minute${requestedMinutes === 1 ? "" : "s"}) was sent for review.`,
+      );
+      setSelectedIdleRequestKey("");
+      if (result.status) setStatus(result.status);
+    } catch (error) {
+      setTimeRequestError(
+        ipcErrorMessage(error, "The request could not be sent. Please try again."),
+      );
+    } finally {
+      setIsSubmittingTimeRequest(false);
+    }
+  }
+
+  async function handleEarlyLeaveRequest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setTimeRequestError(null);
+    setTimeRequestSuccess(null);
+    if (!window.khaliduo || !status.enrolled) {
+      setTimeRequestError("Device must be enrolled before sending a request.");
+      return;
+    }
+    const weeklyRemaining =
+      status.requestPolicy?.weekly_early_leave_remaining_minutes ?? 0;
+    if (!earlyLeaveDate || !earlyLeaveTime || earlyLeaveMinutes < 1) {
+      setTimeRequestError(
+        "Choose a working date and a leaving time before the shift ends.",
+      );
+      return;
+    }
+    if (earlyLeaveMinutes > weeklyRemaining) {
+      setTimeRequestError(
+        `Only ${weeklyRemaining} early-leave minute(s) remain this week.`,
+      );
+      return;
+    }
+    if (earlyLeaveReason.trim().length < 3) {
+      setTimeRequestError(
+        "Write a reason of at least 3 characters before sending.",
+      );
+      return;
+    }
+
+    setIsSubmittingTimeRequest(true);
+    try {
+      const result = await window.khaliduo.createTimeAdjustmentRequest({
+        requestedMinutes: earlyLeaveMinutes,
+        reason: earlyLeaveReason,
+        requestType: "early_leave",
+        requestedDate: earlyLeaveDate,
+        requestedLeaveTime: earlyLeaveTime,
+      });
+      if (!result.success) {
+        setTimeRequestError(result.message ?? "Request failed.");
+        return;
+      }
+      setEarlyLeaveReason("");
+      setTimeRequestSuccess("Early leave request sent to HR/admin.");
+      if (result.status) setStatus(result.status);
+    } catch (error) {
+      setTimeRequestError(
+        ipcErrorMessage(error, "The request could not be sent. Please try again."),
+      );
+    } finally {
+      setIsSubmittingTimeRequest(false);
+    }
+  }
+
+  async function handleLeaveRequest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setLeaveRequestError(null);
+    setLeaveRequestSuccess(null);
+    if (!window.khaliduo || !status.enrolled) {
+      setLeaveRequestError("Device must be enrolled before sending a request.");
+      return;
+    }
+    if (!leaveStartDate || !leaveEndDate) {
+      setLeaveRequestError("Choose the start and end dates.");
+      return;
+    }
+    if (leaveEndDate < leaveStartDate) {
+      setLeaveRequestError("End date must be on or after the start date.");
+      return;
+    }
+
+    setIsSubmittingLeaveRequest(true);
+    try {
+      const result = await window.khaliduo.createLeaveRequest({
+        startDate: leaveStartDate,
+        endDate: leaveEndDate,
+        leaveType: "annual",
+        reason: leaveReason.trim() || undefined,
+      });
+      if (!result.success) {
+        setLeaveRequestError(result.message ?? "Holiday request failed.");
+        return;
+      }
+      setLeaveStartDate("");
+      setLeaveEndDate("");
+      setLeaveReason("");
+      setLeaveRequestSuccess("Holiday request sent to HR/admin.");
+      if (result.status) setStatus(result.status);
+    } catch (error) {
+      setLeaveRequestError(
+        ipcErrorMessage(error, "The holiday request could not be sent. Please try again."),
+      );
+    } finally {
+      setIsSubmittingLeaveRequest(false);
+    }
+  }
+
+  async function handleTaskChange(taskId: string) {
+    setTaskError(null);
+    if (!window.khaliduo || !status.enrolled) {
+      setTaskError("Device must be enrolled before choosing a task.");
+      return;
+    }
+
+    setIsSubmittingTask(true);
+    try {
+      const result = await window.khaliduo.setCurrentTask(
+        taskId === "none" ? null : taskId,
+      );
+      if (!result.success) {
+        setTaskError(result.message ?? "Task selection failed.");
+        return;
+      }
+      if (result.status) setStatus(result.status);
+      const picked = result.status?.selectedTask;
+      pushToast(
+        taskId === "none" || !picked
+          ? "No task selected · time is still tracked"
+          : `Tracking · ${picked.name}`,
+      );
+    } catch (error) {
+      setTaskError(
+        ipcErrorMessage(error, "The action could not be completed. Please try again."),
+      );
+    } finally {
+      setIsSubmittingTask(false);
+    }
+  }
+
+  async function handleCreateTask() {
+    const name = newTaskName.trim();
+    if (!name || !window.khaliduo) return;
+    setTaskError(null);
+    setIsSubmittingTask(true);
+    try {
+      const result = await window.khaliduo.createTask({
+        name,
+        description: newTaskDescription || undefined,
+        projectId: newTaskProjectId || status.selectedTask?.projectId,
+        stage: "assigned",
+        startDate: newTaskStartDate || undefined,
+        deadline: newTaskDeadline || undefined,
+      });
+      if (!result.success) {
+        setTaskError(result.message ?? "Task creation failed.");
+        return;
+      }
+      setNewTaskName("");
+      setNewTaskDescription("");
+      setNewTaskStartDate("");
+      setNewTaskDeadline("");
+      setTrackingControlMessage(
+        result.message ?? "Task submitted for manager approval.",
+      );
+      if (result.status) setStatus(result.status);
+    } catch (error) {
+      setTaskError(
+        ipcErrorMessage(error, "The action could not be completed. Please try again."),
+      );
+    } finally {
+      setIsSubmittingTask(false);
+    }
+  }
+
+  async function handleTaskStage(
+    stage: "assigned" | "in_progress" | "ready_for_review" | "blocked",
+    noteOverride?: string,
+  ) {
+    if (!window.khaliduo || !status.selectedTask) return;
+    if (!status.selectedTask.canUpdateStage) {
+      setTaskError("Only the primary assignee can change this task's status.");
+      return;
+    }
+    setTaskError(null);
+    setTrackingControlMessage(null);
+    setIsSubmittingTask(true);
+    const note =
+      noteOverride !== undefined
+        ? noteOverride.trim()
+        : stage === "blocked"
+          ? window
+              .prompt(
+                "Describe the obstacle blocking this task. Reporting it will stop tracking this task.",
+              )
+              ?.trim()
+          : stage === "ready_for_review"
+            ? window
+                .prompt(
+                  "Submit as finished. Add an optional note for the reviewer.",
+                )
+                ?.trim()
+            : undefined;
+    if (stage === "blocked" && !note) {
+      setIsSubmittingTask(false);
+      return;
+    }
+    try {
+      const result = await window.khaliduo.updateTaskStage(
+        status.selectedTask.id,
+        stage,
+        note,
+      );
+      if (!result.success) {
+        setTaskError(result.message ?? "Task stage update failed.");
+      } else if (stage === "blocked") {
+        setTrackingControlMessage(
+          "Task reported blocked and removed from tracking. Use the employee dashboard to resume it after the obstacle is cleared.",
+        );
+      } else if (stage === "ready_for_review") {
+        setTrackingControlMessage(
+          "Finished work submitted. Waiting for approval.",
+        );
+        setTaskCompletionNote("");
+      }
+      if (result.status) {
+        setStatus(result.status);
+      }
+    } catch (error) {
+      setTaskError(
+        ipcErrorMessage(error, "The task status could not be updated. Please try again."),
+      );
+    } finally {
+      setIsSubmittingTask(false);
+    }
+  }
+
+  async function handleAddChecklistItem() {
+    const task = status.selectedTask;
+    const title = newChecklistTitle.trim();
+    if (!window.khaliduo || !task || !title) return;
+    setTaskError(null);
+    setIsSubmittingTask(true);
+    try {
+      const result = await window.khaliduo.createTaskChecklistItem(
+        task.id,
+        title,
+      );
+      if (!result.success) {
+        setTaskError(result.message ?? "Checklist update failed.");
+        return;
+      }
+      setNewChecklistTitle("");
+      if (result.status) setStatus(result.status);
+    } catch (error) {
+      setTaskError(
+        ipcErrorMessage(error, "The action could not be completed. Please try again."),
+      );
+    } finally {
+      setIsSubmittingTask(false);
+    }
+  }
+
+  async function handleToggleChecklistItem(itemId: string, completed: boolean) {
+    const task = status.selectedTask;
+    if (!window.khaliduo || !task) return;
+    setTaskError(null);
+    setIsSubmittingTask(true);
+    try {
+      const result = await window.khaliduo.updateTaskChecklistItem(
+        task.id,
+        itemId,
+        completed,
+      );
+      if (!result.success) {
+        setTaskError(result.message ?? "Checklist update failed.");
+        return;
+      }
+      if (result.status) setStatus(result.status);
+    } catch (error) {
+      setTaskError(
+        ipcErrorMessage(error, "The action could not be completed. Please try again."),
+      );
+    } finally {
+      setIsSubmittingTask(false);
+    }
+  }
+
+  async function handleDeleteChecklistItems(itemIds: string[]) {
+    const task = status.selectedTask;
+    if (!window.khaliduo || !task || itemIds.length === 0) return false;
+    const confirmation = await Swal.fire({
+      title: `Delete ${itemIds.length} checklist ${itemIds.length === 1 ? "item" : "items"}?`,
+      text: "This removes the selected checklist items permanently.",
+      icon: "warning",
+      showCancelButton: true,
+      confirmButtonText: "Delete selected",
+      cancelButtonText: "Cancel",
+      confirmButtonColor: "#dc2626",
+    });
+    if (!confirmation.isConfirmed) return false;
+
+    setTaskError(null);
+    setIsSubmittingTask(true);
+    try {
+      const result = await window.khaliduo.deleteTaskChecklistItems(
+        task.id,
+        itemIds,
+      );
+      if (!result.success) {
+        setTaskError(result.message ?? "Checklist deletion failed.");
+        return false;
+      }
+      if (result.status) setStatus(result.status);
+      return true;
+    } catch (error) {
+      setTaskError(
+        ipcErrorMessage(error, "The action could not be completed. Please try again."),
+      );
+      return false;
+    } finally {
+      setIsSubmittingTask(false);
+    }
+  }
+
+  async function handleTrackingToggle() {
+    if (!window.khaliduo || !status.enrolled) return;
+    setTrackingControlMessage(null);
+    setIsChangingTracking(true);
+    try {
+      const shouldResume =
+        status.trackingPaused ||
+        status.trackingStatus === "paused" ||
+        status.trackingStatus === "offline" ||
+        status.trackingStatus === "error";
+      const result = await withOperationTimeout(
+        shouldResume
+          ? window.khaliduo.resumeTracking()
+          : window.khaliduo.pauseTracking(),
+        TRACKING_CONTROL_TIMEOUT_MS,
+        "Tracking control did not respond within 20 seconds.",
+      );
+      if (!result.success) {
+        setTrackingControlMessage(
+          result.message ?? "The tracking state could not be changed.",
+        );
+        return;
+      }
+      setTrackingControlMessage(
+        result.message ??
+          (shouldResume
+            ? "Tracking resumed. Screenshots follow the company schedule."
+            : "Paused. Tracking and screenshots stop until you resume."),
+      );
+      // Timeout-guard the success-path refresh too: if the main process hangs
+      // here (never resolves), the finally that releases the button would never
+      // run, wedging it on "Please wait…" forever.
+      setStatus(
+        await withOperationTimeout(window.khaliduo.getAgentStatus(), 2_000),
+      );
+    } catch (error) {
+      try {
+        const nextStatus = await withOperationTimeout(
+          window.khaliduo.getAgentStatus(),
+          2_000,
+        );
+        setStatus(nextStatus);
+      } catch {
+        // The control must still be released if the Electron main process is
+        // temporarily unable to answer the follow-up status request.
+      }
+      setTrackingControlMessage(
+        error instanceof OperationTimeoutError
+          ? "The button was released because syncing took too long. Your locally saved time is safe; check the current status before trying again."
+          : error instanceof Error
+            ? error.message
+            : "The tracking state could not be changed.",
+      );
+    } finally {
+      setIsChangingTracking(false);
+    }
+  }
+
+  async function handleOpenDashboard(section?: "screenshots") {
+    setDashboardError(null);
+    setIsOpeningDashboard(true);
+    try {
+      const result = await window.khaliduo?.openEmployeeDashboard(section);
+      if (!result?.success) {
+        setDashboardError(
+          result?.message ?? "The employee dashboard could not be opened.",
+        );
+      }
+    } finally {
+      setIsOpeningDashboard(false);
+    }
+  }
+
+  const handleLoadRecentScreenshots = useCallback(async () => {
+    if (!window.khaliduo || isLoadingScreenshots) return;
+    setIsLoadingScreenshots(true);
+    setScreenshotError(null);
+    try {
+      const result = await window.khaliduo.getRecentScreenshots();
+      if (!result.success) {
+        setScreenshotError(
+          result.message ?? "Recent screenshots could not be loaded.",
+        );
+        return;
+      }
+      setRecentScreenshots(result.screenshots);
+    } catch (error) {
+      setScreenshotError(
+        ipcErrorMessage(error, "Recent screenshots could not be loaded."),
+      );
+    } finally {
+      setIsLoadingScreenshots(false);
+    }
+  }, [isLoadingScreenshots]);
+
+  useEffect(() => {
+    if (!status.enrolled) return;
+    if (
+      screenshotsLoadedForEnrollment.current &&
+      status.lastScreenshotAt === lastLoadedScreenshotAt.current
+    ) {
+      return;
+    }
+    screenshotsLoadedForEnrollment.current = true;
+    lastLoadedScreenshotAt.current = status.lastScreenshotAt;
+    void handleLoadRecentScreenshots();
+  }, [handleLoadRecentScreenshots, status.enrolled, status.lastScreenshotAt]);
+
+  useEffect(() => {
+    const previousConnectionStatus = previousScreenshotConnectionStatus.current;
+    previousScreenshotConnectionStatus.current = status.connectionStatus;
+    if (
+      !shouldReloadScreenshotsAfterRecovery({
+        previousConnectionStatus,
+        connectionStatus: status.connectionStatus,
+        hasLoadError: Boolean(screenshotError),
+      })
+    ) {
+      return;
+    }
+    lastLoadedScreenshotAt.current = null;
+    void handleLoadRecentScreenshots();
+  }, [handleLoadRecentScreenshots, screenshotError, status.connectionStatus]);
+
+  async function handleLogout() {
+    if (!window.khaliduo || isLoggingOut) return;
+    const confirmation = await Swal.fire({
+      title: "Sign out from this computer?",
+      text: "Tracking and screenshots will stop, and this computer will need to be linked again before it can track work.",
+      icon: "question",
+      showCancelButton: true,
+      confirmButtonText: "Sign out",
+      cancelButtonText: "Keep me signed in",
+      confirmButtonColor: "#842029",
+    });
+    if (!confirmation.isConfirmed) return;
+
+    setIsLoggingOut(true);
+    try {
+      const result = await window.khaliduo.logout();
+      if (!result.success) {
+        await Swal.fire(
+          "Sign out failed",
+          result.message ?? "Please try again.",
+          "error",
+        );
+        return;
+      }
+      setStatus(await window.khaliduo.getAgentStatus());
+      setActiveView("home");
+      setEmployeePassword("");
+      setTrackingControlMessage(null);
+    } finally {
+      setIsLoggingOut(false);
+    }
+  }
+
+  async function showIdleAlert(alert: IdleAlert) {
+    if (shownIdleAlertId.current === alert.id) return;
+    shownIdleAlertId.current = alert.id;
+    window.khaliduo?.setIdleAlertAttention(true);
+    const isTrackingStart = alert.kind === "tracking_start";
+    const isPauseReminder = alert.kind === "manual_pause_reminder";
+    // Shown the moment idle is detected (at the threshold), before any input
+    // returns. Distinguishes "Continue working" (mistaken detection, resume now)
+    // from "I was working during this idle period" (an explanation request that
+    // still requires review — never a retrospective self-approval).
+    const isIdleStarted = alert.kind === "idle_started";
+    const canRequestManualTime = isIdleStarted
+      ? !alert.outsideScheduledShift
+      : !isTrackingStart && !isPauseReminder &&
+        !alert.outsideScheduledShift &&
+        alert.eligibleLostSeconds > 0;
+    let result: SweetAlertResult;
+    try {
+      result = await Swal.fire({
+        title: isPauseReminder ? "Tracking is still paused" : isTrackingStart
+          ? alert.outsideScheduledShift
+            ? "Start extra time?"
+            : "Start work tracking?"
+          : isIdleStarted
+            ? "Are you still working?"
+            : "Confirm you are back",
+        text: isPauseReminder
+          ? "You are using this computer while Khaliduo is paused. Work time and screenshots are not being recorded. Resume tracking if you are working, or choose Stay paused."
+          : isTrackingStart
+          ? alert.outsideScheduledShift
+            ? "You are outside your scheduled shift. A device being on or mouse and keyboard movement alone will not start time. Confirm only if you are actually working."
+            : "Khaliduo will not count time just because this device is on. Confirm that you are present and actually starting work."
+          : isIdleStarted
+            ? "No keyboard or mouse activity was detected, so idle time has started. Choose Continue working if you are here. If you were working away from the computer, submit an explanation for review."
+            : canRequestManualTime
+              ? `Input was detected after ${formatDuration(alert.lostSeconds)} away. Choose Continue to resume now; ${formatDuration(alert.eligibleLostSeconds)} inside your paid shift remains available to explain.`
+              : `Input was detected after ${formatDuration(alert.lostSeconds)} away. Choose Continue to resume tracking now.`,
+        icon: "warning",
+        showDenyButton: true,
+        showCancelButton: canRequestManualTime,
+        confirmButtonText: isPauseReminder ? "Resume tracking" : isTrackingStart
+          ? alert.outsideScheduledShift
+            ? "Start extra time"
+            : "Start work"
+          : isIdleStarted
+            ? "Continue working"
+            : "Continue tracking",
+        denyButtonText: isPauseReminder ? "Stay paused" : isTrackingStart ? "Not working" : "Stop tracking",
+        cancelButtonText: isIdleStarted
+          ? "I was working during this idle period"
+          : "Request manual time",
+        confirmButtonColor: "#1f7a4d",
+        denyButtonColor: "#842029",
+        allowEscapeKey: false,
+        allowOutsideClick: false,
+      });
+    } catch (error) {
+      if (shownIdleAlertId.current === alert.id) {
+        window.khaliduo?.setIdleAlertAttention(false);
+      }
+      throw error;
+    }
+
+    // Send the chosen action BEFORE releasing the alert. IPC messages are
+    // handled in order, so the main process leaves idle before the alert is
+    // cleared. Clearing it first left a moment where tracking was still idle
+    // with no alert pending, and the return check opened a second popup.
+    // A newer alert (e.g. the morning "Start work" replacing last night's
+    // unanswered popup) closes this one; releasing then would drop the newer
+    // alert's always-on-top attention, so only the current alert may release.
+    const releaseAlert = () => {
+      const current = shownIdleAlertId.current;
+      // null: the error path below cleared the guard so this alert can reappear.
+      if (current !== alert.id && current !== null) return;
+      window.khaliduo?.setIdleAlertAttention(false);
+    };
+    let released = false;
+    const runThenRelease = async <T,>(action: () => Promise<T> | undefined) => {
+      const pending = action();
+      releaseAlert();
+      released = true;
+      return await pending;
+    };
+    try {
+      if (result.isConfirmed) {
+        const resumeResult = await runThenRelease(() =>
+          isPauseReminder ? window.khaliduo?.resumeTracking() : isTrackingStart
+            ? window.khaliduo?.confirmTrackingStart()
+            : window.khaliduo?.resumeAutomaticIdle(),
+        );
+        if (resumeResult?.message)
+          setTrackingControlMessage(resumeResult.message);
+        const nextStatus = await window.khaliduo?.getAgentStatus();
+        if (nextStatus) setStatus(nextStatus);
+      } else if (result.isDenied) {
+        const pauseResult = await runThenRelease(() =>
+          isTrackingStart
+            ? window.khaliduo?.declineTrackingStart()
+            : window.khaliduo?.pauseTracking({ source: "idle_alert" }),
+        );
+        if (pauseResult?.message) setTrackingControlMessage(pauseResult.message);
+        const nextStatus = await window.khaliduo?.getAgentStatus();
+        if (nextStatus) setStatus(nextStatus);
+      } else if (
+        canRequestManualTime &&
+        result.dismiss === Swal.DismissReason.cancel
+      ) {
+        // "idle_started" alerts are raised the moment idle begins, so the idle
+        // period runs from the alert until this click. An "idle_return" alert
+        // already carries the away time measured when input came back.
+        const alertAt = Date.parse(alert.endedAt);
+        const idleStartedAt = isIdleStarted
+          ? alertAt
+          : alertAt - alert.lostSeconds * 1000;
+        const idleSecondsInShift = isIdleStarted
+          ? Math.floor((trackingNowMs() - alertAt) / 1000)
+          : alert.eligibleLostSeconds;
+        const resumeResult = await runThenRelease(() =>
+          window.khaliduo?.resumeAutomaticIdle(),
+        );
+        if (resumeResult?.message)
+          setTrackingControlMessage(resumeResult.message);
+        if (idleSecondsInShift < 60) {
+          // Nothing was lost: the minutes before the popup already counted as
+          // work and idle lasted under a minute. Opening the form here showed an
+          // empty period list with a disabled Submit button.
+          await Swal.fire({
+            icon: "success",
+            title: "Tracking resumed",
+            text: "Less than a minute was counted as idle, so there is nothing to explain. The time before this popup already counted as work.",
+            confirmButtonColor: "#1f7a4d",
+          });
+          return;
+        }
+        setTimeRequestError(null);
+        setTimeRequestSuccess(null);
+        setTimeRequestReason(
+          "Offline meeting or work completed while away from the computer.",
+        );
+        setExpandedRequest("idle");
+        setActiveView("requests");
+        // The period is listed once the server has the idle end. Online, the
+        // resume above already waited for that; retry briefly for slow links.
+        let periodKey: string | null = null;
+        for (let attempt = 0; attempt < 6 && !periodKey; attempt += 1) {
+          if (attempt === 1) await window.khaliduo?.syncNow();
+          if (attempt > 0) await new Promise((r) => window.setTimeout(r, 1500));
+          const nextStatus = await window.khaliduo?.getAgentStatus();
+          if (!nextStatus) break;
+          setStatus(nextStatus);
+          periodKey = idleRequestKeyForIdleStart(
+            nextStatus.idleRequestPeriods ?? [],
+            idleStartedAt,
+          );
+        }
+        if (periodKey) {
+          setSelectedIdleRequestKey(periodKey);
+        } else {
+          setTimeRequestError(
+            "This idle period has not synced yet. Check your connection; it will appear in the list above as soon as it syncs.",
+          );
+        }
+        window.setTimeout(
+          () => document.getElementById("idle-request-reason")?.focus(),
+          50,
+        );
+      }
+    } catch (error) {
+      // A follow-up IPC (resume/pause/status) rejected. Clear the shown-alert
+      // guard so this mandatory idle review can reappear instead of being
+      // suppressed forever, and surface a message to the employee.
+      shownIdleAlertId.current = null;
+      setTrackingControlMessage(
+        error instanceof Error
+          ? error.message
+          : "Could not update tracking. Please try again.",
+      );
+    } finally {
+      if (!released) releaseAlert();
+    }
+  }
+
+  async function handleUpdateButton() {
+    if (!window.khaliduo || isCheckingUpdate) return;
+    const isInstallAction = status.updateStatus === "ready";
+    setIsCheckingUpdate(true);
+    try {
+      const result = isInstallAction
+        ? await window.khaliduo.installUpdate()
+        : await window.khaliduo.checkForUpdates();
+      if (result?.success === false) {
+        await Swal.fire({
+          title: isInstallAction
+            ? "Update installation failed"
+            : "Update check failed",
+          text:
+            result.message ??
+            (isInstallAction
+              ? "Khaliduo could not install the update."
+              : "Khaliduo could not check for updates."),
+          icon: "error",
+          confirmButtonText: "OK",
+        });
+      }
+      const nextStatus = await window.khaliduo.getAgentStatus();
+      setStatus(nextStatus);
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  }
+
+  const updateButtonLabel =
+    status.updateStatus === "installing"
+      ? "Installing update..."
+      : status.updateStatus === "ready"
+        ? "Install update"
+        : status.updateStatus === "downloading"
+          ? `Updating ${Math.round(status.updatePercent ?? 0)}%`
+          : status.updateStatus === "available"
+            ? "Downloading update"
+            : status.updateStatus === "error"
+              ? "Retry update"
+              : isCheckingUpdate || status.updateStatus === "checking"
+                ? "Checking..."
+                : "Check update";
+  const updateButtonDisabled =
+    isCheckingUpdate ||
+    status.updateStatus === "checking" ||
+    status.updateStatus === "downloading" ||
+    status.updateStatus === "available" ||
+    status.updateStatus === "installing";
+
+  return (
+    <main
+      className={`k-app app-shell${theme === "dark" ? " app-dark" : ""}`}
+      data-tone={timerTone}
+      data-theme={theme}
+    >
+      <Backdrop />
+      <TopBar
+        enrolled={status.enrolled}
+        activeView={activeView}
+        onViewChange={setActiveView}
+        onOpenDashboard={() => void handleOpenDashboard()}
+        isOpeningDashboard={isOpeningDashboard}
+        statusText={statusText}
+        timerLabel={formatDuration(displayedTimerSeconds)}
+        tone={timerTone}
+        updateLabel={updateButtonLabel}
+        updateTitle={
+          status.updateStatus === "ready"
+            ? "Install the downloaded Khaliduo update now"
+            : "Check for Khaliduo updates now"
+        }
+        updateDisabled={updateButtonDisabled}
+        updateHighlighted={[
+          "available",
+          "downloading",
+          "ready",
+          "installing",
+          "error",
+        ].includes(status.updateStatus)}
+        onUpdate={() => void handleUpdateButton()}
+        skin={skin}
+        mode={theme}
+        onSkin={changeSkin}
+        onMode={changeTheme}
+        employeeName={status.employeeName}
+        employeeAvatarUrl={status.employeeAvatarUrl}
+        employeeInitials={initials(status.employeeName)}
+        presenceLabel={
+          status.connectionStatus === "online" || isTracking
+            ? "Active"
+            : "Offline"
+        }
+        presenceOk={status.connectionStatus === "online" || isTracking}
+      />
+
+      {(status.updateRequired ||
+        ["available", "downloading", "ready", "installing"].includes(
+          status.updateStatus,
+        )) && (
+        <section className="k-update" role="status" aria-live="assertive">
+          <strong>
+            Required update{" "}
+            {status.updateVersion ? `v${status.updateVersion}` : ""}
+          </strong>
+          <span>
+            {status.updateStatus === "installing"
+              ? "Installing automatically now. Khaliduo will restart when it finishes."
+              : status.updateStatus === "ready"
+                ? "Downloaded and ready. Automatic installation is starting now; you can also click Install update."
+                : status.updateStatus === "downloading"
+                  ? `Downloading: ${Math.round(status.updatePercent ?? 0)}%`
+                  : status.updateStatus === "available"
+                    ? "Preparing the required download..."
+                    : status.updateStatus === "error"
+                      ? "This version of Khaliduo is no longer supported and the update could not be downloaded yet. Khaliduo keeps retrying every few minutes; check the internet connection."
+                      : "This version of Khaliduo is no longer supported. Looking for the update now..."}
+          </span>
+          {status.updateRequired &&
+            ["error", "idle", "up-to-date", "ready"].includes(
+              status.updateStatus,
+            ) && (
+              <button
+                type="button"
+                onClick={() => void handleUpdateButton()}
+                disabled={updateButtonDisabled}
+              >
+                {updateButtonLabel}
+              </button>
+            )}
+        </section>
+      )}
+
+      {!status.enrolled ? (
+        <EnrollmentView
+          employeeEmail={employeeEmail}
+          employeePassword={employeePassword}
+          enrollmentError={enrollmentError}
+          isSubmitting={isSubmitting}
+          isDesktopRuntime={isDesktopRuntime}
+          onEmailChange={setEmployeeEmail}
+          onPasswordChange={setEmployeePassword}
+          onCredentialEnrollment={handleCredentialEnrollment}
+        />
+      ) : (
+        <>
+          <Sidebar
+            activeView={activeView}
+            status={status}
+            onViewChange={setActiveView}
+            onOpenDashboard={() => void handleOpenDashboard()}
+            isTracking={isTracking}
+          />
+          {activeView === "home" && (
+            <HomeView
+              status={status}
+              statusText={statusText}
+              timerTone={timerTone}
+              timerShowsIdle={timerShowsIdle}
+              onBreak={onScheduledBreak || onSavedBreak}
+              timerStyle={timerStyle}
+              onTimerStyleChange={changeTimerStyle}
+              selectedProject={selectedProject}
+              projectFilterId={projectFilterId}
+              visibleTasks={visibleTasks}
+              recentScreenshots={recentScreenshots}
+              isLoadingScreenshots={isLoadingScreenshots}
+              screenshotError={screenshotError}
+              sessionNote={sessionNote}
+              timeBreakdown={timeBreakdown}
+              targetProgress={targetProgress}
+              countedTodaySeconds={countedTodaySeconds}
+              trackedTodaySeconds={trackedTodaySeconds}
+              displayedTimerSeconds={displayedTimerSeconds}
+              isExtraTime={isExtraTime}
+              normalSeconds={normalSeconds}
+              extraSeconds={extraSeconds}
+              isChangingTracking={isChangingTracking}
+              isSubmittingTask={isSubmittingTask}
+              isOpeningDashboard={isOpeningDashboard}
+              dashboardError={dashboardError}
+              onProjectChange={setProjectFilterId}
+              onTaskChange={(taskId) => void handleTaskChange(taskId)}
+              onSessionNoteChange={setSessionNote}
+              onTrackingToggle={() => void handleTrackingToggle()}
+              onLoadScreenshots={() => void handleLoadRecentScreenshots()}
+              onOpenScreenshots={() => void handleOpenDashboard("screenshots")}
+              idleRequestOptions={idleRequestOptions}
+              onRequestManualTime={(option) => {
+                if (option) {
+                  setSelectedIdleRequestKey(option.key);
+                }
+                setExpandedRequest("idle");
+                setActiveView("requests");
+              }}
+            />
+          )}
+          {activeView === "tasks" && (
+            <TasksView
+              status={status}
+              taskTeams={taskTeams}
+              trackableTasks={trackableTasks}
+              taskError={taskError}
+              trackingControlMessage={trackingControlMessage}
+              isSubmittingTask={isSubmittingTask}
+              newTaskName={newTaskName}
+              newTaskDescription={newTaskDescription}
+              newTaskTeamId={newTaskTeamId}
+              newTaskProjectId={newTaskProjectId}
+              newTaskStartDate={newTaskStartDate}
+              newTaskDeadline={newTaskDeadline}
+              taskCompletionNote={taskCompletionNote}
+              newChecklistTitle={newChecklistTitle}
+              onTaskChange={(taskId) => void handleTaskChange(taskId)}
+              onTaskStage={(stage, note) => void handleTaskStage(stage, note)}
+              onChecklistToggle={(itemId, completed) =>
+                void handleToggleChecklistItem(itemId, completed)
+              }
+              onDeleteChecklistItems={handleDeleteChecklistItems}
+              onChecklistTitleChange={setNewChecklistTitle}
+              onAddChecklistItem={() => void handleAddChecklistItem()}
+              onTaskCompletionNoteChange={setTaskCompletionNote}
+              onTrackingToggle={() => void handleTrackingToggle()}
+              onNewTaskNameChange={setNewTaskName}
+              onNewTaskDescriptionChange={setNewTaskDescription}
+              onNewTaskTeamChange={(teamId) => {
+                setNewTaskTeamId(teamId);
+                setNewTaskProjectId("");
+              }}
+              onNewTaskProjectChange={setNewTaskProjectId}
+              onNewTaskStartDateChange={setNewTaskStartDate}
+              onNewTaskDeadlineChange={setNewTaskDeadline}
+              onCreateTask={() => void handleCreateTask()}
+            />
+          )}
+          {activeView === "requests" && (
+            <RequestCentreView
+              leadingContent={
+                <BreakBankCard status={status} />
+              }
+              status={status}
+              timeRequestReason={timeRequestReason}
+              timeRequestError={timeRequestError}
+              timeRequestSuccess={timeRequestSuccess}
+              leaveStartDate={leaveStartDate}
+              leaveEndDate={leaveEndDate}
+              leaveReason={leaveReason}
+              leaveRequestError={leaveRequestError}
+              leaveRequestSuccess={leaveRequestSuccess}
+              isSubmittingLeaveRequest={isSubmittingLeaveRequest}
+              isSubmittingTimeRequest={isSubmittingTimeRequest}
+              onLeaveStartDateChange={setLeaveStartDate}
+              onLeaveEndDateChange={setLeaveEndDate}
+              onLeaveReasonChange={setLeaveReason}
+              onSubmitLeaveRequest={handleLeaveRequest}
+              onTimeRequestReasonChange={setTimeRequestReason}
+              selectedIdleRequestKey={selectedIdleRequestKey}
+              idleRequestOptions={idleRequestOptions}
+              earlyLeaveDate={earlyLeaveDate}
+              earlyLeaveTime={earlyLeaveTime}
+              earlyLeaveMinutes={earlyLeaveMinutes}
+              earlyLeaveReason={earlyLeaveReason}
+              expandedRequest={expandedRequest}
+              onSelectedIdleRequestChange={setSelectedIdleRequestKey}
+              onEarlyLeaveDateChange={setEarlyLeaveDate}
+              onEarlyLeaveTimeChange={setEarlyLeaveTime}
+              onEarlyLeaveReasonChange={setEarlyLeaveReason}
+              onExpandedRequestChange={(value) => {
+                setExpandedRequest(value);
+                setTimeRequestError(null);
+                setTimeRequestSuccess(null);
+                setLeaveRequestError(null);
+                setLeaveRequestSuccess(null);
+              }}
+              onSubmitIdleTimeRequest={handleIdleTimeRequest}
+              onSubmitEarlyLeaveRequest={handleEarlyLeaveRequest}
+            >
+              {!isFlexibleSchedule(status.requestPolicy) && (
+                <ShiftRescheduleCard enrolled={status.enrolled} />
+              )}
+            </RequestCentreView>
+          )}
+          {activeView === "meeting" && (
+            <MeetingView
+              status={status}
+              onRefresh={async () => {
+                const next = await window.khaliduo?.getAgentStatus();
+                if (next) setStatus(next);
+              }}
+            />
+          )}
+          {activeView === "insights" && (
+            <InsightsView
+              status={status}
+              countedTodaySeconds={countedTodaySeconds}
+              extraSeconds={extraSeconds}
+            />
+          )}
+          {activeView === "settings" && (
+            <SettingsView
+              status={status}
+              onLogout={() => void handleLogout()}
+              isLoggingOut={isLoggingOut}
+              theme={theme}
+              onThemeChange={changeTheme}
+              skin={skin}
+              onSkinChange={changeSkin}
+              onNotify={pushToast}
+            />
+          )}
+        </>
+      )}
+
+      <StatusBar
+        tone={timerTone}
+        timerStateLabel={
+          isPaused ? "Timer paused" : isRunning ? "Timer running" : "Idle"
+        }
+        syncOk={status.connectionStatus === "online"}
+        syncLabel={
+          status.connectionStatus === "online"
+            ? "Synced"
+            : isTracking
+              ? "Sync pending - time saved locally"
+              : "Offline"
+        }
+        syncTitle={
+          status.connectionStatus === "online"
+            ? "API connection is healthy"
+            : "API sync is offline; click to retry. Local tracking and queued screenshots are preserved."
+        }
+        onSync={() => void refreshStatusAfterEnrollment()}
+        capture={
+          status.screenshotMonitoringEnabled
+            ? {
+                state: status.screenshotCaptureActive
+                  ? status.connectionStatus === "online"
+                    ? "active"
+                    : "queued"
+                  : "paused",
+                label: status.screenshotCaptureActive
+                  ? status.connectionStatus === "online"
+                    ? "Screenshots active"
+                    : "Screenshots queued"
+                  : "Screenshots paused",
+                title:
+                  status.screenshotCaptureActive &&
+                  status.connectionStatus === "offline"
+                    ? "Screenshots are captured locally and queued until the API connection returns"
+                    : status.screenshotCaptureActive
+                      ? "Workplace screenshots are active and syncing"
+                      : "Screenshot monitoring is temporarily paused",
+              }
+            : null
+        }
+        workedTodayLabel={formatDuration(trackedTodaySeconds)}
+        activityPercent={status.activityPercent}
+        agentVersion={status.agentVersion}
+      />
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
+      <DiagnosticsPanel />
+    </main>
+  );
+}
+
+function EnrollmentView({
+  employeeEmail,
+  employeePassword,
+  enrollmentError,
+  isSubmitting,
+  isDesktopRuntime,
+  onEmailChange,
+  onPasswordChange,
+  onCredentialEnrollment,
+}: {
+  employeeEmail: string;
+  employeePassword: string;
+  enrollmentError: string | null;
+  isSubmitting: boolean;
+  isDesktopRuntime: boolean;
+  onEmailChange: (value: string) => void;
+  onPasswordChange: (value: string) => void;
+  onCredentialEnrollment: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  // View-only: password visibility and the shake replayed on each new error.
+  const [showPassword, setShowPassword] = useState(false);
+  const formRef = useRef<HTMLFormElement>(null);
+  useEffect(() => {
+    const form = formRef.current;
+    if (!form || !enrollmentError) return;
+    form.classList.remove("k-shake");
+    void form.offsetWidth;
+    form.classList.add("k-shake");
+  }, [enrollmentError]);
+
+  return (
+    <section className="app-page pg-signin">
+      <div className="pg-signin-wrap">
+        <div className="pg-signin-brand">
+          <span className="pg-signin-logo" aria-hidden="true" />
+          <span>
+            <b>KHALIDUO</b>
+            <small>Time tracking suite</small>
+          </span>
+        </div>
+        <div className="pg-signin-frame">
+          <div className="tp-card pg-signin-card">
+            <h2>Sign in to set up this computer</h2>
+            <p>
+              <i className="ri-time-line" aria-hidden="true" /> Your device will be linked to your employee account.
+            </p>
+            <form ref={formRef} className="pg-form" onSubmit={onCredentialEnrollment}>
+              <label>
+                Work email
+                <span className="pg-input-icon">
+                  <i className="ri-mail-line" aria-hidden="true" />
+                  <input
+                    type="email"
+                    value={employeeEmail}
+                    onChange={(event) => onEmailChange(event.target.value)}
+                    autoComplete="email"
+                    placeholder="contact+35d973d92927@example.com"
+                    disabled={isSubmitting}
+                    required
+                  />
+                </span>
+              </label>
+              <label>
+                Password
+                <span className="pg-input-icon has-toggle">
+                  <i className="ri-lock-line" aria-hidden="true" />
+                  <input
+                    type={showPassword ? "text" : "password"}
+                    value={employeePassword}
+                    onChange={(event) => onPasswordChange(event.target.value)}
+                    autoComplete="current-password"
+                    placeholder="Employee password"
+                    disabled={isSubmitting}
+                    minLength={8}
+                    required
+                  />
+                  <button
+                    type="button"
+                    className="pg-input-toggle"
+                    onClick={() => setShowPassword((value) => !value)}
+                    aria-label={showPassword ? "Hide password" : "CHANGE_ME"}
+                    aria-pressed={showPassword}
+                  >
+                    <i className={showPassword ? "ri-eye-off-line" : "ri-eye-line"} aria-hidden="true" />
+                  </button>
+                </span>
+              </label>
+              <button
+                type="submit"
+                className="pg-btn pg-btn-primary"
+                disabled={isSubmitting || !isDesktopRuntime}
+              >
+                {isSubmitting ? (
+                  <>
+                    <i className="ri-loader-4-line pg-spin" aria-hidden="true" /> Signing in...
+                  </>
+                ) : (
+                  "Sign in and link device"
+                )}
+              </button>
+            </form>
+            {enrollmentError && (
+              <p className="k-error" role="alert">
+                <i className="ri-error-warning-line" aria-hidden="true" /> {enrollmentError}
+              </p>
+            )}
+          </div>
+        </div>
+        <p className="pg-signin-foot">Secured workspace · employee sign-in</p>
+      </div>
+    </section>
+  );
+}
+
+function Sidebar({
+  activeView,
+  status,
+  onViewChange,
+  onOpenDashboard,
+  isTracking,
+}: {
+  activeView: "home" | "tasks" | "requests" | "meeting" | "insights" | "settings";
+  status: AgentStatus;
+  onViewChange: (
+    view: "home" | "tasks" | "requests" | "meeting" | "insights" | "settings",
+  ) => void;
+  onOpenDashboard: () => void;
+  isTracking: boolean;
+}) {
+  return (
+    <aside className="k-sidebar">
+      <nav>
+        <span className="k-nav-title">Main</span>
+        <button
+          className={activeView === "home" ? "active" : ""}
+          onClick={() => onViewChange("home")}
+        >
+          <KIcon name="timer" />
+          <span>Timer</span>
+        </button>
+        <button
+          className={activeView === "tasks" ? "active" : ""}
+          onClick={() => onViewChange("tasks")}
+        >
+          <KIcon name="tasks" />
+          <span>Tasks</span>
+          <b>{status.tasks.length}</b>
+        </button>
+        <button
+          className={activeView === "requests" ? "active" : ""}
+          onClick={() => onViewChange("requests")}
+        >
+          <KIcon name="calendar" />
+          <span>Requests</span>
+        </button>
+        <button
+          className={activeView === "meeting" ? "active" : ""}
+          onClick={() => onViewChange("meeting")}
+        >
+          <KIcon name="meeting" />
+          <span>Meeting</span>
+        </button>
+        <button
+          className={activeView === "settings" ? "active" : ""}
+          onClick={() => onViewChange("settings")}
+        >
+          <KIcon name="settings" />
+          <span>Settings</span>
+        </button>
+        <span className="k-nav-title">Online</span>
+        <button onClick={onOpenDashboard}>
+          <KIcon name="dashboard" />
+          <span>Dashboard</span>
+        </button>
+      </nav>
+      <div className="k-user">
+        <span className="k-avatar">
+          {status.employeeAvatarUrl ? (
+            <img src={status.employeeAvatarUrl} alt={status.employeeName} />
+          ) : (
+            initials(status.employeeName)
+          )}
+        </span>
+        <div>
+          <strong>{status.employeeName}</strong>
+          <small
+            className={
+              status.connectionStatus === "online" || isTracking
+                ? "k-ok"
+                : "k-danger"
+            }
+          >
+            {status.connectionStatus === "online"
+              ? "Online - Synced"
+              : isTracking
+                ? "Offline - tracking locally"
+                : "Offline"}
+          </small>
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+function HomeView({
+  status,
+  statusText,
+  timerTone,
+  timerShowsIdle,
+  onBreak,
+  timerStyle,
+  onTimerStyleChange,
+  selectedProject,
+  projectFilterId,
+  visibleTasks,
+  recentScreenshots,
+  isLoadingScreenshots,
+  screenshotError,
+  sessionNote,
+  timeBreakdown,
+  targetProgress,
+  countedTodaySeconds,
+  trackedTodaySeconds,
+  displayedTimerSeconds,
+  isExtraTime,
+  normalSeconds,
+  extraSeconds,
+  isChangingTracking,
+  isSubmittingTask,
+  isOpeningDashboard,
+  dashboardError,
+  onProjectChange,
+  onTaskChange,
+  onSessionNoteChange,
+  onTrackingToggle,
+  onLoadScreenshots,
+  onOpenScreenshots,
+  idleRequestOptions,
+  onRequestManualTime,
+}: {
+  status: AgentStatus;
+  statusText: string;
+  timerTone: ShellTone;
+  timerShowsIdle: boolean;
+  onBreak: boolean;
+  timerStyle: TimerStyle;
+  onTimerStyleChange: (style: TimerStyle) => void;
+  selectedProject: AgentProject | null;
+  projectFilterId: string;
+  visibleTasks: AgentTask[];
+  recentScreenshots: RecentScreenshot[] | null;
+  isLoadingScreenshots: boolean;
+  screenshotError: string | null;
+  sessionNote: string;
+  timeBreakdown: {
+    segments: Array<{
+      label: string;
+      seconds: number;
+      className: string;
+      counted: boolean;
+    }>;
+    total: number;
+  };
+  targetProgress: number;
+  countedTodaySeconds: number;
+  trackedTodaySeconds: number;
+  displayedTimerSeconds: number;
+  isExtraTime: boolean;
+  normalSeconds: number;
+  extraSeconds: number;
+  isChangingTracking: boolean;
+  isSubmittingTask: boolean;
+  isOpeningDashboard: boolean;
+  dashboardError: string | null;
+  onProjectChange: (projectId: string) => void;
+  onTaskChange: (taskId: string) => void;
+  onSessionNoteChange: (note: string) => void;
+  onTrackingToggle: () => void;
+  onLoadScreenshots: () => void;
+  onOpenScreenshots: () => void;
+  idleRequestOptions: IdleRequestOption[];
+  onRequestManualTime: (option?: IdleRequestOption) => void;
+}) {
+  const todayIdleSeconds = Math.max(
+    status.timeSummary?.today.idle_seconds ?? 0,
+    status.todayTimeline?.idle_seconds ?? 0,
+    status.eligibleIdleSeconds,
+  );
+  const requestableIdleMinuteTotal =
+    totalRequestableIdleMinutes(idleRequestOptions);
+  const isPaused = status.trackingPaused || status.trackingStatus === "paused";
+  const shouldResume =
+    isPaused ||
+    status.trackingStatus === "offline" ||
+    status.trackingStatus === "error";
+  const overtimeLabel =
+    extraSeconds <= 0
+      ? null
+      : status.extraTimeStatus === "pending_overtime"
+        ? "Overtime pending approval"
+        : "Extra time recorded only";
+  const overtimeHelp =
+    extraSeconds <= 0
+      ? null
+      : status.extraTimeStatus === "pending_overtime"
+        ? "HR/Admin must approve this time before payroll."
+        : "Recorded for review. It will not be paid unless HR/Admin approves it.";
+  const overtimeStatus = overtimeStatusLabel(extraSeconds, status.extraTimeStatus);
+  const isFlexible = isFlexibleSchedule(status.requestPolicy);
+  const flexibleBank =
+    isFlexible && (status.flexibleDay?.break_bank_seconds ?? 0) > 0
+      ? status.flexibleDay
+      : null;
+  const paidShiftLabel = isFlexible
+    ? flexibleScheduleLabel(status.requestPolicy)
+    : status.requestPolicy?.shift_start && status.requestPolicy.shift_end
+      ? `${formatScheduledTime(status.requestPolicy.shift_start)}–${formatScheduledTime(status.requestPolicy.shift_end)}`
+      : "Schedule not configured";
+  const hasRunningSession = [
+    "active",
+    "starting",
+    "idle",
+    "locked",
+    "sleeping",
+  ].includes(status.trackingStatus);
+  const workdayTiming = workdayTimingState({
+    timelineStartedAt: status.todayTimeline?.first_started_at ?? null,
+    timelineIsRunning: status.todayTimeline?.is_running ?? false,
+    localSessionStartedAt: status.sessionStartedAt,
+    localTrackingActive: hasRunningSession,
+  });
+  const workdayTimezone =
+    status.todayTimeline?.timezone ??
+    status.requestPolicy?.timezone ??
+    Intl.DateTimeFormat().resolvedOptions().timeZone ??
+    "UTC";
+  const breaksToday = status.requestPolicy?.approved_leave_today
+    ? []
+    : todaysBreaks(status.requestPolicy?.break_rules);
+  const savedBreak = status.breakBank?.policy_active ? status.breakBank : null;
+  const breakNow = breakStatusAt(
+    breaksToday,
+    localMinutesAt(trackingNowDate().toISOString(), workdayTimezone),
+  );
+  // Card face from App's existing flags: a break wins, then the idle counter,
+  // otherwise the same tone the top bar uses.
+  const heroMode: HeroMode = onBreak
+    ? "break"
+    : timerShowsIdle
+      ? "idle"
+      : timerTone;
+  return (
+    <section className="app-page">
+      <div className="flex min-w-0 flex-col gap-3.5">
+        <h1 className="sr-only">Tracker</h1>
+        {/* the selectors, timer card and right column fill the window; the
+            tiles and breakdown sit below the fold, as in his tracker */}
+        <div className="tp-fold">
+        <QuickBar
+          projects={status.projects}
+          projectId={projectFilterId}
+          onProjectChange={onProjectChange}
+          tasks={visibleTasks}
+          taskId={status.selectedTask?.id ?? "none"}
+          taskDisabled={isSubmittingTask}
+          onTaskChange={onTaskChange}
+          note={sessionNote}
+          onNoteChange={onSessionNoteChange}
+        />
+        <div className="tp-layout">
+          <div className="flex min-w-0 flex-col gap-3.5">
+            <HeroCard
+              mode={heroMode}
+              statusText={statusText}
+              shiftLabel={paidShiftLabel}
+              breaks={breaksToday.map((item) => ({
+                key: `${item.name}-${item.start}`,
+                label: `${item.name}${item.prayer ? ` · ${item.prayer}` : ""}`,
+                range: `${formatScheduledTime(item.start)}–${formatScheduledTime(item.end)}`,
+                title: item.prayer
+                  ? `Starts at today's ${item.prayer} adhan`
+                  : undefined,
+                state:
+                  breakNow.current === item
+                    ? "now"
+                    : breakNow.next === item
+                      ? "next"
+                      : null,
+              }))}
+              savedBreak={
+                savedBreak
+                  ? {
+                      remaining: formatSavedMinutes(savedBreak.remaining_seconds),
+                      title: `Saved today ${formatSavedMinutes(savedBreak.earned_seconds)} · used on idle ${formatSavedMinutes(savedBreak.used_seconds ?? savedBreak.approved_seconds)}`,
+                    }
+                  : null
+              }
+              breakBank={
+                flexibleBank
+                  ? {
+                      remaining: `${formatSavedMinutes(flexibleBank.break_bank_remaining_seconds)} left`,
+                      title: `Paid rest you can take at any time today: ${formatSavedMinutes(flexibleBank.break_bank_seconds)}. Pause uses it first, then idle.`,
+                    }
+                  : null
+              }
+              shiftTitle={isFlexible ? "Today's flexible hours" : "Today's paid shift"}
+              overtimeLabel={overtimeLabel}
+              overtimeHelp={overtimeHelp}
+              eyebrow={
+                timerShowsIdle
+                  ? "Idle time (outside breaks)"
+                  : isExtraTime
+                    ? "Overtime recorded today"
+                    : "Worked today"
+              }
+              clock={formatDuration(displayedTimerSeconds)}
+              targetProgress={targetProgress}
+              goalLabel={`${formatDuration(countedTodaySeconds)} of ${formatDuration(status.dailyTargetSeconds)}`}
+              remainingLabel={`${formatDuration(countedTodaySeconds)} logged · ${formatDuration(Math.max(0, status.dailyTargetSeconds - countedTodaySeconds))} remaining`}
+              live={timerTone === "running"}
+              timerAriaLabel={
+                timerShowsIdle
+                  ? `Idle for ${formatDuration(displayedTimerSeconds)} after the idle threshold`
+                  : isExtraTime
+                    ? `Recorded overtime ${formatDuration(displayedTimerSeconds)}`
+                    : `Worked today ${formatDuration(trackedTodaySeconds)}; ${formatDuration(countedTodaySeconds)} counts toward the ${formatDuration(status.dailyTargetSeconds)} target`
+              }
+              projectTaskLabel={`${
+                selectedProject?.name ??
+                status.selectedTask?.projectName ??
+                "No project"
+              } - ${status.selectedTask?.name ?? "No task selected"}`}
+              toggleLabel={
+                isChangingTracking
+                  ? "Please wait..."
+                  : shouldResume
+                    ? "Resume"
+                    : "Pause"
+              }
+              toggleResumes={shouldResume}
+              toggleDisabled={isChangingTracking}
+              onToggle={onTrackingToggle}
+              explainLabel={
+                requestableIdleMinuteTotal > 0
+                  ? `Explain idle · ${requestableIdleMinuteTotal} min`
+                  : "Explain idle"
+              }
+              explainDisabled={!idleRequestOptions.length}
+              onExplain={() => onRequestManualTime(idleRequestOptions[0])}
+              timerStyle={timerStyle}
+              onTimerStyle={onTimerStyleChange}
+            />
+          </div>
+          <div className="tp-side">
+            {status.todayTimeline && (
+              <Timeline
+                timeline={status.todayTimeline}
+                locallyEndedIdleAt={status.locallyEndedIdleAt}
+                idleRequestOptions={idleRequestOptions}
+                onRequestIdleTime={onRequestManualTime}
+                loggedLabel={`${Math.floor(trackedTodaySeconds / 3600)}h logged`}
+                syncFooter={
+                  status.connectionStatus === "online"
+                    ? {
+                        label: status.lastSuccessfulSyncAt
+                          ? `Synced with the server · last sync ${formatTimestamp(status.lastSuccessfulSyncAt)}`
+                          : "Connected to the server",
+                        ok: true,
+                      }
+                    : {
+                        label: "Offline · activity is saved and syncs when the connection returns",
+                        ok: false,
+                      }
+                }
+              />
+            )}
+            <ShotCard
+              shot={
+                recentScreenshots?.[0]
+                  ? {
+                      src: recentScreenshots[0].dataUrl,
+                      alt:
+                        recentScreenshots[0].displayName ?? "Latest screenshot",
+                      time: formatTimestamp(recentScreenshots[0].capturedAt),
+                      syncLabel: screenshotSyncLabel(status.connectionStatus),
+                      synced: status.connectionStatus === "online",
+                    }
+                  : null
+              }
+              showLoadButton={!recentScreenshots}
+              loading={isLoadingScreenshots}
+              onLoad={onLoadScreenshots}
+              onViewAll={onOpenScreenshots}
+              viewAllDisabled={isOpeningDashboard}
+              empty={recentScreenshots?.length === 0}
+              errors={[screenshotError, dashboardError].filter(
+                (error): error is string => Boolean(error),
+              )}
+              footer={
+                status.screenshotMonitoringEnabled
+                  ? {
+                      interval: status.screenshotIntervalMinutes
+                        ? `${status.screenshotIntervalMinutes}m`
+                        : null,
+                      captureLabel: status.screenshotCaptureActive
+                        ? status.connectionStatus === "online"
+                          ? "Capturing"
+                          : "Queued offline"
+                        : "Paused",
+                      captureOk: status.screenshotCaptureActive,
+                    }
+                  : null
+              }
+            />
+          </div>
+        </div>
+        </div>
+        <StatTiles
+          row
+          tiles={[
+            {
+              key: "session",
+              icon: "ri-timer-line",
+              label: "Current session",
+              value: formatDuration(status.activeSeconds),
+              note: timerTone === "running" ? "Active right now" : statusText,
+              tone: timerTone === "running" ? "accent" : undefined,
+            },
+            {
+              key: "week",
+              icon: "ri-calendar-2-line",
+              label: "This week",
+              value: formatDuration(
+                status.timeSummary?.week.tracked_active_seconds ?? 0,
+              ),
+              note: "Tracked this week",
+            },
+            {
+              key: "normal",
+              icon: "ri-briefcase-4-line",
+              label: "Normal",
+              value: formatDuration(normalSeconds),
+              bar: targetProgress,
+              note: `${targetProgress}% of daily target`,
+            },
+            {
+              key: "activity",
+              icon: "ri-line-chart-line",
+              label: "Activity",
+              value: `${status.activityPercent}%`,
+              note: "Keyboard and mouse today",
+              tone: "ok",
+            },
+            {
+              key: "idle",
+              icon: "ri-hourglass-2-line",
+              label: "Idle",
+              value: formatDuration(todayIdleSeconds),
+              note:
+                requestableIdleMinuteTotal > 0
+                  ? `${requestableIdleMinuteTotal} min requestable`
+                  : "No requestable time",
+              tone: requestableIdleMinuteTotal > 0 ? "warn" : undefined,
+            },
+            {
+              key: "overtime",
+              icon: "ri-moon-clear-line",
+              label: "Overtime",
+              value: formatDuration(extraSeconds),
+              note: overtimeStatus,
+              tone: "accent",
+            },
+          ]}
+        />
+        <WorkdayStrip
+          cells={[
+            {
+              label: "Started at",
+              value: status.todayTimeline?.first_started_at
+                ? formatTimelineStart(status.todayTimeline)
+                : workdayTiming.startedAt
+                  ? formatClock(workdayTiming.startedAt, workdayTimezone)
+                  : "Not started",
+            },
+            {
+              label: "Last activity",
+              value: status.todayTimeline?.last_activity_at
+                ? formatClock(
+                    status.todayTimeline.last_activity_at,
+                    status.todayTimeline.timezone,
+                  )
+                : workdayTiming.localSyncPending
+                  ? "Sync pending"
+                  : "—",
+            },
+            {
+              label: workdayTiming.isRunning ? "Session" : "Signed out",
+              value: status.todayTimeline?.is_running
+                ? "Still running - no sign-out yet"
+                : workdayTiming.localSyncPending
+                  ? "Running locally - syncing"
+                  : status.todayTimeline?.last_ended_at
+                    ? formatClock(
+                        status.todayTimeline.last_ended_at,
+                        status.todayTimeline.timezone,
+                      )
+                    : "—",
+            },
+          ]}
+        />
+        <div className="tp-bottom">
+          <BreakdownCard
+            summary={`${formatDuration(countedTodaySeconds)} / ${formatDuration(status.dailyTargetSeconds)} - ${targetProgress}%`}
+            segments={timeBreakdown.segments.map((segment) => ({
+              key: segment.label,
+              label: segment.label,
+              value: formatDuration(segment.seconds),
+              className: segment.className,
+              widthPercent:
+                segment.seconds > 0
+                  ? (segment.seconds / timeBreakdown.total) * 100
+                  : 0,
+            }))}
+          />
+          {status.recentTasks.length > 0 && (
+            <RecentTasksCard
+              tasks={status.recentTasks.map((task) => ({
+                id: task.id,
+                name: task.name,
+                project: task.projectName,
+                tracked: formatDuration(task.trackedSeconds),
+              }))}
+              onPick={onTaskChange}
+            />
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function Timeline({
+  timeline,
+  locallyEndedIdleAt,
+  idleRequestOptions,
+  onRequestIdleTime,
+  loggedLabel,
+  syncFooter,
+}: {
+  timeline: WorkdayTimeline;
+  locallyEndedIdleAt: string | null;
+  idleRequestOptions: IdleRequestOption[];
+  onRequestIdleTime: (option: IdleRequestOption) => void;
+  loggedLabel: string;
+  syncFooter: { label: string; ok: boolean };
+}) {
+  const requestableMinutes = totalRequestableIdleMinutes(idleRequestOptions);
+  const rows: TimelineRow[] =
+    timeline.intervals.length === 0 && timeline.approved_leave
+      ? [
+          {
+            key: "leave",
+            displayType: "leave",
+            label: "Leave",
+            detail: "Approved",
+            range: "Today",
+            duration: "",
+            isCurrent: false,
+          },
+        ]
+      : [];
+  timelineIntervalsForDisplay(timeline.intervals).forEach((interval, index) => {
+    const presentation = timelineIntervalPresentation(
+      interval,
+      locallyEndedIdleAt,
+    );
+    const displayType = timelineDisplayType(
+      interval.type,
+      Boolean(timeline.approved_leave),
+      interval.work_category,
+      interval.saved_break_cover,
+    );
+    const displaysWork =
+      displayType === "worked" ||
+      displayType === "extra" ||
+      displayType === "break_work";
+    rows.push({
+      key: `${interval.session_id}-${interval.started_at}-${index}`,
+      displayType,
+      label: TIMELINE_LABELS[displayType],
+      detail:
+        displaysWork && (interval.task_name || interval.project_name)
+          ? (interval.task_name ?? interval.project_name)
+          : null,
+      range: `${formatClock(interval.started_at, timeline.timezone)} - ${
+        presentation.isCurrent
+          ? "Until now"
+          : formatClock(presentation.endedAt, timeline.timezone)
+      }`,
+      duration: formatDuration(
+        presentation.isCurrent
+          ? Math.max(
+              0,
+              Math.floor(
+                (trackingNowMs() - new Date(interval.started_at).getTime()) / 1000,
+              ),
+            )
+          : presentation.durationSeconds,
+      ),
+      isCurrent: presentation.isCurrent,
+    });
+  });
+  return (
+    <TimelineCard
+      rows={rows}
+      loggedLabel={loggedLabel}
+      footer={syncFooter}
+      needsSummary={`${requestableMinutes} min requestable`}
+      needs={idleRequestOptions.map((option) => ({
+        key: option.key,
+        range: `${formatClock(option.startedAt, timeline.timezone)} - ${formatClock(option.endedAt, timeline.timezone)}`,
+        detail: `${formatDuration(option.durationSeconds)} idle period`,
+        action: `Explain up to ${requestableIdleMinutes(option)} min`,
+        onClick: () => onRequestIdleTime(option),
+      }))}
+    />
+  );
+}
+
+function TasksView({
+  status,
+  taskTeams,
+  trackableTasks,
+  taskError,
+  trackingControlMessage,
+  isSubmittingTask,
+  newTaskName,
+  newTaskDescription,
+  newTaskTeamId,
+  newTaskProjectId,
+  newTaskStartDate,
+  newTaskDeadline,
+  taskCompletionNote,
+  newChecklistTitle,
+  onTaskChange,
+  onTaskStage,
+  onChecklistToggle,
+  onDeleteChecklistItems,
+  onChecklistTitleChange,
+  onAddChecklistItem,
+  onTaskCompletionNoteChange,
+  onTrackingToggle,
+  onNewTaskNameChange,
+  onNewTaskDescriptionChange,
+  onNewTaskTeamChange,
+  onNewTaskProjectChange,
+  onNewTaskStartDateChange,
+  onNewTaskDeadlineChange,
+  onCreateTask,
+}: {
+  status: AgentStatus;
+  taskTeams: Array<[string, string]>;
+  trackableTasks: AgentTask[];
+  taskError: string | null;
+  trackingControlMessage: string | null;
+  isSubmittingTask: boolean;
+  newTaskName: string;
+  newTaskDescription: string;
+  newTaskTeamId: string;
+  newTaskProjectId: string;
+  newTaskStartDate: string;
+  newTaskDeadline: string;
+  taskCompletionNote: string;
+  newChecklistTitle: string;
+  onTaskChange: (taskId: string) => void;
+  onTaskStage: (
+    stage: "assigned" | "in_progress" | "ready_for_review" | "blocked",
+    note?: string,
+  ) => void;
+  onChecklistToggle: (itemId: string, completed: boolean) => void;
+  onDeleteChecklistItems: (itemIds: string[]) => Promise<boolean>;
+  onChecklistTitleChange: (value: string) => void;
+  onAddChecklistItem: () => void;
+  onTaskCompletionNoteChange: (value: string) => void;
+  onTrackingToggle: () => void;
+  onNewTaskNameChange: (value: string) => void;
+  onNewTaskDescriptionChange: (value: string) => void;
+  onNewTaskTeamChange: (value: string) => void;
+  onNewTaskProjectChange: (value: string) => void;
+  onNewTaskStartDateChange: (value: string) => void;
+  onNewTaskDeadlineChange: (value: string) => void;
+  onCreateTask: () => void;
+}) {
+  const selectedTask = status.selectedTask;
+  const checklist = useMemo(
+    () => selectedTask?.checklist ?? [],
+    [selectedTask?.checklist],
+  );
+  const [selectedChecklistItemIds, setSelectedChecklistItemIds] = useState<
+    string[]
+  >([]);
+  const completedChecklistCount = checklist.filter(
+    (item) => item.completed,
+  ).length;
+  const canEditSelectedTask =
+    Boolean(selectedTask?.canUpdateStage) &&
+    !["ready_for_review", "completed", "rejected", "cancelled"].includes(
+      selectedTask?.stage ?? "",
+    );
+
+  useEffect(() => {
+    setSelectedChecklistItemIds([]);
+  }, [selectedTask?.id]);
+
+  useEffect(() => {
+    const availableIds = new Set(checklist.map((item) => item.id));
+    setSelectedChecklistItemIds((current) =>
+      current.filter((itemId) => availableIds.has(itemId)),
+    );
+  }, [checklist]);
+
+  function toggleChecklistSelection(itemId: string) {
+    setSelectedChecklistItemIds((current) =>
+      current.includes(itemId)
+        ? current.filter((selectedId) => selectedId !== itemId)
+        : [...current, itemId],
+    );
+  }
+
+  async function deleteSelectedChecklistItems() {
+    const deleted = await onDeleteChecklistItems(selectedChecklistItemIds);
+    if (deleted) setSelectedChecklistItemIds([]);
+  }
+
+  // View-only filtering of the same trackable task list; picking a row calls
+  // the existing onTaskChange.
+  const [taskQuery, setTaskQuery] = useState("");
+  const [taskStageFilter, setTaskStageFilter] = useState<string>("all");
+  const stageFilters = [
+    "all",
+    ...["backlog", "assigned", "in_progress"].filter((stage) =>
+      trackableTasks.some((task) => task.stage === stage),
+    ),
+  ];
+  const query = taskQuery.trim().toLowerCase();
+  const visibleTaskRows = trackableTasks.filter(
+    (task) =>
+      (taskStageFilter === "all" || task.stage === taskStageFilter) &&
+      (!query ||
+        [task.name, task.projectName, task.teamName]
+          .join(" ")
+          .toLowerCase()
+          .includes(query)),
+  );
+
+  return (
+    <section className="app-page pg-page">
+      <header className="pg-head pg-head-row">
+        <div>
+          <h1>My tasks</h1>
+          <p>Choose what the tracker files your time under.</p>
+        </div>
+        <button
+          type="button"
+          className={`pg-btn${status.trackingPaused ? " pg-btn-primary" : ""}`}
+          onClick={onTrackingToggle}
+        >
+          {status.trackingPaused ? "Resume" : "Pause"}
+        </button>
+      </header>
+      {trackingControlMessage && (
+        <p className="k-success">{trackingControlMessage}</p>
+      )}
+      {taskError && <p className="k-error">{taskError}</p>}
+
+      <section className="tp-card pg-card" aria-label="Your tasks">
+        <div className="pg-toolbar">
+          <label className="pg-search">
+            <i className="ri-search-line" aria-hidden="true" />
+            <input
+              value={taskQuery}
+              onChange={(event) => setTaskQuery(event.target.value)}
+              placeholder="Search tasks, projects or teams"
+              aria-label="Search tasks"
+            />
+          </label>
+          <div className="pg-chips" aria-label="Filter tasks">
+            {stageFilters.map((stage) => (
+              <button
+                key={stage}
+                type="button"
+                className={taskStageFilter === stage ? "active" : ""}
+                onClick={() => setTaskStageFilter(stage)}
+              >
+                {stage === "all" ? "All" : taskStageLabel(stage)}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="pg-task-table">
+          <div className="pg-task-row pg-task-row-head" aria-hidden="true">
+            <span>Task</span>
+            <span>Project</span>
+            <span>Stage</span>
+            <span>Tracked</span>
+          </div>
+          {visibleTaskRows.map((task) => {
+            const selected = status.selectedTask?.id === task.id;
+            return (
+              <button
+                key={task.id}
+                type="button"
+                className={`pg-task-row${selected ? " is-selected" : ""}`}
+                aria-pressed={selected}
+                disabled={isSubmittingTask}
+                onClick={() => onTaskChange(task.id)}
+              >
+                <span className="pg-task-name">
+                  <i
+                    className={selected ? "ri-checkbox-circle-fill" : "ri-checkbox-blank-circle-line"}
+                    aria-hidden="true"
+                  />
+                  <span>
+                    <span className="pg-task-title">
+                      <strong dir="auto">{task.name}</strong>
+                      {selected ? <em className="pg-tracking">Tracking</em> : null}
+                    </span>
+                    <small className="pg-task-meta">
+                      {task.priority && (
+                        <b className={`pg-priority ${task.priority}`}>
+                          {task.priority.charAt(0).toUpperCase() + task.priority.slice(1)}
+                        </b>
+                      )}
+                      {task.deadline && <span className="pg-due">Due {task.deadline}</span>}
+                      <span>{task.teamName}</span>
+                    </small>
+                  </span>
+                </span>
+                <span className="pg-task-cell">{task.projectName}</span>
+                <span>
+                  <em className={`pg-status is-soft ${task.stage}`}>
+                    {taskStageLabel(task.stage)}
+                  </em>
+                </span>
+                <span className="pg-task-cell app-num" title={formatDuration(task.activeSeconds)}>
+                  {formatHoursMinutes(task.activeSeconds)}
+                </span>
+              </button>
+            );
+          })}
+          {visibleTaskRows.length === 0 && (
+            <p className="pg-empty">
+              {trackableTasks.length
+                ? "No tasks match this filter."
+                : "No tasks are assigned to you yet."}
+            </p>
+          )}
+        </div>
+        <p className="pg-hint">Pick a task above to file the running timer under it</p>
+      </section>
+
+      {selectedTask && (
+        <section className="tp-card pg-card pg-task-panel">
+          <div className="pg-card-head">
+            <div>
+              <h2 dir="auto">{selectedTask.name}</h2>
+              <p className="pg-muted">
+                {selectedTask.teamName} / {selectedTask.projectName}
+                {selectedTask.description
+                  ? ` · ${selectedTask.description}`
+                  : ""}
+              </p>
+            </div>
+            <span className={`pg-status ${selectedTask.stage}`}>
+              {selectedTask.stage.replaceAll("_", " ")}
+            </span>
+          </div>
+
+          <div className="pg-grid">
+            <label>
+              Stage
+              <select
+                value={status.selectedTask?.stage ?? "assigned"}
+                disabled={
+                  !status.selectedTask ||
+                  isSubmittingTask ||
+                  !status.selectedTask.canUpdateStage
+                }
+                onChange={(event) =>
+                  onTaskStage(
+                    event.target.value as
+                      "assigned" | "in_progress" | "ready_for_review" | "blocked",
+                  )
+                }
+              >
+                {status.selectedTask?.stage === "backlog" && (
+                  <option value="backlog">Backlog</option>
+                )}
+                <option value="assigned">Assigned</option>
+                <option value="in_progress">In progress</option>
+                <option value="ready_for_review">Submit as finished</option>
+                <option value="blocked">Report blocked</option>
+              </select>
+            </label>
+            <div className="pg-field-action">
+              <button
+                type="button"
+                className="pg-link"
+                disabled={isSubmittingTask}
+                onClick={() => onTaskChange("none")}
+              >
+                Stop filing time under this task
+              </button>
+            </div>
+          </div>
+
+          <div className="pg-checklist">
+            <div className="pg-row-between">
+              <strong>Checklist</strong>
+              <small>
+                {completedChecklistCount}/{checklist.length || 0} complete
+              </small>
+            </div>
+            {checklist.length > 0 ? (
+              <div className="pg-checklist-items">
+                {checklist.map((item) => {
+                  const selected = selectedChecklistItemIds.includes(item.id);
+                  return (
+                    <div
+                      key={item.id}
+                      className={`pg-check-item${item.completed ? " done" : ""}${selected ? " selected" : ""}`}
+                    >
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={item.completed}
+                          disabled={!canEditSelectedTask || isSubmittingTask}
+                          onChange={(event) =>
+                            onChecklistToggle(item.id, event.target.checked)
+                          }
+                        />
+                        <span dir="auto">{item.title}</span>
+                      </label>
+                      {canEditSelectedTask && (
+                        <button
+                          type="button"
+                          className="pg-btn pg-btn-xs"
+                          aria-pressed={selected}
+                          disabled={isSubmittingTask}
+                          onClick={() => toggleChecklistSelection(item.id)}
+                        >
+                          {selected ? "Selected" : "Select"}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+                {canEditSelectedTask && selectedChecklistItemIds.length > 0 && (
+                  <div className="pg-row-between pg-danger-row">
+                    <span>{selectedChecklistItemIds.length} selected</span>
+                    <button
+                      type="button"
+                      className="pg-btn pg-btn-sm pg-btn-danger"
+                      disabled={isSubmittingTask}
+                      onClick={() => void deleteSelectedChecklistItems()}
+                    >
+                      {isSubmittingTask
+                        ? "Deleting..."
+                        : `Delete selected (${selectedChecklistItemIds.length})`}
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <p className="pg-muted">
+                No checklist yet. Add the steps you need to finish.
+              </p>
+            )}
+            {canEditSelectedTask && (
+              <div className="pg-inline-add">
+                <input
+                  value={newChecklistTitle}
+                  maxLength={500}
+                  placeholder="Add a checklist step..."
+                  disabled={isSubmittingTask}
+                  onChange={(event) => onChecklistTitleChange(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      onAddChecklistItem();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="pg-btn"
+                  disabled={!newChecklistTitle.trim() || isSubmittingTask}
+                  onClick={onAddChecklistItem}
+                >
+                  Add
+                </button>
+              </div>
+            )}
+          </div>
+
+          <label className="pg-field-block">
+            What did you do?
+            <textarea
+              value={taskCompletionNote}
+              maxLength={1000}
+              rows={3}
+              placeholder="Write what you completed, links, blockers, or delivery notes..."
+              disabled={!canEditSelectedTask || isSubmittingTask}
+              onChange={(event) => onTaskCompletionNoteChange(event.target.value)}
+            />
+          </label>
+          <div className="pg-form-foot">
+            <span>Submitting moves the task to review.</span>
+            <button
+              type="button"
+              className="pg-btn pg-btn-primary"
+              disabled={!canEditSelectedTask || isSubmittingTask}
+              onClick={() => onTaskStage("ready_for_review", taskCompletionNote)}
+            >
+              {isSubmittingTask ? "Submitting..." : "Complete / submit work"}
+            </button>
+          </div>
+        </section>
+      )}
+
+      <section className="tp-card pg-card" aria-label="Create task request">
+        <div className="pg-card-head">
+          <div>
+            <h2>Create task request</h2>
+            <p className="pg-muted">Ask for a new task to be added to your list.</p>
+          </div>
+        </div>
+        <div className="pg-grid">
+          <label className="pg-wide">
+            Task name
+            <input
+              value={newTaskName}
+              maxLength={255}
+              placeholder="What are you working on?"
+              disabled={isSubmittingTask}
+              onChange={(event) => onNewTaskNameChange(event.target.value)}
+            />
+          </label>
+          <label className="pg-wide">
+            Description
+            <input
+              value={newTaskDescription}
+              maxLength={1000}
+              placeholder="Expected outcome or useful context"
+              disabled={isSubmittingTask}
+              onChange={(event) => onNewTaskDescriptionChange(event.target.value)}
+            />
+          </label>
+          <label>
+            Team
+            <select
+              value={newTaskTeamId}
+              disabled={isSubmittingTask}
+              onChange={(event) => onNewTaskTeamChange(event.target.value)}
+            >
+              <option value="">Select team</option>
+              {taskTeams.map(([teamId, teamName]) => (
+                <option key={teamId} value={teamId}>
+                  {teamName}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Project
+            <select
+              value={newTaskProjectId}
+              disabled={isSubmittingTask || !newTaskTeamId}
+              onChange={(event) => onNewTaskProjectChange(event.target.value)}
+            >
+              <option value="">Select project</option>
+              {status.projects
+                .filter((project) => project.team_id === newTaskTeamId)
+                .map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <label>
+            Start date
+            <input
+              type="date"
+              value={newTaskStartDate}
+              disabled={isSubmittingTask}
+              onChange={(event) => onNewTaskStartDateChange(event.target.value)}
+            />
+          </label>
+          <label>
+            Deadline
+            <input
+              type="date"
+              min={newTaskStartDate || undefined}
+              value={newTaskDeadline}
+              disabled={isSubmittingTask}
+              onChange={(event) => onNewTaskDeadlineChange(event.target.value)}
+            />
+          </label>
+        </div>
+        <div className="pg-form-foot">
+          <span />
+          <button
+            type="button"
+            className="pg-btn pg-btn-primary"
+            disabled={!newTaskName.trim() || isSubmittingTask}
+            onClick={onCreateTask}
+          >
+            {isSubmittingTask ? "Submitting..." : "Submit request"}
+          </button>
+        </div>
+      </section>
+    </section>
+  );
+}
+
+function taskStageLabel(stage: string) {
+  if (stage === "in_progress") return "In progress";
+  if (stage === "ready_for_review") return "In review";
+  return stage.charAt(0).toUpperCase() + stage.slice(1).replaceAll("_", " ");
+}
+
+type RequestCentreProps = {
+  status: AgentStatus;
+  timeRequestReason: string;
+  timeRequestError: string | null;
+  timeRequestSuccess: string | null;
+  selectedIdleRequestKey: string;
+  idleRequestOptions: IdleRequestOption[];
+  earlyLeaveDate: string;
+  earlyLeaveTime: string;
+  earlyLeaveMinutes: number;
+  earlyLeaveReason: string;
+  expandedRequest: "idle" | "early" | "leave" | null;
+  leaveStartDate: string;
+  leaveEndDate: string;
+  leaveReason: string;
+  leaveRequestError: string | null;
+  leaveRequestSuccess: string | null;
+  isSubmittingLeaveRequest: boolean;
+  isSubmittingTimeRequest: boolean;
+  onLeaveStartDateChange: (value: string) => void;
+  onLeaveEndDateChange: (value: string) => void;
+  onLeaveReasonChange: (value: string) => void;
+  onSubmitLeaveRequest: (event: FormEvent<HTMLFormElement>) => void;
+  onTimeRequestReasonChange: (value: string) => void;
+  onSelectedIdleRequestChange: (value: string) => void;
+  onEarlyLeaveDateChange: (value: string) => void;
+  onEarlyLeaveTimeChange: (value: string) => void;
+  onEarlyLeaveReasonChange: (value: string) => void;
+  onExpandedRequestChange: (value: "idle" | "early" | "leave" | null) => void;
+  onSubmitIdleTimeRequest: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmitEarlyLeaveRequest: (event: FormEvent<HTMLFormElement>) => void;
+  // Extra cards must render inside this scrolling page. Rendered as siblings
+  // they land in the app shell grid and overlap the page.
+  leadingContent?: ReactNode;
+  children?: ReactNode;
+};
+
+function RequestCentreView(props: RequestCentreProps) {
+  const {
+    status,
+    idleRequestOptions,
+    selectedIdleRequestKey,
+    expandedRequest,
+    earlyLeaveDate,
+    earlyLeaveTime,
+    earlyLeaveMinutes,
+    earlyLeaveReason,
+    leaveStartDate,
+    leaveEndDate,
+    leaveReason,
+  } = props;
+  const [requestFilter, setRequestFilter] = useState<
+    "all" | "pending" | "approved" | "rejected" | "cancelled"
+  >("all");
+  const [openRequestId, setOpenRequestId] = useState<string | null>(null);
+  const policy = status.requestPolicy;
+  const workingDays = policy?.working_days ?? [0, 1, 2, 3, 4];
+  const leaveBalance = status.leaveRequests?.balance.remaining_days ?? 0;
+  const selectedLeaveDays = countWorkingDays(
+    leaveStartDate,
+    leaveEndDate,
+    workingDays,
+  );
+  const expectedLeaveBalance = Math.max(0, leaveBalance - selectedLeaveDays);
+  const weeklyRemaining = policy?.weekly_early_leave_remaining_minutes ?? 0;
+  const weeklyAllowance = policy?.weekly_early_leave_minutes ?? 120;
+  const isFlexible = isFlexibleSchedule(policy);
+  const scheduledShift = isFlexible
+    ? `Flexible · ${flexibleScheduleLabel(policy)}`
+    : policy?.shift_start && policy.shift_end
+      ? `${formatScheduledTime(policy.shift_start)} - ${formatScheduledTime(policy.shift_end)}`
+      : "Not configured";
+  const earlyLeaveIsWorkday = workingDays.includes(
+    weekdayIndex(earlyLeaveDate),
+  );
+  const selectedIdle =
+    idleRequestOptions.find((item) => item.key === selectedIdleRequestKey) ??
+    idleRequestOptions[0] ??
+    null;
+  const maxIdleMinutes = selectedIdle
+    ? Math.max(1, requestableIdleMinutes(selectedIdle))
+    : 0;
+  const requests = useMemo(
+    () =>
+      [
+        ...status.timeAdjustmentRequests.map((request) => ({
+          id: request.id,
+          type:
+            request.request_type === "idle_time"
+              ? "Explain Idle Time"
+              : request.request_type === "early_leave"
+                ? "Early Leave Permission"
+                : "Time Adjustment",
+          period:
+            request.request_type === "idle_time" && request.source_start_at
+              ? `${formatClock(request.source_start_at, policy?.timezone ?? "UTC")} - ${formatClock(request.source_end_at, policy?.timezone ?? "UTC")}`
+              : request.requested_date,
+          duration: `${request.requested_minutes} min`,
+          createdAt: request.created_at,
+          status: request.status,
+          reason: request.reason,
+          note: request.admin_note,
+        })),
+        ...(status.leaveRequests?.requests ?? []).map((request) => ({
+          id: request.id,
+          type: "Annual Leave",
+          period:
+            request.start_date === request.end_date
+              ? request.start_date
+              : `${request.start_date} - ${request.end_date}`,
+          duration: `${request.requested_days} working day${request.requested_days === 1 ? "" : "s"}`,
+          createdAt: request.created_at ?? request.start_date,
+          status: request.status,
+          reason: request.reason ?? "",
+          note: null,
+        })),
+      ].sort(
+        (left, right) =>
+          new Date(right.createdAt).getTime() -
+          new Date(left.createdAt).getTime(),
+      ),
+    [policy?.timezone, status.leaveRequests, status.timeAdjustmentRequests],
+  );
+  const filteredRequests = requests.filter(
+    (request) => requestFilter === "all" || request.status === requestFilter,
+  );
+
+  const toggle = (type: "idle" | "early" | "leave") =>
+    props.onExpandedRequestChange(expandedRequest === type ? null : type);
+
+  useEffect(() => {
+    if (!expandedRequest) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") props.onExpandedRequestChange(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [expandedRequest, props]);
+
+  return (
+    <section className="app-page pg-page">
+      <header className="pg-head">
+        <div>
+          <h1>Time &amp; Leave Requests</h1>
+          <p>
+            Submit and track work-time explanations, permissions, and leave.
+          </p>
+        </div>
+      </header>
+
+      <section className="tp-card tp-workday" aria-label="Request balances">
+        <div>
+          <span>Today&apos;s scheduled shift</span>
+          <strong>{scheduledShift}</strong>
+        </div>
+        {!isFlexible && (
+          <div>
+            <span>Weekly early-leave balance</span>
+            <strong>
+              {weeklyRemaining} of {weeklyAllowance} min remaining
+            </strong>
+          </div>
+        )}
+        <div>
+          <span>Annual-leave balance</span>
+          <strong>{leaveBalance} working days</strong>
+        </div>
+      </section>
+
+      {props.leadingContent}
+
+      <section className="tp-card pg-card">
+        <div className="pg-card-head">
+          <h2>Request Centre</h2>
+          <span>Choose one request type</span>
+        </div>
+
+        <article
+          className={`pg-option ${expandedRequest === "idle" ? "is-open" : ""}`}
+        >
+          <div className="pg-option-row">
+            <span className="tp-card-icon">
+              <KIcon name="idle" />
+            </span>
+            <div className="pg-option-copy">
+              <h3>Explain Idle Time</h3>
+              <p>
+                Explain an idle period detected during your scheduled shift.
+              </p>
+            </div>
+            <strong className="pg-option-state">
+              {idleRequestOptions.length
+                ? `${idleRequestOptions.length} idle period${idleRequestOptions.length === 1 ? "" : "s"} require explanation`
+                : "No unexplained idle periods during your scheduled working hours."}
+            </strong>
+            <button
+              type="button"
+              className="pg-btn pg-btn-sm"
+              disabled={!idleRequestOptions.length}
+              aria-expanded={expandedRequest === "idle"}
+              onClick={() => toggle("idle")}
+            >
+              Explain
+            </button>
+          </div>
+          {expandedRequest === "idle" && (
+            <div
+              className="k-request-form-shell"
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) {
+                  props.onExpandedRequestChange(null);
+                }
+              }}
+            >
+              <form
+                className="pg-form pg-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="idle-request-title"
+                onSubmit={props.onSubmitIdleTimeRequest}
+              >
+                <header className="pg-dialog-head">
+                  <div>
+                    <h2 id="idle-request-title">Explain Idle Time</h2>
+                    <p>
+                      Choose the detected period and explain the work you
+                      completed.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="pg-dialog-close"
+                    aria-label="Close request"
+                    onClick={() => props.onExpandedRequestChange(null)}
+                  >
+                    ×
+                  </button>
+                </header>
+                <div className="pg-grid">
+                  <label>
+                    Idle period
+                    <select
+                      value={selectedIdle?.key ?? ""}
+                      onChange={(event) =>
+                        props.onSelectedIdleRequestChange(event.target.value)
+                      }
+                      disabled={!idleRequestOptions.length}
+                    >
+                      {idleRequestOptions.map((option) => (
+                        <option key={option.key} value={option.key}>
+                          {formatClock(
+                            option.startedAt,
+                            status.todayTimeline?.timezone ?? "UTC",
+                          )}{" "}
+                          -{" "}
+                          {formatClock(
+                            option.endedAt,
+                            status.todayTimeline?.timezone ?? "UTC",
+                          )}{" "}
+                          | {formatDuration(option.durationSeconds)} idle | up
+                          to {requestableIdleMinutes(option)} min remaining
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Minutes requested (full idle period)
+                    <input
+                      value={selectedIdle ? `${maxIdleMinutes} min` : "0 min"}
+                      disabled
+                    />
+                  </label>
+                </div>
+                <label>
+                  What were you doing?
+                  <textarea
+                    id="idle-request-reason"
+                    value={props.timeRequestReason}
+                    onChange={(event) =>
+                      props.onTimeRequestReasonChange(event.target.value)
+                    }
+                    minLength={10}
+                    maxLength={1000}
+                    placeholder="Client call, meeting, offline work, or a system issue..."
+                    required
+                  />
+                  <small>Required · at least 10 characters</small>
+                </label>
+                <div className="pg-form-foot">
+                  <span>
+                    Idle period:{" "}
+                    {selectedIdle
+                      ? formatDuration(selectedIdle.durationSeconds)
+                      : "00:00:00"}
+                    {selectedIdle
+                      ? ` | The full ${requestableIdleMinutes(selectedIdle)} min will be sent`
+                      : ""}
+                  </span>
+                  <button
+                    className="pg-btn pg-btn-primary"
+                    disabled={
+                      props.isSubmittingTimeRequest ||
+                      !selectedIdle ||
+                      props.timeRequestReason.trim().length < 10
+                    }
+                  >
+                    {props.isSubmittingTimeRequest
+                      ? "Submitting..."
+                      : "Submit to HR"}
+                  </button>
+                </div>
+                {props.timeRequestError && (
+                  <p className="k-error">{props.timeRequestError}</p>
+                )}
+                {props.timeRequestSuccess && (
+                  <p className="k-success">{props.timeRequestSuccess}</p>
+                )}
+              </form>
+            </div>
+          )}
+        </article>
+
+        {!isFlexible && (
+        <article
+          className={`pg-option ${expandedRequest === "early" ? "is-open" : ""}`}
+        >
+          <div className="pg-option-row">
+            <span className="tp-card-icon">
+              <KIcon name="timer" />
+            </span>
+            <div className="pg-option-copy">
+              <h3>Early Leave Permission</h3>
+              <p>
+                Request permission to leave before your scheduled shift ends.
+              </p>
+            </div>
+            <strong className="pg-option-state">
+              {weeklyRemaining} of {weeklyAllowance} weekly minutes remaining
+            </strong>
+            <button
+              type="button"
+              className="pg-btn pg-btn-sm"
+              disabled={weeklyRemaining < 1 || !policy?.shift_end}
+              aria-expanded={expandedRequest === "early"}
+              onClick={() => toggle("early")}
+            >
+              Request
+            </button>
+          </div>
+          {expandedRequest === "early" && (
+            <div
+              className="k-request-form-shell"
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) {
+                  props.onExpandedRequestChange(null);
+                }
+              }}
+            >
+              <form
+                className="pg-form pg-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="early-request-title"
+                onSubmit={props.onSubmitEarlyLeaveRequest}
+              >
+                <header className="pg-dialog-head">
+                  <div>
+                    <h2 id="early-request-title">Early Leave Permission</h2>
+                    <p>
+                      Request permission to leave before your scheduled shift
+                      ends.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="pg-dialog-close"
+                    aria-label="Close request"
+                    onClick={() => props.onExpandedRequestChange(null)}
+                  >
+                    ×
+                  </button>
+                </header>
+                <div className="pg-grid pg-grid-4">
+                  <label>
+                    Selected date
+                    <input
+                      type="date"
+                      min={localDateKey()}
+                      value={earlyLeaveDate}
+                      onChange={(event) =>
+                        props.onEarlyLeaveDateChange(event.target.value)
+                      }
+                      required
+                    />
+                  </label>
+                  <label>
+                    Scheduled shift
+                    <input value={scheduledShift} disabled />
+                  </label>
+                  <label>
+                    Requested leaving time
+                    <input
+                      type="time"
+                      min={policy?.shift_start ?? undefined}
+                      max={policy?.shift_end ?? undefined}
+                      value={earlyLeaveTime}
+                      onChange={(event) =>
+                        props.onEarlyLeaveTimeChange(event.target.value)
+                      }
+                      required
+                    />
+                  </label>
+                  <label>
+                    Requested minutes
+                    <input value={`${earlyLeaveMinutes} min`} disabled />
+                  </label>
+                </div>
+                {!earlyLeaveIsWorkday && (
+                  <p className="k-error">
+                    The selected date is not a scheduled working day.
+                  </p>
+                )}
+                <label>
+                  Reason (required)
+                  <textarea
+                    value={earlyLeaveReason}
+                    onChange={(event) =>
+                      props.onEarlyLeaveReasonChange(event.target.value)
+                    }
+                    minLength={3}
+                    maxLength={1000}
+                    placeholder="Doctor appointment, family emergency..."
+                    required
+                  />
+                </label>
+                <div className="pg-form-foot">
+                  <span>
+                    {Math.max(0, weeklyRemaining - earlyLeaveMinutes)} min would
+                    remain
+                  </span>
+                  <button
+                    className="pg-btn pg-btn-primary"
+                    disabled={
+                      props.isSubmittingTimeRequest ||
+                      earlyLeaveMinutes < 1 ||
+                      earlyLeaveMinutes > weeklyRemaining ||
+                      !earlyLeaveIsWorkday
+                    }
+                  >
+                    {props.isSubmittingTimeRequest
+                      ? "Submitting..."
+                      : "Submit to HR"}
+                  </button>
+                </div>
+                {props.timeRequestError && (
+                  <p className="k-error">{props.timeRequestError}</p>
+                )}
+                {props.timeRequestSuccess && (
+                  <p className="k-success">{props.timeRequestSuccess}</p>
+                )}
+              </form>
+            </div>
+          )}
+        </article>
+        )}
+
+        <article
+          className={`pg-option ${expandedRequest === "leave" ? "is-open" : ""}`}
+        >
+          <div className="pg-option-row">
+            <span className="tp-card-icon">
+              <KIcon name="calendar" />
+            </span>
+            <div className="pg-option-copy">
+              <h3>Annual Leave</h3>
+              <p>Request one or more complete working days of annual leave.</p>
+            </div>
+            <strong className="pg-option-state">
+              {leaveBalance} working days available
+            </strong>
+            <button
+              type="button"
+              className="pg-btn pg-btn-sm"
+              disabled={leaveBalance <= 0}
+              aria-expanded={expandedRequest === "leave"}
+              onClick={() => toggle("leave")}
+            >
+              Plan leave
+            </button>
+          </div>
+          {expandedRequest === "leave" && (
+            <div
+              className="k-request-form-shell"
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) {
+                  props.onExpandedRequestChange(null);
+                }
+              }}
+            >
+              <form
+                className="pg-form pg-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="leave-request-title"
+                onSubmit={props.onSubmitLeaveRequest}
+              >
+                <header className="pg-dialog-head">
+                  <div>
+                    <h2 id="leave-request-title">Annual Leave</h2>
+                    <p>Request one or more complete scheduled working days.</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="pg-dialog-close"
+                    aria-label="Close request"
+                    onClick={() => props.onExpandedRequestChange(null)}
+                  >
+                    ×
+                  </button>
+                </header>
+                <div className="pg-grid pg-grid-4">
+                  <label>
+                    From date
+                    <input
+                      type="date"
+                      min={localDateKey()}
+                      value={leaveStartDate}
+                      onChange={(event) =>
+                        props.onLeaveStartDateChange(event.target.value)
+                      }
+                      required
+                    />
+                  </label>
+                  <label>
+                    To date
+                    <input
+                      type="date"
+                      min={leaveStartDate || localDateKey()}
+                      value={leaveEndDate}
+                      onChange={(event) =>
+                        props.onLeaveEndDateChange(event.target.value)
+                      }
+                      required
+                    />
+                  </label>
+                  <label>
+                    Calculated working days
+                    <input
+                      value={`${selectedLeaveDays} day${selectedLeaveDays === 1 ? "" : "s"}`}
+                      disabled
+                    />
+                  </label>
+                  <label>
+                    Expected balance
+                    <input value={`${expectedLeaveBalance} days`} disabled />
+                  </label>
+                </div>
+                <div className="pg-calc">
+                  <span>Current balance</span>
+                  <strong>{leaveBalance} days</strong>
+                  <span>After approval</span>
+                  <strong>{expectedLeaveBalance} days</strong>
+                </div>
+                <label>
+                  Notes (optional)
+                  <textarea
+                    value={leaveReason}
+                    onChange={(event) =>
+                      props.onLeaveReasonChange(event.target.value)
+                    }
+                    maxLength={1000}
+                    placeholder="Add any helpful context for HR..."
+                  />
+                </label>
+                <div className="pg-form-foot">
+                  <span>Only scheduled working days are counted.</span>
+                  <button
+                    className="pg-btn pg-btn-primary"
+                    disabled={
+                      props.isSubmittingLeaveRequest ||
+                      selectedLeaveDays < 1 ||
+                      selectedLeaveDays > leaveBalance
+                    }
+                  >
+                    {props.isSubmittingLeaveRequest
+                      ? "Submitting..."
+                      : "Submit to HR"}
+                  </button>
+                </div>
+                {props.leaveRequestError && (
+                  <p className="k-error">{props.leaveRequestError}</p>
+                )}
+                {props.leaveRequestSuccess && (
+                  <p className="k-success">{props.leaveRequestSuccess}</p>
+                )}
+              </form>
+            </div>
+          )}
+        </article>
+      </section>
+
+      <section className="tp-card pg-card">
+        <div className="pg-card-head">
+          <div>
+            <h2>My Requests</h2>
+            <span>Track every request from one place</span>
+          </div>
+          <div className="pg-chips" aria-label="Filter requests">
+            {(
+              ["all", "pending", "approved", "rejected", "cancelled"] as const
+            ).map((filter) => (
+              <button
+                key={filter}
+                type="button"
+                className={requestFilter === filter ? "active" : ""}
+                onClick={() => setRequestFilter(filter)}
+              >
+                {filter[0].toUpperCase() + filter.slice(1)}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="pg-list">
+          {filteredRequests.length ? (
+            filteredRequests.map((request) => (
+              <div className="pg-record" key={request.id}>
+                <div className="pg-record-row">
+                  <strong>{request.type}</strong>
+                  <span>{request.period}</span>
+                  <span>{request.duration}</span>
+                  <span>Submitted {formatTimestamp(request.createdAt)}</span>
+                  <em className={`pg-status ${request.status}`}>
+                    {request.status}
+                  </em>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setOpenRequestId(
+                        openRequestId === request.id ? null : request.id,
+                      )
+                    }
+                  >
+                    {openRequestId === request.id
+                      ? "Hide details"
+                      : "View details"}
+                  </button>
+                </div>
+                {openRequestId === request.id && (
+                  <div className="pg-record-details">
+                    <span>Reason</span>
+                    <p>{request.reason || "No notes provided."}</p>
+                    {request.note && (
+                      <>
+                        <span>Review note</span>
+                        <p>{request.note}</p>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))
+          ) : (
+            <div className="pg-empty">
+              No {requestFilter === "all" ? "" : `${requestFilter} `}requests
+              yet.
+            </div>
+          )}
+        </div>
+      </section>
+
+      {props.children}
+    </section>
+  );
+}
+
+function meetingStatusLabel(status: MeetingSummary["status"]) {
+  if (status === "approved") return "Approved";
+  if (status === "rejected") return "Rejected";
+  return "Pending review";
+}
+
+// The single lifecycle+sync label. A meeting is only "Pending review" once the
+// server has confirmed its end; before that it is clearly a local/waiting state.
+function meetingStateLabel(
+  syncState: MeetingSummary["syncState"],
+  status: MeetingSummary["status"],
+  lifecycleState: MeetingSummary["lifecycleState"],
+) {
+  switch (syncState) {
+    case "start_pending":
+      return "In progress · waiting to sync";
+    case "start_synced":
+      return "In progress · synced";
+    case "end_pending":
+      return "Ending · waiting to sync";
+    case "start_error":
+    case "end_error":
+      return "Sync failed · tap Retry";
+    default:
+      if (lifecycleState === "active") return "In progress";
+      return meetingStatusLabel(status);
+  }
+}
+
+// A CSS-class-friendly kind for the badge color.
+function meetingStateKind(
+  syncState: MeetingSummary["syncState"],
+  status: MeetingSummary["status"],
+  lifecycleState: MeetingSummary["lifecycleState"],
+) {
+  if (syncState === "start_error" || syncState === "end_error") return "failed";
+  if (syncState === "start_pending" || syncState === "end_pending") return "waiting";
+  if (lifecycleState === "active") return "inprogress";
+  return status;
+}
+
+function BreakBankCard({ status }: { status: AgentStatus }) {
+  const bank = status.breakBank;
+  // Saved breaks are switched on per company from the dashboard; nothing new
+  // appears while the company has them switched off.
+  if (!bank || !bank.policy_active) {
+    return null;
+  }
+  const used = bank.used_seconds ?? bank.approved_seconds;
+
+  return (
+    <section className="tp-card pg-card k-break-bank">
+      <h2>Saved break time</h2>
+      <p>
+        When you work through a scheduled break, those minutes are saved. Idle
+        time later today is covered from them automatically. There is nothing to
+        claim. Saved minutes do not carry over to the next day.
+      </p>
+      <div className="pg-stats">
+        <div>
+          <span className="pg-stat-label">Left today</span>
+          <strong>{formatDuration(bank.remaining_seconds)}</strong>
+        </div>
+        <div>
+          <span className="pg-stat-label">Saved today</span>
+          <strong>{formatDuration(bank.earned_seconds)}</strong>
+        </div>
+        <div>
+          <span className="pg-stat-label">Used on idle</span>
+          <strong>{formatDuration(used)}</strong>
+        </div>
+      </div>
+      {bank.paid_late_allowance_seconds > 0 && (
+        <p className="pg-muted">
+          Paid late allowance applied today:{" "}
+          {formatDuration(bank.paid_late_allowance_seconds)}.
+        </p>
+      )}
+    </section>
+  );
+}
+
+function MeetingView({
+  status,
+  onRefresh,
+}: {
+  status: AgentStatus;
+  onRefresh: () => Promise<void>;
+}) {
+  const active = status.activeMeeting;
+  const [title, setTitle] = useState("");
+  const [reason, setReason] = useState("");
+  const [expectedMinutes, setExpectedMinutes] = useState(30);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  // A bare tick that forces a re-render every second while any meeting is
+  // active, so every live timer (the top card AND each active Recent row, which
+  // may be running on the server without a local active meeting) stays current.
+  const [, setTick] = useState(0);
+  const hasActiveRow =
+    Boolean(active) ||
+    status.meetings.some((meeting) => meeting.lifecycleState === "active");
+
+  useEffect(() => {
+    void window.khaliduo?.refreshMeetings();
+  }, []);
+
+  useEffect(() => {
+    if (!hasActiveRow) return;
+    const timer = window.setInterval(() => setTick((value) => value + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasActiveRow]);
+
+  async function handleRetry() {
+    setRetrying(true);
+    try {
+      await window.khaliduo?.retryMeetingSync();
+      await onRefresh();
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  async function handleStart(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError(null);
+    setMessage(null);
+    setSubmitting(true);
+    try {
+      const result = await window.khaliduo?.startMeeting({
+        title,
+        reason,
+        expectedEndMinutes: expectedMinutes,
+      });
+      if (result?.success) {
+        setTitle("");
+        setReason("");
+        setMessage(result.message ?? "Meeting started.");
+      } else {
+        setError(result?.message ?? "Could not start the meeting.");
+      }
+      await onRefresh();
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleEnd() {
+    setError(null);
+    setMessage(null);
+    setSubmitting(true);
+    try {
+      const result = await window.khaliduo?.endMeeting();
+      if (result?.success) {
+        setMessage(result.message ?? "Meeting ended.");
+      } else {
+        setError(result?.message ?? "Could not end the meeting.");
+      }
+      await onRefresh();
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const elapsedSeconds = active
+    ? Math.max(0, Math.floor((trackingNowMs() - Date.parse(active.startedAt)) / 1000))
+    : 0;
+  const expectedEndClock = active
+    ? new Date(active.expectedEndAt).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      })
+    : "";
+
+  return (
+    <section className="app-page pg-page">
+      <article className="tp-card pg-card">
+        <header className="pg-card-head">
+          <span className="tp-card-icon">
+            <KIcon name="meeting" />
+          </span>
+          <div>
+            <h2>Meeting Mode</h2>
+            <p className="pg-muted">
+              Record an offline meeting or call. Screenshot capture continues as
+              normal. The time is sent for review once it ends; approved meetings
+              are paid, and genuine activity is preserved if it is rejected.
+            </p>
+          </div>
+        </header>
+
+        {active ? (
+          <div className="pg-meeting-live">
+            <span className="pg-live-chip">
+              <span className="pg-live-dot" aria-hidden="true" />
+              {meetingStateLabel(active.syncState, "pending", "active")}
+            </span>
+            <p className="pg-meeting-clock app-num" aria-live="polite">
+              {formatDuration(elapsedSeconds)}
+            </p>
+            <p className="pg-meeting-title">{active.title}</p>
+            <p className="pg-muted">{active.reason}</p>
+            <p className="pg-muted">
+              Becomes “Pending review” once its end is confirmed · ends
+              automatically by {expectedEndClock}
+            </p>
+            {active.lastError && (
+              <p className="k-error">{active.lastError}</p>
+            )}
+            <button
+              type="button"
+              className="pg-btn pg-btn-primary"
+              onClick={() => void handleEnd()}
+              disabled={submitting}
+            >
+              {submitting ? "Ending…" : "End meeting"}
+            </button>
+          </div>
+        ) : (
+          <form className="pg-form" onSubmit={handleStart}>
+            <label>
+              Title
+              <input
+                type="text"
+                value={title}
+                onChange={(event) => setTitle(event.target.value)}
+                placeholder="Client call, standup, workshop…"
+                maxLength={255}
+                disabled={submitting}
+                required
+              />
+            </label>
+            <label>
+              Reason
+              <textarea
+                value={reason}
+                onChange={(event) => setReason(event.target.value)}
+                placeholder="Briefly describe the meeting"
+                maxLength={1000}
+                minLength={3}
+                disabled={submitting}
+                required
+              />
+            </label>
+            <label>
+              Expected duration (minutes)
+              <input
+                type="number"
+                value={expectedMinutes}
+                onChange={(event) =>
+                  setExpectedMinutes(Number(event.target.value) || 0)
+                }
+                min={1}
+                max={720}
+                disabled={submitting}
+                required
+              />
+            </label>
+            <button type="submit" className="pg-btn pg-btn-primary" disabled={submitting}>
+              {submitting ? "Starting…" : "Start meeting"}
+            </button>
+          </form>
+        )}
+        {error && <p className="k-error">{error}</p>}
+        {message && <p className="k-success">{message}</p>}
+      </article>
+
+      <article className="tp-card pg-card">
+        <header className="pg-card-head">
+          <span className="tp-card-icon">
+            <KIcon name="calendar" />
+          </span>
+          <div>
+            <h2>Recent meetings</h2>
+            <p className="pg-muted">Your latest Meeting Mode periods.</p>
+          </div>
+        </header>
+        {status.meetings.length === 0 ? (
+          <p className="pg-muted">No meetings recorded yet.</p>
+        ) : (
+          <ul className="pg-list pg-meeting-list">
+            {status.meetings.map((meeting) => {
+              const isActive = meeting.lifecycleState === "active";
+              const badgeKind = meetingStateKind(
+                meeting.syncState,
+                meeting.status,
+                meeting.lifecycleState,
+              );
+              const badgeLabel = meetingStateLabel(
+                meeting.syncState,
+                meeting.status,
+                meeting.lifecycleState,
+              );
+              // Each active row computes its own elapsed time from its own
+              // startedAt — a server-side active meeting shows real elapsed time
+              // even when there is no local active meeting.
+              const rowSeconds =
+                isActive && meeting.endedAt === null
+                  ? Math.max(
+                      0,
+                      Math.floor((trackingNowMs() - Date.parse(meeting.startedAt)) / 1000),
+                    )
+                  : meeting.recordedSeconds;
+              const failed =
+                meeting.syncState === "start_error" ||
+                meeting.syncState === "end_error";
+              return (
+                <li key={meeting.id}>
+                  <div>
+                    <strong>{meeting.title}</strong>
+                    <span className="pg-muted">
+                      {" "}
+                      · {formatDuration(rowSeconds)}
+                    </span>
+                    {failed && meeting.lastError && (
+                      <p className="k-error">{meeting.lastError}</p>
+                    )}
+                    {failed && (
+                      <button
+                        type="button"
+                        className="pg-link"
+                        onClick={() => void handleRetry()}
+                        disabled={retrying}
+                      >
+                        {retrying ? "Retrying…" : "Retry sync"}
+                      </button>
+                    )}
+                  </div>
+                  <span className={`pg-status ${badgeKind}`}>
+                    {badgeLabel}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </article>
+    </section>
+  );
+}
+
+function overtimeStatusLabel(
+  extraSeconds: number,
+  extraTimeStatus: AgentStatus["extraTimeStatus"],
+) {
+  return extraSeconds <= 0
+    ? "No overtime"
+    : extraTimeStatus === "pending_overtime"
+      ? "Pending approval"
+      : "Recorded only";
+}
+
+/** "Nov 3" for an ISO date (YYYY-MM-DD), read as a calendar day. */
+function formatShortDate(value: string) {
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(
+    new Date(`${value}T12:00:00`),
+  );
+}
+
+function formatWeekday(value: string) {
+  return new Intl.DateTimeFormat("en-US", { weekday: "short" }).format(
+    new Date(`${value}T12:00:00`),
+  );
+}
+
+/** "40h" / "7h 30m" for targets. */
+function formatTargetHours(totalSeconds: number) {
+  const minutes = Math.round(totalSeconds / 60);
+  const hours = Math.floor(minutes / 60);
+  return minutes % 60 ? `${hours}h ${minutes % 60}m` : `${hours}h`;
+}
+
+function WeekBars({
+  rows,
+  largest,
+}: {
+  rows: Array<{ label: string; seconds: number; tone: string }>;
+  largest: number;
+}) {
+  return (
+    <div className="pg-bars">
+      {rows.map((row) => (
+        <div key={row.label} className="pg-bar-row">
+          <div className="pg-row-between">
+            <span>{row.label}</span>
+            <b className="app-num">{formatDuration(row.seconds)}</b>
+          </div>
+          <span className="tp-breakdown-bar">
+            <i
+              className={`segment-${row.tone}`}
+              style={{ width: `${(row.seconds / largest) * 100}%` }}
+            />
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function InsightsView({
+  status,
+  countedTodaySeconds,
+  extraSeconds,
+}: {
+  status: AgentStatus;
+  countedTodaySeconds: number;
+  extraSeconds: number;
+}) {
+  const timezone =
+    status.todayTimeline?.timezone ??
+    status.requestPolicy?.timezone ??
+    Intl.DateTimeFormat().resolvedOptions().timeZone ??
+    "UTC";
+  const now = trackingNowDate();
+  const todayKey = localDateAt(now.toISOString(), timezone);
+  const todayLabel = new Intl.DateTimeFormat("en-US", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    timeZone: timezone,
+  }).format(now);
+  const monthLabel = new Intl.DateTimeFormat("en-US", {
+    month: "long",
+    year: "numeric",
+    timeZone: timezone,
+  }).format(now);
+  const summary = status.timeSummary;
+  const attendance = status.attendanceWeek ?? null;
+  const policy = status.requestPolicy;
+  const workingDays = attendance?.working_days ?? policy?.working_days ?? null;
+  // Week and month targets: the daily target on each scheduled working day.
+  const periodTarget = (start: string | undefined, end: string | undefined) =>
+    start && end && workingDays
+      ? status.dailyTargetSeconds * countWorkingDays(start, end, workingDays)
+      : null;
+  const periods = [
+    {
+      key: "today",
+      title: "Today",
+      range: todayLabel,
+      data: summary?.today ?? null,
+      target: status.dailyTargetSeconds,
+    },
+    {
+      key: "week",
+      title: "This week",
+      range: attendance
+        ? `${formatShortDate(attendance.week_start)} – ${formatShortDate(attendance.week_end)}`
+        : null,
+      data: summary?.week ?? null,
+      target: periodTarget(attendance?.week_start, attendance?.week_end),
+    },
+    {
+      key: "month",
+      title: "This month",
+      range: attendance
+        ? `${formatShortDate(attendance.month_start)} – ${formatShortDate(attendance.month_end)}`
+        : monthLabel,
+      data: summary?.month ?? null,
+      target: periodTarget(attendance?.month_start, attendance?.month_end),
+    },
+  ];
+  const week = summary?.week ?? null;
+  const weekRows = week
+    ? [
+        { label: "Worked", seconds: week.tracked_active_seconds, tone: "worked" },
+        { label: "Manual approved", seconds: week.manual_approved_seconds, tone: "approved" },
+        { label: "Manual pending", seconds: week.manual_pending_seconds, tone: "pending" },
+        { label: "Idle", seconds: week.idle_seconds, tone: "idle" },
+      ]
+    : [];
+  const largestWeekRow = Math.max(1, ...weekRows.map((row) => row.seconds));
+  const workRows = (status.todayTimeline?.intervals ?? [])
+    .filter((interval) => interval.type === "worked")
+    .slice(-6)
+    .reverse();
+  const breaksToday = policy?.approved_leave_today ? [] : todaysBreaks(policy?.break_rules);
+  const signedIn = status.todayTimeline?.first_started_at
+    ? formatTimelineStart(status.todayTimeline)
+    : status.sessionStartedAt
+      ? formatClock(status.sessionStartedAt, timezone)
+      : "Not started";
+  const days = attendance?.days ?? [];
+  const today = days.find((day) => day.date === todayKey) ?? null;
+  const graceMinutes = attendance?.late_grace_minutes ?? null;
+  const todaySessions =
+    today?.session_count ??
+    new Set((status.todayTimeline?.intervals ?? []).map((interval) => interval.session_id)).size;
+  const weekSessions = days.reduce((total, day) => total + day.session_count, 0);
+  const loadMax = Math.max(status.dailyTargetSeconds, ...days.map((day) => day.active_seconds), 1);
+  const lateLabel = (day: AttendanceDay) =>
+    day.deductible_late_seconds > 0
+      ? `${Math.round(day.deductible_late_seconds / 60)} min after grace`
+      : day.raw_late_seconds > 0
+        ? "Within grace"
+        : day.start_time
+          ? "On time"
+          : "—";
+  const isWorkingDay = (date: string) =>
+    workingDays ? workingDays.includes(weekdayIndex(date)) : true;
+  const signedInNote =
+    today && today.start_time
+      ? lateLabel(today) === "On time" && graceMinutes
+        ? `On time · ${graceMinutes} min grace`
+        : lateLabel(today)
+      : status.breakBank?.paid_late_allowance_seconds
+        ? `Paid late allowance ${formatDuration(status.breakBank.paid_late_allowance_seconds)}`
+        : "First activity today";
+
+  return (
+    <section className="app-page pg-page">
+      <header className="pg-head">
+        <div>
+          <h1>Insights</h1>
+          <p>Your shift, and how tracked time adds up across today, this week and the month.</p>
+        </div>
+      </header>
+
+      <section className="pg-kpis" aria-label="Attendance today">
+        <div className="tp-card pg-kpi">
+          <span className="pg-stat-label">Paid shift</span>
+          <strong>
+            {policy?.shift_start && policy.shift_end
+              ? `${formatScheduledTime(policy.shift_start)} – ${formatScheduledTime(policy.shift_end)}`
+              : "Not configured"}
+          </strong>
+          <small>
+            {policy?.approved_leave_today
+              ? "Approved leave today"
+              : `${breaksToday.length} break${breaksToday.length === 1 ? "" : "s"} scheduled today`}
+          </small>
+        </div>
+        <div className="tp-card pg-kpi">
+          <span className="pg-stat-label">Signed in</span>
+          <strong className="is-accent">{signedIn}</strong>
+          <small>{signedInNote}</small>
+        </div>
+        <div className="tp-card pg-kpi">
+          <span className="pg-stat-label">Counted today</span>
+          <strong className="app-num">{formatDuration(countedTodaySeconds)}</strong>
+          <small>of {formatDuration(status.dailyTargetSeconds)} target</small>
+        </div>
+        <div className="tp-card pg-kpi">
+          <span className="pg-stat-label">Overtime</span>
+          <strong className="app-num">{formatDuration(extraSeconds)}</strong>
+          <small>{overtimeStatusLabel(extraSeconds, status.extraTimeStatus)}</small>
+        </div>
+      </section>
+
+      {!summary ? (
+        <section className="tp-card pg-card">
+          <p className="pg-empty">Your time summary has not loaded yet.</p>
+        </section>
+      ) : (
+        <div className="pg-periods">
+          {periods.map(({ key, title, range, data, target }) => {
+            if (!data) return null;
+            const counted = data.tracked_active_seconds + data.manual_approved_seconds;
+            const percent = target ? Math.min(100, Math.round((counted / target) * 100)) : null;
+            return (
+              <section key={key} className="tp-card pg-period" aria-label={title}>
+                <div className="pg-row-between">
+                  <span className="pg-stat-label">{title}</span>
+                  {range ? <span className="pg-period-range">{range}</span> : null}
+                </div>
+                <div className="pg-row-between pg-period-head">
+                  <strong className="pg-insight-total app-num">{formatDuration(counted)}</strong>
+                  {target ? (
+                    <span className="pg-target-tag">vs {formatTargetHours(target)} target</span>
+                  ) : null}
+                </div>
+                {percent !== null ? (
+                  <span className="pg-progress" role="img" aria-label={`${percent}% of target`}>
+                    <span style={{ width: `${Math.max(2, percent)}%` }} />
+                  </span>
+                ) : null}
+                <p className="pg-muted">
+                  Worked {formatDuration(data.tracked_active_seconds)} · manual approved{" "}
+                  {formatDuration(data.manual_approved_seconds)} · idle{" "}
+                  {formatDuration(data.idle_seconds)}
+                </p>
+              </section>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="pg-insights">
+        {days.length ? (
+          <section className="tp-card pg-card" aria-label="Daily load">
+            <div className="pg-card-head">
+              <div>
+                <h2>Daily load</h2>
+                <p className="pg-muted">
+                  Worked time each day against the {formatTargetHours(status.dailyTargetSeconds)} target
+                </p>
+              </div>
+              <span className="pg-target-tag">
+                {weekSessions} session{weekSessions === 1 ? "" : "s"}
+              </span>
+            </div>
+            <div className="pg-load" role="list">
+              {days.map((day) => (
+                <div
+                  key={day.date}
+                  role="listitem"
+                  className={`pg-load-day${day.date === todayKey ? " is-today" : ""}${
+                    isWorkingDay(day.date) ? "" : " is-off"
+                  }`}
+                  title={`${formatWeekday(day.date)} ${formatShortDate(day.date)}: ${formatDuration(day.active_seconds)} worked`}
+                >
+                  <span className="pg-load-value app-num">
+                    {day.active_seconds ? formatHoursMinutes(day.active_seconds) : ""}
+                  </span>
+                  <span className="pg-load-bar">
+                    <span
+                      style={{
+                        height: `${
+                          day.active_seconds
+                            ? Math.max(4, Math.round((day.active_seconds / loadMax) * 100))
+                            : 0
+                        }%`,
+                      }}
+                    />
+                    <i
+                      style={{ bottom: `${Math.round((status.dailyTargetSeconds / loadMax) * 100)}%` }}
+                      aria-hidden="true"
+                    />
+                  </span>
+                  <span className="pg-load-label">{formatWeekday(day.date)}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
+        {week ? (
+          <section className="tp-card pg-card" aria-label="Where this week went">
+            <div className="pg-card-head">
+              <h2>Where this week went</h2>
+            </div>
+            <WeekBars rows={weekRows} largest={largestWeekRow} />
+            <div className="pg-pills">
+              <span>
+                <i className="ri-camera-line" aria-hidden="true" /> {week.screenshot_count} captures
+              </span>
+              {summary?.month ? (
+                <span>
+                  <i className="ri-calendar-line" aria-hidden="true" /> Month{" "}
+                  {formatDuration(summary.month.tracked_active_seconds)}
+                </span>
+              ) : null}
+            </div>
+          </section>
+        ) : null}
+      </div>
+
+      {days.length ? (
+        <section className="tp-card pg-card" aria-label="This week's attendance">
+          <div className="pg-card-head">
+            <div>
+              <h2>This week&apos;s attendance</h2>
+              <p className="pg-muted">
+                {graceMinutes
+                  ? `Starting within ${graceMinutes} minutes of the shift start is not counted late.`
+                  : "Late time is counted from the shift start."}
+              </p>
+            </div>
+          </div>
+          <div className="pg-week-scroll">
+            <table className="pg-week-table">
+              <thead>
+                <tr>
+                  <th>Day</th>
+                  <th>Signed in</th>
+                  <th>Signed out</th>
+                  <th>Worked</th>
+                  <th>Payable</th>
+                  <th>Late</th>
+                  <th>Sessions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {days
+                  .filter((day) => day.date <= todayKey)
+                  .map((day) => {
+                    const late = lateLabel(day);
+                    return (
+                      <tr key={day.date} className={day.date === todayKey ? "is-today" : undefined}>
+                        <td>
+                          <strong>{formatWeekday(day.date)}</strong>{" "}
+                          <span className="pg-muted">{formatShortDate(day.date)}</span>
+                        </td>
+                        <td className="app-num">
+                          {day.start_time ? formatClock(day.start_time, timezone) : "—"}
+                        </td>
+                        <td className="app-num">
+                          {day.date === todayKey && status.todayTimeline?.is_running
+                            ? "Still working"
+                            : day.sign_out_at
+                              ? formatClock(day.sign_out_at, timezone)
+                              : day.end_time
+                                ? formatClock(day.end_time, timezone)
+                                : "—"}
+                        </td>
+                        <td className="app-num">{formatHoursMinutes(day.active_seconds)}</td>
+                        <td className="app-num">{formatHoursMinutes(day.payable_seconds)}</td>
+                        <td>
+                          {day.leave_status ? (
+                            <em className="pg-status is-soft approved">Leave</em>
+                          ) : !isWorkingDay(day.date) && !day.start_time ? (
+                            <em className="pg-status is-soft backlog">Day off</em>
+                          ) : !day.start_time && day.date < todayKey ? (
+                            <em className="pg-status is-soft rejected">No activity</em>
+                          ) : (
+                            <em
+                              className={`pg-status is-soft ${
+                                day.deductible_late_seconds > 0
+                                  ? "pending"
+                                  : late === "—"
+                                    ? "backlog"
+                                    : "approved"
+                              }`}
+                            >
+                              {late}
+                            </em>
+                          )}
+                        </td>
+                        <td className="app-num">{day.session_count}</td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
+
+      <div className="pg-insights">
+        <section className="tp-card pg-card" aria-label="Today's activity">
+          <div className="pg-card-head">
+            <h2>Today&apos;s activity</h2>
+            {todaySessions ? (
+              <span className="pg-target-tag">
+                {todaySessions} session{todaySessions === 1 ? "" : "s"}
+              </span>
+            ) : null}
+          </div>
+          {workRows.length ? (
+            <div className="pg-activity">
+              {workRows.map((interval) => (
+                <div key={`${interval.session_id}-${interval.started_at}`} className="pg-activity-item">
+                  <div className="pg-row-between">
+                    <span className="app-num">
+                      {formatClock(interval.started_at, timezone)} –{" "}
+                      {interval.is_current ? "now" : formatClock(interval.ended_at, timezone)}
+                    </span>
+                    <em className={`pg-status ${interval.is_current ? "inprogress" : "approved"}`}>
+                      {interval.is_current ? "Ongoing" : "Worked"}
+                    </em>
+                  </div>
+                  <strong dir="auto">
+                    {interval.task_name ?? interval.project_name ?? "No task selected"}
+                  </strong>
+                  <small className="app-num">{formatDuration(interval.duration_seconds)}</small>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="pg-empty">No worked time recorded yet today.</p>
+          )}
+          <p className="pg-note">
+            Every tracked minute is filed under the task selected in the tracker. Switching tasks never stops the clock.
+          </p>
+        </section>
+
+        <section className="tp-card pg-card" aria-label="Today's schedule">
+          <div className="pg-card-head">
+            <h2>How time is counted</h2>
+          </div>
+          <ul className="pg-rules">
+            <li>Worked time and approved manual time are counted. Idle, pending and rejected minutes never enter the total.</li>
+            <li>Resting during a paid scheduled break is paid time.</li>
+            {status.breakBank?.policy_active ? (
+              <li>Working through a scheduled break saves those minutes; they cover later idle today automatically.</li>
+            ) : null}
+            {graceMinutes ? (
+              <li>Starting within {graceMinutes} minutes of your shift start is not counted late.</li>
+            ) : null}
+            <li>Time outside your paid shift is recorded as extra time and needs HR/Admin approval before payroll.</li>
+          </ul>
+          {breaksToday.length ? (
+            <div className="pg-pills">
+              {breaksToday.map((item) => (
+                <span key={`${item.name}-${item.start}`}>
+                  <i className="ri-cup-line" aria-hidden="true" /> {item.name}
+                  {item.prayer ? ` · ${item.prayer}` : ""} {formatScheduledTime(item.start)}–
+                  {formatScheduledTime(item.end)}
+                </span>
+              ))}
+              <span className="is-ok">
+                <i className="ri-shield-check-line" aria-hidden="true" />{" "}
+                {formatDuration(status.dailyTargetSeconds)} target
+              </span>
+            </div>
+          ) : null}
+        </section>
+      </div>
+    </section>
+  );
+}
+
+const SETTINGS_SECTIONS = [
+  { id: "settings-appearance", label: "Appearance" },
+  { id: "settings-system", label: "System details" },
+  { id: "settings-account", label: "Signed-in account" },
+  { id: "settings-device", label: "Device account" },
+];
+
+function SettingsView({
+  status,
+  onLogout,
+  isLoggingOut,
+  theme,
+  onThemeChange,
+  skin,
+  onSkinChange,
+  onNotify,
+}: {
+  status: AgentStatus;
+  onLogout: () => void;
+  isLoggingOut: boolean;
+  theme: "light" | "dark";
+  onThemeChange: (theme: "light" | "dark") => void;
+  skin: Skin;
+  onSkinChange: (skin: Skin) => void;
+  onNotify: (message: string, tone?: "success" | "warning" | "error") => void;
+}) {
+  // View-only: whether the System details rows are shown.
+  const [showSystemDetails, setShowSystemDetails] = useState(true);
+  // View-only: the section in view, highlighted in "On this page".
+  const [activeSection, setActiveSection] = useState(SETTINGS_SECTIONS[0].id);
+  useEffect(() => {
+    const root = document.querySelector<HTMLElement>(".app-page");
+    const targets = SETTINGS_SECTIONS
+      .map((section) => document.getElementById(section.id))
+      .filter((element): element is HTMLElement => Boolean(element));
+    if (!root || !targets.length || typeof IntersectionObserver === "undefined") return;
+    const visible = new Map<string, boolean>();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) visible.set(entry.target.id, entry.isIntersecting);
+        const first = targets.find((element) => visible.get(element.id));
+        if (first) setActiveSection(first.id);
+      },
+      { root, rootMargin: "0px 0px -55% 0px" },
+    );
+    targets.forEach((element) => observer.observe(element));
+    return () => observer.disconnect();
+    // The section list is fixed for this view, so observe once.
+  }, []);
+  const systemDetailCount = 5 + (status.diagnostics ? 4 : 0);
+  const enrolledSince = status.attendanceWeek?.enrolled_at
+    ? new Intl.DateTimeFormat("en-US", { day: "numeric", month: "short", year: "numeric" }).format(
+        new Date(status.attendanceWeek.enrolled_at),
+      )
+    : null;
+
+  async function copy(label: string, value: string | null | undefined) {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      onNotify(`${label} copied`);
+    } catch {
+      onNotify(`Could not copy the ${label.toLowerCase()}`, "error");
+    }
+  }
+
+  const accountRows: Array<{ label: string; value: string | null; copy?: boolean; mono?: boolean }> = [
+    { label: "Employee", value: status.employeeName || null },
+    { label: "Work email", value: status.employeeEmail, copy: true },
+    { label: "Device", value: status.deviceName || null },
+    { label: "Device ID", value: status.deviceId, copy: true, mono: true },
+    { label: "MAC address", value: status.macAddress, copy: true, mono: true },
+    { label: "Local IP", value: status.localIpAddress, copy: true, mono: true },
+    { label: "Platform", value: status.platformLabel ?? null },
+  ];
+
+  return (
+    <section className="app-page pg-page">
+      <header className="pg-head">
+        <div>
+          <h1>Settings</h1>
+          <p>Device information and account controls.</p>
+        </div>
+      </header>
+      <div className="pg-settings">
+        <aside className="pg-settings-nav">
+          <span className="pg-stat-label">On this page</span>
+          {SETTINGS_SECTIONS.map((section) => (
+            <button
+              key={section.id}
+              type="button"
+              className={`pg-settings-link${activeSection === section.id ? " is-active" : ""}`}
+              aria-current={activeSection === section.id ? "true" : undefined}
+              onClick={() => {
+                setActiveSection(section.id);
+                document.getElementById(section.id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+              }}
+            >
+              {section.label}
+            </button>
+          ))}
+          <div className="tp-card pg-enrolled-card">
+            <span className={`pg-status ${status.enrolled ? "online" : "offline"}`}>
+              {status.enrolled ? "Enrolled device" : "Not enrolled"}
+            </span>
+            <p className="pg-muted">
+              {status.deviceName || "This computer"} is linked to an employee account and syncs while the shift runs.
+            </p>
+            {enrolledSince ? (
+              <small className="pg-hint">
+                <i className="ri-calendar-check-line" aria-hidden="true" /> Enrolled since {enrolledSince}
+              </small>
+            ) : null}
+          </div>
+        </aside>
+
+        <div className="pg-settings-main">
+          <section id="settings-appearance" className="tp-card pg-card" aria-label="Appearance">
+            <div className="pg-card-head">
+              <div>
+                <h2>Appearance</h2>
+                <p className="pg-muted">
+                  Pick one of the three styles, then its light or dark face. Saved on this computer.
+                </p>
+              </div>
+            </div>
+            <div className="pg-segment" role="group" aria-label="Light or dark">
+              {(["light", "dark"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  aria-pressed={theme === mode}
+                  className={theme === mode ? "active" : ""}
+                  onClick={() => onThemeChange(mode)}
+                >
+                  <i className={mode === "light" ? "ri-sun-line" : "ri-moon-line"} aria-hidden="true" />
+                  {mode === "light" ? "Light" : "Dark"}
+                </button>
+              ))}
+            </div>
+            <div className="pg-skins">
+              {SKINS.map((item) => {
+                const selected = item.key === skin;
+                const swatch = theme === "dark" ? item.swatchDark : item.swatch;
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    aria-pressed={selected}
+                    className={`pg-skin${selected ? " is-selected" : ""}`}
+                    onClick={() => onSkinChange(item.key)}
+                  >
+                    <span className="pg-skin-swatch" aria-hidden="true">
+                      {swatch.map((color) => (
+                        <span key={color} style={{ background: color }} />
+                      ))}
+                    </span>
+                    <span className="pg-row-between">
+                      <strong>{item.label}</strong>
+                      {selected ? <i className="ri-check-line" aria-hidden="true" /> : null}
+                    </span>
+                    <small>
+                      <i className="ri-palette-line" aria-hidden="true" /> {item.blurb}
+                    </small>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+
+          <section id="settings-system" className="tp-card pg-card" aria-label="System details">
+            <div className="pg-card-head">
+              <h2>System details</h2>
+              <button
+                type="button"
+                className="pg-btn pg-btn-xs"
+                aria-expanded={showSystemDetails}
+                onClick={() => setShowSystemDetails((value) => !value)}
+              >
+                {showSystemDetails ? "Hide" : "Show"}
+                <i className={showSystemDetails ? "ri-arrow-up-s-line" : "ri-arrow-down-s-line"} aria-hidden="true" />
+              </button>
+            </div>
+            {!showSystemDetails ? (
+              <p className="pg-hidden-summary">
+                <i className="ri-eye-off-line" aria-hidden="true" /> {systemDetailCount} details hidden · last sync{" "}
+                {formatTimestamp(status.lastSuccessfulSyncAt)}
+              </p>
+            ) : null}
+            {showSystemDetails && (
+              <dl className="pg-dl">
+                <div>
+                  <dt>Current session</dt>
+                  <dd>{formatTimestamp(status.sessionStartedAt)}</dd>
+                </div>
+                <div>
+                  <dt>Connection</dt>
+                  <dd>
+                    <span className={`pg-dot ${status.connectionStatus === "online" ? "is-ok" : "is-bad"}`} />
+                    {status.connectionStatus}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Last screenshot</dt>
+                  <dd>{formatTimestamp(status.lastScreenshotAt)}</dd>
+                </div>
+                <div>
+                  <dt>Last sync</dt>
+                  <dd>{formatTimestamp(status.lastSuccessfulSyncAt)}</dd>
+                </div>
+                <div>
+                  <dt>Agent version</dt>
+                  <dd>{status.agentVersion}</dd>
+                </div>
+                {status.diagnostics && (
+                  <>
+                    <div>
+                      <dt>Build</dt>
+                      <dd>
+                        {status.diagnostics.buildIdentifier} · {status.diagnostics.environment}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Process ID</dt>
+                      <dd>{status.diagnostics.processId}</dd>
+                    </div>
+                    <div>
+                      <dt>API base URL</dt>
+                      <dd className="pg-mono">{status.diagnostics.apiBaseUrl}</dd>
+                    </div>
+                    <div>
+                      <dt>Data directory</dt>
+                      <dd className="pg-mono">{status.diagnostics.userDataPath}</dd>
+                    </div>
+                  </>
+                )}
+              </dl>
+            )}
+          </section>
+
+          <section id="settings-account" className="tp-card pg-card" aria-label="Signed-in account">
+            <div className="pg-card-head">
+              <div>
+                <h2>Signed-in account</h2>
+                <p className="pg-muted">This employee account is linked to this Windows device.</p>
+              </div>
+              <span className={`pg-status ${status.enrolled ? "online" : "offline"}`}>
+                {status.enrolled ? "Enrolled" : "Not enrolled"}
+              </span>
+            </div>
+            <dl className="pg-dl">
+              {accountRows.map((row) => (
+                <div key={row.label}>
+                  <dt>{row.label}</dt>
+                  <dd className={row.mono ? "pg-mono" : undefined}>
+                    {row.value || "—"}
+                    {row.copy && row.value ? (
+                      <button
+                        type="button"
+                        className="pg-copy"
+                        aria-label={`Copy ${row.label.toLowerCase()}`}
+                        title={`Copy ${row.label.toLowerCase()}`}
+                        onClick={() => void copy(row.label, row.value)}
+                      >
+                        <i className="ri-file-copy-line" aria-hidden="true" />
+                      </button>
+                    ) : null}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          </section>
+
+          <section id="settings-device" className="tp-card pg-card" aria-label="Device account">
+            <div className="pg-card-head">
+              <h2>Device account</h2>
+            </div>
+            <div className="pg-signout-row">
+              <div>
+                <p className="pg-muted">Sign out only when this computer should stop tracking this employee.</p>
+                <small className="pg-hint">
+                  <i className="ri-shield-check-line" aria-hidden="true" /> Time already tracked stays on record after sign-out
+                </small>
+              </div>
+              <button className="pg-btn pg-btn-solid-danger" onClick={onLogout} disabled={isLoggingOut}>
+                <i className="ri-logout-box-r-line" aria-hidden="true" />
+                {isLoggingOut ? "Signing out..." : "Sign out from this device"}
+              </button>
+            </div>
+          </section>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function MoreView({
+  status,
+  timeRequestMinutes,
+  timeRequestReason,
+  timeRequestError,
+  timeRequestSuccess,
+  selectedIdleRequestKey,
+  idleRequestOptions,
+  earlyLeaveMinutes,
+  earlyLeaveReason,
+  leaveStartDate,
+  leaveEndDate,
+  leaveReason,
+  leaveRequestError,
+  leaveRequestSuccess,
+  isSubmittingLeaveRequest,
+  isSubmittingTimeRequest,
+  onLeaveStartDateChange,
+  onLeaveEndDateChange,
+  onLeaveReasonChange,
+  onSubmitLeaveRequest,
+  onTimeRequestMinutesChange,
+  onTimeRequestReasonChange,
+  onSelectedIdleRequestChange,
+  onEarlyLeaveMinutesChange,
+  onEarlyLeaveReasonChange,
+  onSubmitIdleTimeRequest,
+  onSubmitEarlyLeaveRequest,
+  onLogout,
+  isLoggingOut,
+}: {
+  status: AgentStatus;
+  timeRequestMinutes: number;
+  timeRequestReason: string;
+  timeRequestError: string | null;
+  timeRequestSuccess: string | null;
+  selectedIdleRequestKey: string;
+  idleRequestOptions: IdleRequestOption[];
+  earlyLeaveMinutes: number;
+  earlyLeaveReason: string;
+  leaveStartDate: string;
+  leaveEndDate: string;
+  leaveReason: string;
+  leaveRequestError: string | null;
+  leaveRequestSuccess: string | null;
+  isSubmittingLeaveRequest: boolean;
+  isSubmittingTimeRequest: boolean;
+  onLeaveStartDateChange: (value: string) => void;
+  onLeaveEndDateChange: (value: string) => void;
+  onLeaveReasonChange: (value: string) => void;
+  onSubmitLeaveRequest: (event: FormEvent<HTMLFormElement>) => void;
+  onTimeRequestMinutesChange: (value: number) => void;
+  onTimeRequestReasonChange: (value: string) => void;
+  onSelectedIdleRequestChange: (value: string) => void;
+  onEarlyLeaveMinutesChange: (value: number) => void;
+  onEarlyLeaveReasonChange: (value: string) => void;
+  onSubmitIdleTimeRequest: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmitEarlyLeaveRequest: (event: FormEvent<HTMLFormElement>) => void;
+  onLogout: () => void;
+  isLoggingOut: boolean;
+}) {
+  const selectedIdle =
+    idleRequestOptions.find(
+      (option) => option.key === selectedIdleRequestKey,
+    ) ??
+    idleRequestOptions[0] ??
+    null;
+  const maxIdleMinutes = selectedIdle
+    ? Math.max(1, requestableIdleMinutes(selectedIdle))
+    : 0;
+  const recentRequests = status.timeAdjustmentRequests.slice(0, 5);
+  return (
+    <section className="k-page">
+      <details className="k-panel k-system-panel">
+        <summary>System details</summary>
+        <dl className="k-details">
+          <div>
+            <dt>Current session</dt>
+            <dd>{formatTimestamp(status.sessionStartedAt)}</dd>
+          </div>
+          <div>
+            <dt>Connection</dt>
+            <dd>{status.connectionStatus}</dd>
+          </div>
+          <div>
+            <dt>Last screenshot</dt>
+            <dd>{formatTimestamp(status.lastScreenshotAt)}</dd>
+          </div>
+          <div>
+            <dt>Last sync</dt>
+            <dd>{formatTimestamp(status.lastSuccessfulSyncAt)}</dd>
+          </div>
+          <div>
+            <dt>Agent version</dt>
+            <dd>{status.agentVersion}</dd>
+          </div>
+          {status.diagnostics && (
+            <>
+              <div>
+                <dt>Build</dt>
+                <dd>
+                  {status.diagnostics.buildIdentifier} ·{" "}
+                  {status.diagnostics.environment}
+                </dd>
+              </div>
+              <div>
+                <dt>Process ID</dt>
+                <dd>{status.diagnostics.processId}</dd>
+              </div>
+              <div>
+                <dt>API base URL</dt>
+                <dd className="k-details-mono">{status.diagnostics.apiBaseUrl}</dd>
+              </div>
+              <div>
+                <dt>Data directory</dt>
+                <dd className="k-details-mono">
+                  {status.diagnostics.userDataPath}
+                </dd>
+              </div>
+            </>
+          )}
+        </dl>
+      </details>
+
+      <div className="k-request-grid">
+        <article className="k-panel k-request-card">
+          <header className="k-request-card-header">
+            <span className="k-request-icon">
+              <KIcon name="calendar" />
+            </span>
+            <div>
+              <h2>Holiday request</h2>
+              <p className="k-muted">
+                {status.leaveRequests?.balance.remaining_days ?? "-"} of{" "}
+                {status.leaveRequests?.balance.credit_days ?? "-"} annual days
+                available
+              </p>
+            </div>
+          </header>
+          <form className="k-form" onSubmit={onSubmitLeaveRequest}>
+            <div className="k-form-grid">
+              <label>
+                From
+                <input
+                  type="date"
+                  value={leaveStartDate}
+                  onChange={(event) =>
+                    onLeaveStartDateChange(event.target.value)
+                  }
+                  required
+                />
+              </label>
+              <label>
+                To
+                <input
+                  type="date"
+                  value={leaveEndDate}
+                  onChange={(event) => onLeaveEndDateChange(event.target.value)}
+                  required
+                />
+              </label>
+            </div>
+            <label>
+              Reason (optional)
+              <textarea
+                value={leaveReason}
+                onChange={(event) => onLeaveReasonChange(event.target.value)}
+                maxLength={1000}
+                placeholder="Family event, personal appointment..."
+              />
+            </label>
+            <button className="k-primary" disabled={isSubmittingLeaveRequest}>
+              {isSubmittingLeaveRequest ? "Sending..." : "Request holiday"}
+            </button>
+            {leaveRequestError && (
+              <p className="k-error">{leaveRequestError}</p>
+            )}
+            {leaveRequestSuccess && (
+              <p className="k-success">{leaveRequestSuccess}</p>
+            )}
+          </form>
+          {status.leaveRequests?.requests?.length ? (
+            <div className="k-mini-list">
+              {status.leaveRequests.requests.slice(0, 3).map((request) => (
+                <div key={request.id}>
+                  <span>
+                    {request.start_date} – {request.end_date}
+                  </span>
+                  <strong>{request.status}</strong>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </article>
+
+        <article className="k-panel k-request-card k-request-card-highlight">
+          <header className="k-request-card-header">
+            <span className="k-request-icon">
+              <KIcon name="idle" />
+            </span>
+            <div>
+              <h2>Idle time correction</h2>
+              <p className="k-muted">
+                Explain completed idle time and send it for approval.
+              </p>
+            </div>
+          </header>
+          <form className="k-form" onSubmit={onSubmitIdleTimeRequest}>
+            <label>
+              Idle period
+              <select
+                value={selectedIdle?.key ?? ""}
+                onChange={(event) =>
+                  onSelectedIdleRequestChange(event.target.value)
+                }
+                disabled={!idleRequestOptions.length}
+              >
+                {idleRequestOptions.length ? (
+                  idleRequestOptions.map((option) => (
+                    <option key={option.key} value={option.key}>
+                      {formatClock(
+                        option.startedAt,
+                        status.todayTimeline?.timezone ?? "UTC",
+                      )}{" "}
+                      -{" "}
+                      {formatClock(
+                        option.endedAt,
+                        status.todayTimeline?.timezone ?? "UTC",
+                      )}
+                      {" | "}
+                      {formatDuration(option.durationSeconds)} idle | up to{" "}
+                      {requestableIdleMinutes(option)} min
+                    </option>
+                  ))
+                ) : (
+                  <option value="">No idle time available</option>
+                )}
+              </select>
+            </label>
+            <div className="k-request-meter">
+              <span>Idle period / maximum request</span>
+              <strong>
+                {selectedIdle
+                  ? `${formatDuration(selectedIdle.durationSeconds)} / ${requestableIdleMinutes(selectedIdle)} min`
+                  : "00:00:00 / 0 min"}
+              </strong>
+            </div>
+            <label>
+              Minutes to count
+              <input
+                id="time-request-minutes"
+                type="number"
+                min={1}
+                max={maxIdleMinutes || 1}
+                value={timeRequestMinutes}
+                disabled={!selectedIdle}
+                onChange={(event) =>
+                  onTimeRequestMinutesChange(
+                    Math.min(
+                      Math.max(1, Number(event.target.value)),
+                      maxIdleMinutes || 1,
+                    ),
+                  )
+                }
+              />
+            </label>
+            <label>
+              What were you doing?
+              <textarea
+                id="time-request-reason"
+                value={timeRequestReason}
+                onChange={(event) =>
+                  onTimeRequestReasonChange(event.target.value)
+                }
+                minLength={3}
+                maxLength={1000}
+                placeholder="Client call, offline task, meeting, system issue..."
+                required
+                disabled={!selectedIdle}
+              />
+            </label>
+            <button
+              className="k-primary"
+              disabled={
+                isSubmittingTimeRequest ||
+                !selectedIdle ||
+                timeRequestMinutes < 1
+              }
+            >
+              {isSubmittingTimeRequest ? "Submitting..." : "Request idle time"}
+            </button>
+            {timeRequestError && <p className="k-error">{timeRequestError}</p>}
+            {timeRequestSuccess && (
+              <p className="k-success">{timeRequestSuccess}</p>
+            )}
+          </form>
+        </article>
+
+        <article className="k-panel k-request-card">
+          <header className="k-request-card-header">
+            <span className="k-request-icon">
+              <KIcon name="timer" />
+            </span>
+            <div>
+              <h2>Early leave</h2>
+              <p className="k-muted">
+                Request up to 2 hours. HR or an admin will review it.
+              </p>
+            </div>
+          </header>
+          <form className="k-form" onSubmit={onSubmitEarlyLeaveRequest}>
+            <label>
+              Date
+              <input type="date" value={localDateKey()} disabled />
+            </label>
+            <label>
+              Permission minutes
+              <input
+                type="number"
+                min={1}
+                max={120}
+                value={earlyLeaveMinutes}
+                onChange={(event) =>
+                  onEarlyLeaveMinutesChange(
+                    Math.min(120, Math.max(1, Number(event.target.value))),
+                  )
+                }
+              />
+            </label>
+            <label>
+              Reason
+              <textarea
+                value={earlyLeaveReason}
+                onChange={(event) =>
+                  onEarlyLeaveReasonChange(event.target.value)
+                }
+                minLength={3}
+                maxLength={1000}
+                placeholder="Doctor appointment, family emergency..."
+                required
+              />
+            </label>
+            <button
+              className="k-secondary-action"
+              disabled={isSubmittingTimeRequest || earlyLeaveMinutes < 1}
+            >
+              {isSubmittingTimeRequest ? "Submitting..." : "Request permission"}
+            </button>
+          </form>
+        </article>
+      </div>
+
+      <div className="k-panel k-request-history">
+        <h2>Recent time requests</h2>
+        <div className="k-mini-list">
+          {recentRequests.length ? (
+            recentRequests.map((request) => (
+              <div key={request.id}>
+                <span>
+                  {(request.request_type === "idle_time" && "Idle time") ||
+                    (request.request_type === "early_leave" && "Early leave") ||
+                    "Manual time"}{" "}
+                  · {formatDuration(request.requested_minutes * 60)}
+                </span>
+                <strong>{request.status}</strong>
+              </div>
+            ))
+          ) : (
+            <div>
+              <span>No time requests yet</span>
+              <strong>-</strong>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="k-panel k-device-account">
+        <h2>Device account</h2>
+        <p className="k-muted">
+          Sign out only when this computer should stop tracking this employee.
+        </p>
+        <button
+          className="k-danger-button"
+          onClick={onLogout}
+          disabled={isLoggingOut}
+        >
+          {isLoggingOut ? "Signing out..." : "Sign out from this device"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+// Kept temporarily for compatibility with older renderer snapshots; the live
+// application uses RequestCentreView above.
+void MoreView;
+
+export default App;

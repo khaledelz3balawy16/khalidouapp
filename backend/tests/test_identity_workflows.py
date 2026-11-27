@@ -1,0 +1,1639 @@
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
+from sqlalchemy import create_engine
+
+from app.api.v1 import people as people_api
+from app.core.config import settings
+from app.core.security import (
+    create_jwt_token,
+    decode_jwt_token,
+    hash_password,
+    hash_token,
+    verify_password,
+)
+from app.database.base import Base
+from app.database.session import get_db
+from app.main import app
+from app.models import (
+    AdminPasswordResetToken,
+    AdminUser,
+    Company,
+    Device,
+    DeviceToken,
+    EmailDelivery,
+    Employee,
+    EmployeeInvitation,
+    Team,
+    TeamMember,
+    TeamOwner,
+)
+
+
+def employee_onboarding_payload() -> dict:
+    return {
+        "start_date": "2026-01-01",
+        "annual_leave_days": 21,
+        "work_profile": {
+            "shift_start": "10:00",
+            "shift_end": "18:00",
+            "working_days": [0, 1, 2, 3, 4],
+            "weekly_off_days": [5, 6],
+            "required_daily_minutes": 480,
+            "break_rules": [
+                {
+                    "name": "Lunch",
+                    "minutes": 30,
+                    "paid": False,
+                    "start_time": "13:00",
+                    "end_time": "13:30",
+                },
+                {
+                    "name": "Short break",
+                    "minutes": 15,
+                    "paid": False,
+                    "start_time": "16:30",
+                    "end_time": "16:45",
+                },
+            ],
+            "late_grace_minutes": 15,
+            "deduction_policy": {
+                "mode": "review",
+                "brackets": [],
+                "require_admin_review": True,
+            },
+            "salary_amount": 0,
+            "salary_currency": "EGP",
+            "salary_type": "monthly",
+        },
+    }
+
+
+@pytest.fixture()
+def identity_client():
+    engine = create_engine(
+        'CHANGE_ME',
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    testing_session = sessionmaker(
+        bind=engine,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+
+    def override_get_db():
+        db = testing_session()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    db: Session = testing_session()
+    company = Company(name="Kent Test", status="active")
+    db.add(company)
+    db.flush()
+    general_admin = AdminUser(
+        company_id=company.id,
+        name="General Admin",
+        email='contact+0e99c26b71ca@example.com',
+        password_hash=hash_password('CHANGE_ME'),
+        role="general_admin",
+        status="active",
+    )
+    team_a = Team(company_id=company.id, name="Team A", status="active")
+    team_b = Team(company_id=company.id, name="Team B", status="active")
+    db.add_all([general_admin, team_a, team_b])
+    db.commit()
+
+    token = create_jwt_token(
+        subject=general_admin.id,
+        company_id=company.id,
+        token_type="access",
+        expires_delta=timedelta(minutes=30),
+        extra_claims={"role": general_admin.role},
+    )
+    data = {
+        "session_factory": testing_session,
+        "general_admin": general_admin,
+        "general_headers": {"Authorization": f"Bearer {token}"},
+        "team_a": team_a,
+        "team_b": team_b,
+    }
+    db.close()
+    try:
+        yield TestClient(app), data
+    finally:
+        app.dependency_overrides.clear()
+        Base.metadata.drop_all(engine)
+
+
+def test_password_reset_uses_one_time_link_and_revokes_old_sessions(identity_client, monkeypatch):
+    client, data = identity_client
+    raw_reset_token = 'CHANGE_ME'
+    monkeypatch.setattr(
+        "app.api.v1.auth.secrets.token_urlsafe",
+        lambda _length: raw_reset_token,
+    )
+
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"email": 'contact+0e99c26b71ca@example.com', "password": 'CHANGE_ME'},
+    )
+    old_refresh_token = login.json()["data"]["refresh_token"]
+    forgot = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": 'contact+0e99c26b71ca@example.com'},
+    )
+    old_password_still_works = client.post(
+        "/api/v1/auth/login",
+        json={"email": 'contact+0e99c26b71ca@example.com', "password": 'CHANGE_ME'},
+    )
+
+    db: Session = data["session_factory"]()
+    try:
+        reset_rows = db.scalars(select(AdminPasswordResetToken)).all()
+        deliveries = db.scalars(
+            select(EmailDelivery).where(EmailDelivery.category == "admin_password_reset")
+        ).all()
+    finally:
+        db.close()
+
+    assert forgot.status_code == 200
+    assert old_password_still_works.status_code == 200
+    assert len(reset_rows) == 1
+    assert len(deliveries) == 1
+    assert deliveries[0].recipient == 'contact+0e99c26b71ca@example.com'
+    assert deliveries[0].status == "suppressed"
+
+    reset = client.post(
+        "/api/v1/auth/reset-password",
+        json={"token": raw_reset_token, "new_password": 'CHANGE_ME'},
+    )
+    old_login = client.post(
+        "/api/v1/auth/login",
+        json={"email": 'contact+0e99c26b71ca@example.com', "password": 'CHANGE_ME'},
+    )
+    new_login = client.post(
+        "/api/v1/auth/login",
+        json={"email": 'contact+0e99c26b71ca@example.com', "password": 'CHANGE_ME'},
+    )
+    old_refresh = client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": old_refresh_token},
+    )
+    reused = client.post(
+        "/api/v1/auth/reset-password",
+        json={"token": raw_reset_token, "new_password": 'CHANGE_ME'},
+    )
+
+    assert reset.status_code == 200
+    assert old_login.status_code == 401
+    assert new_login.status_code == 200
+    assert old_refresh.status_code == 401
+    assert reused.status_code == 400
+
+
+def test_admin_login_is_case_insensitive_for_legacy_mixed_case_email(identity_client):
+    client, data = identity_client
+    db: Session = data["session_factory"]()
+    try:
+        admin = db.get(AdminUser, data["general_admin"].id)
+        admin.email = 'contact+1ac6d375d16f@example.com'
+        db.add(admin)
+        db.commit()
+    finally:
+        db.close()
+
+    mixed_case_login = client.post(
+        "/api/v1/auth/login",
+        json={"email": 'contact+1ac6d375d16f@example.com', "password": 'CHANGE_ME'},
+    )
+    lowercase_login = client.post(
+        "/api/v1/auth/login",
+        json={"email": 'contact+1ac6d375d16f@example.com', "password": 'CHANGE_ME'},
+    )
+
+    assert mixed_case_login.status_code == 200
+    assert lowercase_login.status_code == 200
+
+
+def test_admin_login_returns_profile_without_a_second_request(identity_client):
+    client, data = identity_client
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"email": 'contact+0e99c26b71ca@example.com', "password": 'CHANGE_ME'},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["access_token"]
+    assert payload["refresh_token"]
+    assert payload["user"]["id"] == str(data["general_admin"].id)
+    assert payload["user"]["employee_id"]
+    assert payload["user"]["email"] == 'contact+0e99c26b71ca@example.com'
+
+
+def test_admin_login_selects_the_unique_password_matching_tenant(identity_client):
+    client, data = identity_client
+    db: Session = data["session_factory"]()
+    try:
+        other_company = Company(name="Other tenant", status="active")
+        db.add(other_company)
+        db.flush()
+        db.add(
+            AdminUser(
+                company_id=other_company.id,
+                name="Other Admin",
+                email=data["general_admin"].email,
+                password_hash=hash_password('CHANGE_ME'),
+                role="general_admin",
+                status="active",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": data["general_admin"].email,
+            "password": 'CHANGE_ME',
+        },
+    )
+
+    assert response.status_code == 200
+    payload = decode_jwt_token(response.json()["data"]["access_token"])
+    assert payload["company_id"] == str(data["general_admin"].company_id)
+
+
+def test_admin_login_rejects_credentials_matching_multiple_tenants(identity_client):
+    client, data = identity_client
+    db: Session = data["session_factory"]()
+    try:
+        other_company = Company(name="Ambiguous tenant", status="active")
+        db.add(other_company)
+        db.flush()
+        db.add(
+            AdminUser(
+                company_id=other_company.id,
+                name="Ambiguous Admin",
+                email=data["general_admin"].email,
+                password_hash=hash_password('CHANGE_ME'),
+                role="general_admin",
+                status="active",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": data["general_admin"].email,
+            "password": 'CHANGE_ME',
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "INVALID_CREDENTIALS"
+
+
+def test_employee_login_rejects_credentials_matching_multiple_tenants(identity_client):
+    client, data = identity_client
+    db: Session = data["session_factory"]()
+    try:
+        other_company = Company(name="Employee tenant", status="active")
+        db.add(other_company)
+        db.flush()
+        shared_password = hash_password('CHANGE_ME')
+        db.add_all(
+            [
+                Employee(
+                    company_id=data["general_admin"].company_id,
+                    name="First Employee",
+                    email="shared.employee@example.com",
+                    employee_code="SHARED-1",
+                    portal_password_hash=shared_password,
+                    status="active",
+                ),
+                Employee(
+                    company_id=other_company.id,
+                    name="Second Employee",
+                    email="shared.employee@example.com",
+                    employee_code="SHARED-2",
+                    portal_password_hash=shared_password,
+                    status="active",
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/v1/employee-auth/login",
+        json={
+            "email": "shared.employee@example.com",
+            "password": 'CHANGE_ME',
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "INVALID_EMPLOYEE_LOGIN"
+
+
+def test_each_allowed_password_reset_click_creates_a_new_link_and_silently_throttles_rapid_resends(
+    identity_client,
+    monkeypatch,
+):
+    client, data = identity_client
+    raw_tokens = iter(
+        [
+            'CHANGE_ME',
+            'CHANGE_ME',
+        ]
+    )
+    monkeypatch.setattr(
+        "app.api.v1.auth.secrets.token_urlsafe",
+        lambda _length: next(raw_tokens),
+    )
+
+    first = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": 'contact+0e99c26b71ca@example.com'},
+    )
+    rapid_resend = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": 'contact+0e99c26b71ca@example.com'},
+    )
+
+    db: Session = data["session_factory"]()
+    try:
+        first_delivery = db.scalar(
+            select(EmailDelivery).where(EmailDelivery.category == "admin_password_reset")
+        )
+        first_delivery.created_at = datetime.now(UTC) - timedelta(
+            seconds=settings.password_reset_email_cooldown_seconds + 1
+        )
+        db.add(first_delivery)
+        db.commit()
+    finally:
+        db.close()
+
+    second = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": 'contact+0e99c26b71ca@example.com'},
+    )
+
+    db = data["session_factory"]()
+    try:
+        reset_rows = db.scalars(
+            select(AdminPasswordResetToken).order_by(AdminPasswordResetToken.created_at)
+        ).all()
+        deliveries = db.scalars(
+            select(EmailDelivery).where(EmailDelivery.category == "admin_password_reset")
+        ).all()
+    finally:
+        db.close()
+
+    old_link = client.post(
+        "/api/v1/auth/reset-password",
+        json={
+            "token": 'CHANGE_ME',
+            "new_password": 'CHANGE_ME',
+        },
+    )
+    newest_link = client.post(
+        "/api/v1/auth/reset-password",
+        json={
+            "token": 'CHANGE_ME',
+            "new_password": 'CHANGE_ME',
+        },
+    )
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"email": 'contact+0e99c26b71ca@example.com', "password": 'CHANGE_ME'},
+    )
+
+    assert first.status_code == 200
+    assert rapid_resend.status_code == 200
+    assert second.status_code == 200
+    assert len(reset_rows) == 2
+    assert reset_rows[0].used_at is not None
+    assert reset_rows[1].used_at is None
+    assert len(deliveries) == 2
+    assert old_link.status_code == 400
+    assert newest_link.status_code == 200
+    assert login.status_code == 200
+
+
+def test_unknown_password_reset_is_non_enumerating(identity_client):
+    client, data = identity_client
+    response = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": 'contact+29dbc260eff4@example.com'},
+    )
+    db: Session = data["session_factory"]()
+    try:
+        assert db.scalar(select(AdminPasswordResetToken.id)) is None
+        assert db.scalar(select(EmailDelivery.id)) is None
+    finally:
+        db.close()
+    assert response.status_code == 200
+    assert "If the account exists" in response.json()["data"]["message"]
+
+
+def test_ambiguous_cross_tenant_password_reset_does_not_choose_an_account(identity_client):
+    client, data = identity_client
+    db: Session = data["session_factory"]()
+    try:
+        other_company = Company(name="Reset ambiguity tenant", status="active")
+        db.add(other_company)
+        db.flush()
+        db.add(
+            AdminUser(
+                company_id=other_company.id,
+                name="Other Reset Admin",
+                email=data["general_admin"].email,
+                password_hash=hash_password("OtherPassword123!"),
+                role="general_admin",
+                status="active",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": data["general_admin"].email},
+    )
+
+    db = data["session_factory"]()
+    try:
+        assert db.scalar(select(AdminPasswordResetToken.id)) is None
+        assert db.scalar(select(EmailDelivery.id)) is None
+    finally:
+        db.close()
+    assert response.status_code == 200
+    assert "If the account exists" in response.json()["data"]["message"]
+
+
+def test_invited_admin_accepts_link_then_can_change_password(identity_client, monkeypatch):
+    client, data = identity_client
+    raw_token = 'CHANGE_ME'
+    monkeypatch.setattr(
+        "app.services.employee_invitations.secrets.token_urlsafe",
+        lambda _length: raw_token,
+    )
+    created = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Password Change Manager",
+            "email": 'contact+c4609664cf7e@example.com',
+            "kind": "team_manager",
+            "team_ids": [str(data["team_a"].id)],
+            **employee_onboarding_payload(),
+        },
+    )
+    before_accept = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": 'contact+c4609664cf7e@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+    accepted = client.post(
+        f"/api/v1/people/invitations/{raw_token}",
+        json={"password": 'CHANGE_ME'},
+    )
+    login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": 'contact+c4609664cf7e@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+    tokens = login.json()["data"]
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+
+    wrong_current = client.post(
+        "/api/v1/auth/change-password",
+        headers=headers,
+        json={"current_password": 'CHANGE_ME', "new_password": 'CHANGE_ME'},
+    )
+    changed = client.post(
+        "/api/v1/auth/change-password",
+        headers=headers,
+        json={
+            "current_password": 'CHANGE_ME',
+            "new_password": 'CHANGE_ME',
+        },
+    )
+    old_refresh = client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": tokens["refresh_token"]},
+    )
+    old_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": 'contact+c4609664cf7e@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+    new_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": 'contact+c4609664cf7e@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+    employee_app_login = client.post(
+        "/api/v1/employee-auth/login",
+        json={
+            "email": 'contact+c4609664cf7e@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+
+    assert created.status_code == 200
+    assert created.json()["data"]["invitation"]["status"] == "pending"
+    assert before_accept.status_code == 401
+    assert accepted.status_code == 200
+    assert login.status_code == 200
+    assert wrong_current.status_code == 400
+    assert changed.status_code == 200
+    assert old_refresh.status_code == 401
+    assert old_login.status_code == 401
+    assert new_login.status_code == 200
+    assert employee_app_login.status_code == 200
+
+
+def test_inviting_team_manager_is_atomic_and_permissions_are_scoped(identity_client, monkeypatch):
+    client, data = identity_client
+    raw_token = 'CHANGE_ME'
+    monkeypatch.setattr(
+        "app.services.employee_invitations.secrets.token_urlsafe",
+        lambda _length: raw_token,
+    )
+    invited = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Team Manager",
+            "email": 'contact+29c794fd7765@example.com',
+            "kind": "team_manager",
+            "team_ids": [str(data["team_a"].id)],
+            "timezone": "Africa/Cairo",
+            **employee_onboarding_payload(),
+        },
+    )
+    assert invited.status_code == 200
+    invitation = invited.json()["data"]
+    assert invitation["email_queued"] is True
+    assert invitation["invitation"]["status"] == "pending"
+
+    db: Session = data["session_factory"]()
+    try:
+        manager = db.scalar(
+            select(AdminUser).where(AdminUser.email == 'contact+29c794fd7765@example.com')
+        )
+        employee = db.scalar(select(Employee).where(Employee.email == 'contact+29c794fd7765@example.com'))
+        membership = db.scalar(
+            select(TeamMember).where(
+                TeamMember.team_id == data["team_a"].id,
+                TeamMember.employee_id == employee.id,
+            )
+        )
+        ownership = db.scalar(
+            select(TeamOwner).where(
+                TeamOwner.team_id == data["team_a"].id,
+                TeamOwner.admin_user_id == manager.id,
+            )
+        )
+        delivery = db.scalar(
+            select(EmailDelivery).where(EmailDelivery.recipient == 'contact+29c794fd7765@example.com')
+        )
+        assert manager.employee_id == employee.id
+        assert manager.role == "team_owner"
+        assert manager.status == "invited"
+        assert employee.status == "invited"
+        assert employee.timezone == "Africa/Cairo"
+        assert employee.start_date.isoformat() == "2026-01-01"
+        assert employee.work_profile.shift_start.isoformat() == "10:00:00"
+        assert employee.work_profile.shift_end.isoformat() == "18:00:00"
+        assert len(employee.work_profile.break_rules) == 2
+        assert employee.work_profile.overtime_enabled is False
+        assert membership is not None and membership.status == "active"
+        assert ownership is not None
+        assert delivery.category == "employee_invitation"
+        assert delivery.status == "suppressed"
+    finally:
+        db.close()
+
+    before_accept = client.post(
+        "/api/v1/auth/login",
+        json={"email": 'contact+29c794fd7765@example.com', "password": 'CHANGE_ME'},
+    )
+    verified = client.get(f"/api/v1/people/invitations/{raw_token}")
+    accepted = client.post(
+        f"/api/v1/people/invitations/{raw_token}",
+        json={"password": 'CHANGE_ME'},
+    )
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"email": 'contact+29c794fd7765@example.com', "password": 'CHANGE_ME'},
+    )
+    employee_app_login = client.post(
+        "/api/v1/employee-auth/login",
+        json={"email": 'contact+29c794fd7765@example.com', "password": 'CHANGE_ME'},
+    )
+    manager_headers = {"Authorization": f"Bearer {login.json()['data']['access_token']}"}
+    me = client.get("/api/v1/auth/me", headers=manager_headers)
+    own_team = client.get(f"/api/v1/teams/{data['team_a'].id}", headers=manager_headers)
+    other_team = client.get(f"/api/v1/teams/{data['team_b'].id}", headers=manager_headers)
+    users = client.get("/api/v1/users", headers=manager_headers)
+    invite_attempt = client.post(
+        "/api/v1/people/invitations",
+        headers=manager_headers,
+        json={
+            "name": "Unauthorized User",
+            "email": 'contact+1649b9c83bd9@example.com',
+            "kind": "employee",
+            "team_ids": [str(data["team_a"].id)],
+        },
+    )
+
+    assert before_accept.status_code == 401
+    assert verified.status_code == 200
+    assert verified.json()["data"]["kind"] == "team_manager"
+    assert accepted.status_code == 200
+    assert accepted.json()["data"]["admin_user_id"] == invitation["admin_user_id"]
+    assert login.status_code == 200
+    assert employee_app_login.status_code == 200
+    assert me.status_code == 200
+    assert "tasks.manage_team" in me.json()["data"]["permissions"]
+    assert "company.manage" not in me.json()["data"]["permissions"]
+    assert own_team.status_code == 200
+    assert other_team.status_code == 403
+    assert users.status_code == 403
+    assert invite_attempt.status_code == 403
+
+
+def test_general_admin_can_invite_employee_and_other_general_admin(identity_client):
+    client, data = identity_client
+    employee_response = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "New Employee",
+            "email": 'contact+bd884fec621c@example.com',
+            "kind": "employee",
+            "team_ids": [str(data["team_b"].id)],
+            **employee_onboarding_payload(),
+        },
+    )
+    admin_response = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Another General Admin",
+            "email": 'contact+0285208ef954@example.com',
+            "kind": "general_admin",
+            "job_title": "Operations Manager",
+            "team_ids": [],
+            **employee_onboarding_payload(),
+        },
+    )
+    hr_response = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "People Partner",
+            "email": 'contact+f3e62bf6a74f@example.com',
+            "kind": "hr",
+            "job_title": "HR Manager",
+            "team_ids": [],
+            **employee_onboarding_payload(),
+        },
+    )
+    me = client.get("/api/v1/auth/me", headers=data["general_headers"])
+
+    db: Session = data["session_factory"]()
+    try:
+        deliveries = db.scalars(select(EmailDelivery).order_by(EmailDelivery.recipient)).all()
+        invited_employee = db.scalar(
+            select(Employee).where(Employee.email == 'contact+bd884fec621c@example.com')
+        )
+        invited_admin = db.scalar(
+            select(AdminUser).where(AdminUser.email == 'contact+0285208ef954@example.com')
+        )
+        invited_hr = db.scalar(select(AdminUser).where(AdminUser.email == 'contact+f3e62bf6a74f@example.com'))
+        assert {row.category for row in deliveries} == {"employee_invitation"}
+        assert invited_employee is not None
+        assert invited_admin is not None and invited_admin.role == "general_admin"
+        assert invited_admin.status == "invited"
+        assert invited_admin.employee is not None
+        assert invited_admin.employee.status == "invited"
+        assert invited_admin.employee.job_title == "Operations Manager"
+        assert invited_admin.employee.work_profile.required_daily_minutes == 480
+        assert len(invited_admin.employee.work_profile.break_rules) == 2
+        assert invited_hr is not None and invited_hr.role == "hr"
+        assert invited_hr.status == "invited"
+        assert invited_hr.employee is not None
+        assert invited_hr.employee.work_profile.shift_start.isoformat() == "10:00:00"
+    finally:
+        db.close()
+
+    assert employee_response.status_code == 200
+    assert admin_response.status_code == 200
+    assert hr_response.status_code == 200
+    assert me.status_code == 200
+    assert "company.manage" in me.json()["data"]["permissions"]
+    assert "admins.manage" in me.json()["data"]["permissions"]
+
+
+def test_general_admin_can_sign_in_to_employee_portal(identity_client):
+    client, data = identity_client
+
+    login = client.post(
+        "/api/v1/employee-auth/login",
+        json={
+            "email": 'contact+0e99c26b71ca@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+
+    assert login.status_code == 200
+    response_data = login.json()["data"]
+    assert response_data["employee"]["email"] == 'contact+0e99c26b71ca@example.com'
+    assert response_data["employee"]["status"] == "active"
+    assert response_data["access_token"]
+
+    db: Session = data["session_factory"]()
+    try:
+        admin = db.get(AdminUser, data["general_admin"].id)
+        employee = db.get(Employee, UUID(response_data["employee"]["id"]))
+        assert employee is not None
+        assert admin.employee_id == employee.id
+        assert employee.portal_password_hash == admin.password_hash
+    finally:
+        db.close()
+
+
+def test_protected_super_admin_can_use_employee_tracking_account(identity_client):
+    client, data = identity_client
+    db: Session = data["session_factory"]()
+    try:
+        password_hash = hash_password('CHANGE_ME')
+        admin = AdminUser(
+            company_id=data["general_admin"].company_id,
+            name="Protected Owner",
+            email='contact+c2089d8f0c44@example.com',
+            password_hash=password_hash,
+            role="general_admin",
+            is_super_admin=True,
+            status="active",
+        )
+        db.add(admin)
+        db.commit()
+        admin_id = admin.id
+    finally:
+        db.close()
+
+    employee_login = client.post(
+        "/api/v1/employee-auth/login",
+        json={
+            "email": 'contact+c2089d8f0c44@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+    admin_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": 'contact+c2089d8f0c44@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+    headers = {"Authorization": f"Bearer {admin_login.json()['data']['access_token']}"}
+    me = client.get("/api/v1/auth/me", headers=headers)
+
+    assert employee_login.status_code == 200
+    assert admin_login.status_code == 200
+    assert me.status_code == 200
+    employee_id = UUID(employee_login.json()["data"]["employee"]["id"])
+    assert me.json()["data"]["employee_id"] == str(employee_id)
+
+    db = data["session_factory"]()
+    try:
+        admin = db.get(AdminUser, admin_id)
+        employee = db.get(Employee, employee_id)
+        assert admin.employee_id == employee.id
+        assert employee.status == "active"
+        assert employee.job_title == "Super admin"
+        assert employee.portal_password_hash == admin.password_hash
+        assert employee.work_profile is not None
+    finally:
+        db.close()
+
+
+def test_general_admin_can_reset_manager_password_and_queue_reset_email(
+    identity_client, monkeypatch
+):
+    client, data = identity_client
+    raw_token = 'CHANGE_ME'
+    monkeypatch.setattr(
+        "app.services.employee_invitations.secrets.token_urlsafe",
+        lambda _length: raw_token,
+    )
+    invited = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Password Reset Manager",
+            "email": 'contact+b33f7f077386@example.com',
+            "kind": "team_manager",
+            "team_ids": [str(data["team_a"].id)],
+            **employee_onboarding_payload(),
+        },
+    )
+    admin_id = invited.json()["data"]["admin_user_id"]
+    accepted = client.post(
+        f"/api/v1/people/invitations/{raw_token}",
+        json={"password": 'CHANGE_ME'},
+    )
+    changed = client.patch(
+        f"/api/v1/users/{admin_id}",
+        headers=data["general_headers"],
+        json={"password": 'CHANGE_ME'},
+    )
+    old_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": 'contact+b33f7f077386@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+    new_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": 'contact+b33f7f077386@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+    db: Session = data["session_factory"]()
+    try:
+        deliveries = db.scalars(
+            select(EmailDelivery)
+            .where(EmailDelivery.recipient == 'contact+b33f7f077386@example.com')
+            .order_by(EmailDelivery.created_at)
+        ).all()
+    finally:
+        db.close()
+
+    assert accepted.status_code == 200
+    assert changed.status_code == 200
+    assert old_login.status_code == 401
+    assert new_login.status_code == 200
+    assert [row.category for row in deliveries] == [
+        "employee_invitation",
+        "admin_password_reset",
+    ]
+    assert all(row.status == "suppressed" for row in deliveries)
+
+
+def test_invalid_team_invitation_creates_nothing(identity_client):
+    client, data = identity_client
+    response = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Should Not Exist",
+            "email": 'contact+0ad5db6c0822@example.com',
+            "kind": "team_manager",
+            "team_ids": [str(uuid4())],
+        },
+    )
+    db: Session = data["session_factory"]()
+    try:
+        assert (
+            db.scalar(select(AdminUser.id).where(AdminUser.email == 'contact+0ad5db6c0822@example.com'))
+            is None
+        )
+        assert (
+            db.scalar(select(Employee.id).where(Employee.email == 'contact+0ad5db6c0822@example.com'))
+            is None
+        )
+        assert (
+            db.scalar(
+                select(EmailDelivery.id).where(
+                    EmailDelivery.recipient == 'contact+0ad5db6c0822@example.com'
+                )
+            )
+            is None
+        )
+    finally:
+        db.close()
+    assert response.status_code == 400
+
+
+def test_admin_role_requires_employee_start_date_shift_and_breaks(identity_client):
+    client, data = identity_client
+    response = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Incomplete HR",
+            "email": 'contact+cc48910c6214@example.com',
+            "kind": "hr",
+            "team_ids": [],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "START_DATE_REQUIRED"
+
+    db: Session = data["session_factory"]()
+    try:
+        assert (
+            db.scalar(
+                select(AdminUser.id).where(AdminUser.email == 'contact+cc48910c6214@example.com')
+            )
+            is None
+        )
+        assert (
+            db.scalar(
+                select(Employee.id).where(Employee.email == 'contact+cc48910c6214@example.com')
+            )
+            is None
+        )
+    finally:
+        db.close()
+
+
+def test_employee_invitation_is_hashed_one_time_and_accepts_password(identity_client, monkeypatch):
+    client, data = identity_client
+    raw_token = 'CHANGE_ME'
+    monkeypatch.setattr(
+        "app.services.employee_invitations.secrets.token_urlsafe",
+        lambda _length: raw_token,
+    )
+
+    created = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Invited Employee",
+            "email": 'contact+5a6d182ec451@example.com',
+            "kind": "employee",
+            "team_ids": [str(data["team_a"].id)],
+            **employee_onboarding_payload(),
+        },
+    )
+    created_data = created.json()["data"]
+    assert created.status_code == 200
+    assert created_data["invitation"]["status"] == "pending"
+    assert created_data["email_queued"] is True
+
+    db: Session = data["session_factory"]()
+    try:
+        employee = db.scalar(
+            select(Employee).where(Employee.email == 'contact+5a6d182ec451@example.com')
+        )
+        invitation = db.scalar(
+            select(EmployeeInvitation).where(EmployeeInvitation.employee_id == employee.id)
+        )
+        assert employee.status == "invited"
+        assert employee.portal_password_hash is None
+        assert invitation.token_hash == hash_token(raw_token)
+        assert invitation.token_hash != raw_token
+        validity = invitation.expires_at - invitation.created_at
+        assert timedelta(hours=23, minutes=59) < validity < timedelta(hours=24, minutes=1)
+    finally:
+        db.close()
+
+    verified = client.get(f"/api/v1/people/invitations/{raw_token}")
+    before_accept_login = client.post(
+        "/api/v1/employee-auth/login",
+        json={
+            "email": 'contact+5a6d182ec451@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+    accepted = client.post(
+        f"/api/v1/people/invitations/{raw_token}",
+        json={"password": 'CHANGE_ME'},
+    )
+    reused = client.post(
+        f"/api/v1/people/invitations/{raw_token}",
+        json={"password": 'CHANGE_ME'},
+    )
+    login = client.post(
+        "/api/v1/employee-auth/login",
+        json={
+            "email": 'contact+5a6d182ec451@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+
+    assert verified.status_code == 200
+    assert verified.json()["data"]["valid"] is True
+    assert before_accept_login.status_code == 401
+    assert accepted.status_code == 200
+    assert accepted.json()["data"]["status"] == "accepted"
+    assert reused.status_code == 400
+    assert login.status_code == 200
+
+    db = data["session_factory"]()
+    try:
+        employee = db.scalar(
+            select(Employee).where(Employee.email == 'contact+5a6d182ec451@example.com')
+        )
+        invitation = db.scalar(
+            select(EmployeeInvitation).where(EmployeeInvitation.employee_id == employee.id)
+        )
+        assert employee.status == "active"
+        assert employee.portal_password_hash != 'CHANGE_ME'
+        assert verify_password('CHANGE_ME', employee.portal_password_hash)
+        assert invitation.accepted_at is not None
+    finally:
+        db.close()
+
+
+def test_direct_employee_creation_is_invited_and_overview_exposes_invitation(
+    identity_client, monkeypatch
+):
+    client, data = identity_client
+    monkeypatch.setattr(
+        "app.services.employee_invitations.secrets.token_urlsafe",
+        lambda _length: "direct-employee-invitation-token-with-enough-length-123",
+    )
+    created = client.post(
+        "/api/v1/employees",
+        headers=data["general_headers"],
+        json={
+            "name": "Direct Employee",
+            "email": 'contact+856f87090566@example.com',
+            "timezone": "Africa/Cairo",
+            "status": "active",
+        },
+    )
+    employee_id = created.json()["data"]["id"]
+    overview = client.get(
+        f"/api/v1/employees-overview?employee_id={employee_id}",
+        headers=data["general_headers"],
+    )
+    premature_activation = client.patch(
+        f"/api/v1/employees/{employee_id}",
+        headers=data["general_headers"],
+        json={"status": "active"},
+    )
+
+    assert created.status_code == 200
+    assert created.json()["data"]["status"] == "invited"
+    assert created.json()["data"]["invitation"]["status"] == "pending"
+    assert overview.status_code == 200
+    assert premature_activation.status_code == 409
+    assert overview.json()["data"][0]["employee"]["status"] == "invited"
+    assert (
+        overview.json()["data"][0]["employee"]["invitation"]["id"]
+        == (created.json()["data"]["invitation"]["id"])
+    )
+
+
+def test_employee_invitation_resend_revokes_old_token(identity_client, monkeypatch):
+    client, data = identity_client
+    tokens = iter(
+        [
+            "first-employee-invitation-token-with-enough-length-123456",
+            "failed-employee-invitation-token-with-enough-length-000000",
+            "final-employee-invitation-token-with-enough-length-654321",
+        ]
+    )
+    monkeypatch.setattr(
+        "app.services.employee_invitations.secrets.token_urlsafe",
+        lambda _length: next(tokens),
+    )
+    created = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Resent Employee",
+            "email": 'contact+6b4a22e9e5fe@example.com',
+            "kind": "employee",
+            "team_ids": [str(data["team_a"].id)],
+            **employee_onboarding_payload(),
+        },
+    )
+    invitation_id = created.json()["data"]["invitation"]["id"]
+
+    cooldown_blocked = client.post(
+        f"/api/v1/people/invitations/{invitation_id}/resend",
+        headers=data["general_headers"],
+    )
+    original_still_valid = client.get(
+        "/api/v1/people/invitations/first-employee-invitation-token-with-enough-length-123456"
+    )
+    assert cooldown_blocked.status_code == 429
+    assert original_still_valid.json()["data"]["valid"] is True
+
+    db: Session = data["session_factory"]()
+    try:
+        delivery = db.scalar(
+            select(EmailDelivery).where(
+                EmailDelivery.recipient == 'contact+6b4a22e9e5fe@example.com',
+                EmailDelivery.category == "employee_invitation",
+            )
+        )
+        delivery.created_at = datetime.now(UTC) - timedelta(
+            minutes=settings.email_cooldown_minutes + 1
+        )
+        db.add(delivery)
+        db.commit()
+    finally:
+        db.close()
+
+    real_enqueue = people_api.enqueue_employee_invitation_email
+    monkeypatch.setattr(
+        people_api,
+        "enqueue_employee_invitation_email",
+        lambda *args, **kwargs: False,
+    )
+    queue_failed = client.post(
+        f"/api/v1/people/invitations/{invitation_id}/resend",
+        headers=data["general_headers"],
+    )
+    old_after_queue_failure = client.get(
+        "/api/v1/people/invitations/first-employee-invitation-token-with-enough-length-123456"
+    )
+    assert queue_failed.status_code == 200
+    assert queue_failed.json()["data"]["email_queued"] is False
+    assert queue_failed.json()["data"]["invitation"]["id"] == invitation_id
+    assert old_after_queue_failure.json()["data"]["valid"] is True
+
+    monkeypatch.setattr(people_api, "enqueue_employee_invitation_email", real_enqueue)
+    resent = client.post(
+        f"/api/v1/people/invitations/{invitation_id}/resend",
+        headers=data["general_headers"],
+    )
+    old_verification = client.get(
+        "/api/v1/people/invitations/first-employee-invitation-token-with-enough-length-123456"
+    )
+    new_verification = client.get(
+        "/api/v1/people/invitations/final-employee-invitation-token-with-enough-length-654321"
+    )
+
+    assert resent.status_code == 200
+    assert resent.json()["data"]["invitation"]["status"] == "pending"
+    assert resent.json()["data"]["invitation"]["id"] != invitation_id
+    assert old_verification.json()["data"] == {"valid": False, "status": "revoked"}
+    assert new_verification.json()["data"]["valid"] is True
+
+    db: Session = data["session_factory"]()
+    try:
+        invitations = db.scalars(
+            select(EmployeeInvitation).order_by(EmployeeInvitation.created_at)
+        ).all()
+        assert len(invitations) == 3
+        assert invitations[0].revoked_at is not None
+        assert invitations[1].revoked_at is not None
+        assert invitations[2].revoked_at is None
+    finally:
+        db.close()
+
+
+def test_accepted_employee_can_enroll_desktop_with_employee_token(identity_client, monkeypatch):
+    client, data = identity_client
+    raw_token = 'CHANGE_ME'
+    monkeypatch.setattr(
+        "app.services.employee_invitations.secrets.token_urlsafe",
+        lambda _length: raw_token,
+    )
+    client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Desktop Employee",
+            "email": 'contact+20b3272f66db@example.com',
+            "kind": "employee",
+            "team_ids": [str(data["team_a"].id)],
+            **employee_onboarding_payload(),
+        },
+    )
+    client.post(
+        f"/api/v1/people/invitations/{raw_token}",
+        json={"password": 'CHANGE_ME'},
+    )
+    portal_login = client.post(
+        "/api/v1/employee-auth/login",
+        json={
+            "email": 'contact+20b3272f66db@example.com',
+            "password": 'CHANGE_ME',
+        },
+    )
+    employee_token = portal_login.json()["data"]["access_token"]
+    enrolled = client.post(
+        "/api/v1/agent/enroll-authenticated",
+        headers={"Authorization": f"Bearer {employee_token}"},
+        json={
+            "device": {
+                "installation_id": "desktop-installation-12345",
+                "device_name": "KBC Laptop",
+                "operating_system": "Windows 11",
+                "agent_version": "1.2.0",
+                "windows_username": "kbc-user",
+            }
+        },
+    )
+
+    assert portal_login.status_code == 200
+    assert enrolled.status_code == 200
+    assert enrolled.json()["data"]["device"]["installation_id"] == "desktop-installation-12345"
+    assert enrolled.json()["data"]["device_token"]
+    assert enrolled.json()["data"]["token_type"] == "bearer"
+
+
+def test_general_admin_can_reactivate_device_without_restoring_old_tokens(identity_client):
+    client, data = identity_client
+    revoked_at = datetime.now(UTC)
+    db: Session = data["session_factory"]()
+    try:
+        employee = Employee(
+            company_id=data["general_admin"].company_id,
+            name="Revoked Device Employee",
+            email='contact+06596378e65e@example.com',
+            employee_code="EMP-REVOKED-DEVICE",
+            job_title="Developer",
+            timezone="Africa/Cairo",
+            status="active",
+            portal_password_hash=hash_password("EmployeePassword123!"),
+        )
+        db.add(employee)
+        db.flush()
+        device = Device(
+            company_id=employee.company_id,
+            employee_id=employee.id,
+            device_name="Revoked Laptop",
+            installation_id="revoked-installation-12345",
+            operating_system="Windows 11",
+            agent_version="1.2.0",
+            status="revoked",
+            revoked_at=revoked_at,
+        )
+        db.add(device)
+        db.flush()
+        old_token = DeviceToken(
+            company_id=employee.company_id,
+            device_id=device.id,
+            token_hash=hash_token("previously-revoked-device-token"),
+            revoked_at=revoked_at,
+        )
+        db.add(old_token)
+        db.commit()
+        device_id = device.id
+        old_token_id = old_token.id
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/v1/devices/{device_id}/reactivate",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == "active"
+    assert response.json()["data"]["revoked_at"] is None
+
+    db = data["session_factory"]()
+    try:
+        device = db.get(Device, device_id)
+        old_token = db.get(DeviceToken, old_token_id)
+        assert device.status == "active"
+        assert device.revoked_at is None
+        assert old_token.revoked_at is not None
+    finally:
+        db.close()
+
+
+def test_revoke_then_reactivate_keeps_the_old_sign_in_revoked(identity_client):
+    client, data = identity_client
+    db: Session = data["session_factory"]()
+    try:
+        employee = Employee(
+            company_id=data["general_admin"].company_id,
+            name="Swapped Laptop Employee",
+            email='contact+018f3da32695@example.com',
+            employee_code="EMP-SWAPPED-LAPTOP",
+            job_title="Developer",
+            timezone="Africa/Cairo",
+            status="active",
+            portal_password_hash=hash_password("EmployeePassword123!"),
+        )
+        db.add(employee)
+        db.flush()
+        device = Device(
+            company_id=employee.company_id,
+            employee_id=employee.id,
+            device_name="Swapped Laptop",
+            installation_id="swapped-installation-12345",
+            operating_system="Windows 11",
+            agent_version="1.2.0",
+            status="active",
+        )
+        db.add(device)
+        db.flush()
+        live_token = DeviceToken(
+            company_id=employee.company_id,
+            device_id=device.id,
+            token_hash=hash_token("live-device-token"),
+        )
+        db.add(live_token)
+        db.commit()
+        device_id = device.id
+        live_token_id = live_token.id
+    finally:
+        db.close()
+
+    revoked = client.post(f"/api/v1/devices/{device_id}/revoke", headers=data["general_headers"])
+    assert revoked.status_code == 200
+    reactivated = client.post(
+        f"/api/v1/devices/{device_id}/reactivate", headers=data["general_headers"]
+    )
+    assert reactivated.status_code == 200
+
+    db = data["session_factory"]()
+    try:
+        assert db.get(Device, device_id).status == "active"
+        assert db.get(DeviceToken, live_token_id).revoked_at is not None
+    finally:
+        db.close()
+
+
+def test_signing_in_on_someone_elses_computer_is_logged_and_hr_can_reassign(
+    identity_client, monkeypatch
+):
+    client, data = identity_client
+    tokens = iter(
+        [
+            "swap-invitation-token-owner-with-enough-length-123456789",
+            "swap-invitation-token-borrower-with-enough-length-12345",
+        ]
+    )
+    monkeypatch.setattr(
+        "app.services.employee_invitations.secrets.token_urlsafe",
+        lambda _length: next(tokens),
+    )
+
+    def employee_token(name, email, raw_token):
+        client.post(
+            "/api/v1/people/invitations",
+            headers=data["general_headers"],
+            json={
+                "name": name,
+                "email": email,
+                "kind": "employee",
+                "team_ids": [str(data["team_a"].id)],
+                **employee_onboarding_payload(),
+            },
+        )
+        client.post(
+            f"/api/v1/people/invitations/{raw_token}",
+            json={"password": 'CHANGE_ME'},
+        )
+        login = client.post(
+            "/api/v1/employee-auth/login",
+            json={"email": email, "password": 'CHANGE_ME'},
+        )
+        return login.json()["data"]["access_token"]
+
+    owner = employee_token(
+        "Laptop Owner",
+        'contact+aca8e3cbc93b@example.com',
+        "swap-invitation-token-owner-with-enough-length-123456789",
+    )
+    borrower = employee_token(
+        "Laptop Borrower",
+        'contact+92065c940120@example.com',
+        "swap-invitation-token-borrower-with-enough-length-12345",
+    )
+
+    def enroll(token):
+        return client.post(
+            "/api/v1/agent/enroll-authenticated",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "device": {
+                    "installation_id": "shared-laptop-installation-1",
+                    "device_name": "Shared Laptop",
+                    "operating_system": "Windows 11",
+                    "agent_version": "1.2.0",
+                    "windows_username": "kbc-user",
+                }
+            },
+        )
+
+    owned = enroll(owner)
+    assert owned.status_code == 200
+    device_id = owned.json()["data"]["device"]["id"]
+
+    for _ in range(2):
+        refused = enroll(borrower)
+        assert refused.status_code == 409
+        assert refused.json()["error"]["code"] == "DEVICE_ALREADY_ENROLLED"
+
+    attempts = client.get(
+        "/api/v1/devices/sign-in-attempts", headers=data["general_headers"]
+    ).json()["data"]
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert attempt["employee_name"] == "Laptop Borrower"
+    assert attempt["owner_employee_name"] == "Laptop Owner"
+    assert attempt["device_name"] == "Shared Laptop"
+    assert attempt["attempt_count"] == 2
+
+    reassigned = client.post(
+        f"/api/v1/devices/{device_id}/reassign",
+        headers=data["general_headers"],
+        json={"employee_id": attempt["employee_id"]},
+    )
+    assert reassigned.status_code == 200
+    assert reassigned.json()["data"]["employee_id"] == attempt["employee_id"]
+
+    # The borrower can sign in now, the open list is empty, and the previous
+    # owner's sign-in on that computer no longer works.
+    assert enroll(borrower).status_code == 200
+    assert (
+        client.get("/api/v1/devices/sign-in-attempts", headers=data["general_headers"]).json()[
+            "data"
+        ]
+        == []
+    )
+    assert enroll(owner).status_code == 409
+
+
+def test_inviting_an_existing_active_employee_is_a_conflict(identity_client):
+    client, data = identity_client
+    db: Session = data["session_factory"]()
+    active_employee = Employee(
+        company_id=data["general_admin"].company_id,
+        name="Existing Employee",
+        email='contact+03ccb337dd31@example.com',
+        employee_code="EMP-EXISTING",
+        timezone="Africa/Cairo",
+        status="active",
+    )
+    db.add(active_employee)
+    db.commit()
+    db.close()
+
+    response = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Existing Employee",
+            "email": 'contact+03ccb337dd31@example.com',
+            "kind": "employee",
+            "team_ids": [str(data["team_a"].id)],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "EMPLOYEE_EMAIL_EXISTS"
+    db = data["session_factory"]()
+    try:
+        assert (
+            db.scalar(
+                select(EmployeeInvitation.id).where(
+                    EmployeeInvitation.employee_id == active_employee.id
+                )
+            )
+            is None
+        )
+        assert (
+            db.scalar(
+                select(EmailDelivery.id).where(
+                    EmailDelivery.recipient == 'contact+03ccb337dd31@example.com'
+                )
+            )
+            is None
+        )
+    finally:
+        db.close()
+
+
+def test_archived_person_can_be_deleted_and_email_reused(identity_client):
+    client, data = identity_client
+    email = 'contact+09d0e27a65d8@example.com'
+    created = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Delete Me",
+            "email": email,
+            "kind": "employee",
+            "team_ids": [str(data["team_a"].id)],
+            **employee_onboarding_payload(),
+        },
+    )
+    assert created.status_code == 200
+    employee_id = created.json()["data"]["employee_id"]
+
+    delete_before_archive = client.delete(
+        f"/api/v1/people/employee/{employee_id}",
+        headers=data["general_headers"],
+    )
+    # Archiving (fired/resigned) is an HR / General Admin / Super Admin decision.
+    archived = client.post(
+        f"/api/v1/people/employee/{employee_id}/archive",
+        headers=data["general_headers"],
+        json={"reason": "resigned", "last_working_day": datetime.now(UTC).date().isoformat()},
+    )
+    deleted = client.delete(
+        f"/api/v1/people/employee/{employee_id}",
+        headers=data["general_headers"],
+    )
+    listed = client.get("/api/v1/employees", headers=data["general_headers"])
+    recreated = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Delete Me Again",
+            "email": email,
+            "kind": "employee",
+            "team_ids": [str(data["team_a"].id)],
+            **employee_onboarding_payload(),
+        },
+    )
+
+    assert delete_before_archive.status_code == 409
+    assert archived.status_code == 200
+    assert deleted.status_code == 200
+    assert deleted.json()["data"]["deleted"] is True
+    assert all(item["email"] != email for item in listed.json()["data"])
+    assert recreated.status_code == 200
+
+    db: Session = data["session_factory"]()
+    try:
+        deleted_employee = db.get(Employee, UUID(employee_id))
+        assert deleted_employee is not None
+        assert deleted_employee.status == "deleted"
+        assert deleted_employee.email != email
+        assert deleted_employee.email.startswith("deleted-employee-")
+    finally:
+        db.close()
+
+
+def test_failed_invitation_queue_is_reported_and_can_be_resent(identity_client, monkeypatch):
+    client, data = identity_client
+    tokens = iter(
+        [
+            "queue-failure-invitation-token-with-enough-length-123456",
+            "queue-recovery-invitation-token-with-enough-length-654321",
+        ]
+    )
+    monkeypatch.setattr(
+        "app.services.employee_invitations.secrets.token_urlsafe",
+        lambda _length: next(tokens),
+    )
+    real_enqueue = people_api.enqueue_employee_invitation_email
+    monkeypatch.setattr(
+        people_api,
+        "enqueue_employee_invitation_email",
+        lambda *args, **kwargs: False,
+    )
+    created = client.post(
+        "/api/v1/people/invitations",
+        headers=data["general_headers"],
+        json={
+            "name": "Queue Recovery Employee",
+            "email": 'contact+45ed3dc88fe0@example.com',
+            "kind": "employee",
+            "team_ids": [str(data["team_a"].id)],
+            **employee_onboarding_payload(),
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["data"]["email_queued"] is False
+    assert created.json()["data"]["invitation"]["status"] == "pending"
+
+    monkeypatch.setattr(people_api, "enqueue_employee_invitation_email", real_enqueue)
+    resent = client.post(
+        f"/api/v1/people/invitations/{created.json()['data']['invitation']['id']}/resend",
+        headers=data["general_headers"],
+    )
+    assert resent.status_code == 200
+    assert resent.json()["data"]["email_queued"] is True
+    assert resent.json()["data"]["invitation"]["status"] == "pending"

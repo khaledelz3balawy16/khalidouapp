@@ -1,0 +1,144 @@
+import electronRenderer from "electron/renderer";
+
+const { contextBridge, ipcRenderer } = electronRenderer;
+
+contextBridge.exposeInMainWorld("khaliduo", {
+  getAgentStatus: () => ipcRenderer.invoke("agent:get-status"),
+  syncNow: () => ipcRenderer.invoke("agent:sync-now"),
+  onStatusChanged: (callback: (status: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, status: unknown) =>
+      callback(status);
+    ipcRenderer.on("agent:status-changed", listener);
+    return () => ipcRenderer.removeListener("agent:status-changed", listener);
+  },
+  enrollWithCredentials: (email: string, password: string) =>
+    ipcRenderer.invoke("agent:enroll-with-credentials", email, password),
+  pauseTracking: (options?: { requestedMinutes?: number; reason?: string }) =>
+    ipcRenderer.invoke("agent:pause-tracking", options),
+  resumeTracking: () => ipcRenderer.invoke("agent:resume-tracking"),
+  resumeAutomaticIdle: () => ipcRenderer.invoke("agent:resume-automatic-idle"),
+  startMeeting: (input: {
+    title: string;
+    reason: string;
+    expectedEndMinutes: number;
+    projectId?: string | null;
+    taskId?: string | null;
+  }) => ipcRenderer.invoke("agent:start-meeting", input),
+  endMeeting: () => ipcRenderer.invoke("agent:end-meeting"),
+  refreshMeetings: () => ipcRenderer.invoke("agent:refresh-meetings"),
+  retryMeetingSync: () => ipcRenderer.invoke("agent:retry-meeting-sync"),
+  confirmTrackingStart: () =>
+    ipcRenderer.invoke("agent:confirm-tracking-start"),
+  declineTrackingStart: () =>
+    ipcRenderer.invoke("agent:decline-tracking-start"),
+  logout: () => ipcRenderer.invoke("agent:logout"),
+  openEmployeeDashboard: (section?: "screenshots") =>
+    ipcRenderer.invoke("agent:open-employee-dashboard", section),
+  getRecentScreenshots: () =>
+    ipcRenderer.invoke("agent:get-recent-screenshots"),
+  setCurrentTask: (taskId: string | null) =>
+    ipcRenderer.invoke("agent:set-current-task", taskId),
+  createTask: (options: {
+    name: string;
+    projectId?: string;
+    description?: string;
+    stage?: "assigned";
+    startDate?: string;
+    deadline?: string;
+    estimatedMinutes?: number;
+  }) => ipcRenderer.invoke("agent:create-task", options),
+  updateTaskStage: (taskId: string, stage: string, note?: string) =>
+    ipcRenderer.invoke("agent:update-task-stage", taskId, stage, note),
+  createTaskChecklistItem: (taskId: string, title: string) =>
+    ipcRenderer.invoke("agent:create-task-checklist-item", taskId, title),
+  updateTaskChecklistItem: (
+    taskId: string,
+    itemId: string,
+    completed: boolean,
+  ) =>
+    ipcRenderer.invoke(
+      "agent:update-task-checklist-item",
+      taskId,
+      itemId,
+      completed,
+    ),
+  deleteTaskChecklistItems: (taskId: string, itemIds: string[]) =>
+    ipcRenderer.invoke("agent:delete-task-checklist-items", taskId, itemIds),
+  createTimeAdjustmentRequest: (input: {
+    requestedMinutes: number;
+    reason: string;
+    requestType?: "idle_time" | "early_leave" | "manual_time" | "delayed_break";
+    requestedDate?: string;
+    workSessionId?: string;
+    sourceStartAt?: string;
+    sourceEndAt?: string;
+    requestedLeaveTime?: string;
+  }) => ipcRenderer.invoke("agent:create-time-adjustment-request", input),
+  createLeaveRequest: (input: {
+    startDate: string;
+    endDate: string;
+    leaveType?: "annual" | "sick" | "unpaid";
+    reason?: string;
+  }) => ipcRenderer.invoke("agent:create-leave-request", input),
+  listShiftReschedules: () => ipcRenderer.invoke("agent:list-shift-reschedules"),
+  getShiftRescheduleDay: (workDate: string) =>
+    ipcRenderer.invoke("agent:get-shift-reschedule-day", workDate),
+  createShiftReschedule: (input: {
+    workDate: string;
+    requestedStart: string;
+    requestedEnd: string;
+    reason: string;
+  }) => ipcRenderer.invoke("agent:create-shift-reschedule", input),
+  cancelShiftReschedule: (requestId: string) =>
+    ipcRenderer.invoke("agent:cancel-shift-reschedule", requestId),
+  setIdleAlertAttention: (active: boolean) =>
+    ipcRenderer.send("agent:set-idle-alert-attention", active),
+  setUpdateAttention: (active: boolean) =>
+    ipcRenderer.send("agent:set-update-attention", active),
+  // Developer diagnostics panel (support tool, audit-logged on open).
+  diagnosticsConfig: () => ipcRenderer.invoke("diag:config"),
+  diagnosticsUnlock: (passcode: string) =>
+    ipcRenderer.invoke("diag:unlock", passcode),
+  diagnosticsSnapshot: () => ipcRenderer.invoke("diag:snapshot"),
+  diagnosticsResync: () => ipcRenderer.invoke("diag:resync"),
+  diagnosticsExportLogs: () => ipcRenderer.invoke("diag:export-logs"),
+  minimizeWindow: () => ipcRenderer.invoke("window:minimize"),
+  toggleMaximizeWindow: () => ipcRenderer.invoke("window:toggle-maximize"),
+  closeWindow: () => ipcRenderer.invoke("window:close"),
+  checkForUpdates: () => ipcRenderer.invoke("agent:check-for-updates"),
+  installUpdate: () => ipcRenderer.invoke("agent:install-update"),
+  onRequiredUpdate: (
+    callback: (update: { version: string | null }) => void,
+  ) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      update: { version: string | null },
+    ) => callback(update);
+    ipcRenderer.on("agent:update-required", listener);
+    return () => ipcRenderer.removeListener("agent:update-required", listener);
+  },
+  onIdleAlert: (
+    callback: (alert: {
+      id: string;
+      kind: "idle_return" | "tracking_start" | "idle_started";
+      lostSeconds: number;
+      eligibleLostSeconds: number;
+      outsideScheduledShift: boolean;
+      endedAt: string;
+    }) => void,
+  ) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      alert: {
+        id: string;
+        kind: "idle_return" | "tracking_start" | "idle_started";
+        lostSeconds: number;
+        eligibleLostSeconds: number;
+        outsideScheduledShift: boolean;
+        endedAt: string;
+      },
+    ) => callback(alert);
+    ipcRenderer.on("agent:idle-alert", listener);
+    return () => ipcRenderer.removeListener("agent:idle-alert", listener);
+  },
+});

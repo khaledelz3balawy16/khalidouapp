@@ -1,0 +1,276 @@
+import secrets
+from datetime import UTC, datetime, timedelta
+from typing import Annotated
+
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
+from sqlalchemy import func, select, update
+from sqlalchemy.orm import Session
+
+from app.api.deps import get_current_admin
+from app.core.config import settings
+from app.core.responses import success_response
+from app.database.session import get_db
+from app.models import AdminPasswordResetToken, AdminRefreshToken, AdminUser, Employee, TeamOwner
+from app.schemas.auth import (
+    ForgotPasswordRequest,
+    LoginRequest,
+    LogoutRequest,
+    PasswordChange,
+    PasswordResetConfirm,
+    ProfileUpdate,
+    RefreshRequest,
+)
+from app.core.exceptions import ApiError
+from app.core.security import hash_password, hash_token, verify_password
+from app.services.email import enqueue_admin_password_reset_link_email, ensure_email_allowed
+from app.services.admin_auth import (
+    authenticate_admin,
+    create_admin_token_pair,
+    logout_admin,
+    refresh_admin_tokens,
+)
+from app.services.audit import record_audit_log
+from app.services.permissions import capabilities_for_admin, is_super_admin
+from app.services.person_access import enforce_admin_tracking_policy
+from app.services.rate_limit import enforce_rate_limit
+
+router = APIRouter(prefix="/auth", tags=["admin-auth"])
+
+
+def validate_avatar(value: str | None) -> str | None:
+    if value is None or value == "":
+        return None
+    if not value.startswith(
+        ("data:image/jpeg;base64,", "data:image/png;base64,", "data:image/webp;base64,")
+    ):
+        raise ApiError("INVALID_AVATAR", "Profile photo must be a JPEG, PNG, or WebP image.", 400)
+    return value
+
+
+def _tracked_employee_for_profile(db: Session, admin: AdminUser) -> Employee:
+    if admin.employee_id is not None:
+        employee = db.get(Employee, admin.employee_id)
+        if employee is not None:
+            return employee
+    # Legacy admin rows may predate the required employee identity. Repair
+    # those once; normal login/profile reads must not rewrite attendance data.
+    return enforce_admin_tracking_policy(db, admin)
+
+
+def _admin_profile_data(
+    db: Session,
+    admin: AdminUser,
+    tracked_employee: Employee,
+) -> dict[str, object]:
+    assigned_team_ids = db.scalars(
+        select(TeamOwner.team_id).where(TeamOwner.admin_user_id == admin.id)
+    ).all()
+    return {
+        "id": str(admin.id),
+        "company_id": str(admin.company_id),
+        "employee_id": str(tracked_employee.id),
+        "name": admin.name,
+        "email": admin.email,
+        "job_title": tracked_employee.job_title,
+        "role": admin.role,
+        "is_super_admin": is_super_admin(admin),
+        "permissions": capabilities_for_admin(admin),
+        "permission_mode": admin.permission_mode,
+        "data_scope": admin.data_scope,
+        "status": admin.status,
+        "avatar_url": admin.avatar_url,
+        "assigned_team_ids": [str(team_id) for team_id in assigned_team_ids],
+    }
+
+
+@router.post("/login")
+def login(payload: LoginRequest, request: Request, db: Annotated[Session, Depends(get_db)]):
+    enforce_rate_limit(request, action="admin-login", limit=10, window_seconds=60)
+    admin = authenticate_admin(db, payload.email, payload.password)
+    tracked_employee = _tracked_employee_for_profile(db, admin)
+    tokens = create_admin_token_pair(db, admin, commit=False)
+    record_audit_log(
+        db,
+        admin,
+        "logged_in",
+        "admin_user",
+        entity_id=admin.id,
+        entity_name=admin.email,
+        request=request,
+    )
+    user = _admin_profile_data(db, admin, tracked_employee)
+    db.commit()
+    return success_response(data={**tokens, "user": user})
+
+
+@router.post("/refresh")
+def refresh(
+    payload: RefreshRequest,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+):
+    enforce_rate_limit(request, action="admin-refresh", limit=60, window_seconds=60)
+    return success_response(data=refresh_admin_tokens(db, payload.refresh_token))
+
+
+@router.post("/logout")
+def logout(payload: LogoutRequest, db: Annotated[Session, Depends(get_db)]):
+    logout_admin(db, payload.refresh_token)
+    return success_response(data={"logged_out": True})
+
+
+@router.get("/me")
+def me(
+    current_admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    tracked_employee = _tracked_employee_for_profile(db, current_admin)
+    profile = _admin_profile_data(db, current_admin, tracked_employee)
+    db.commit()
+    return success_response(data=profile)
+
+
+@router.patch("/me")
+def update_me(
+    payload: ProfileUpdate,
+    current_admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    changes = payload.model_dump(exclude_unset=True)
+    if "name" in changes:
+        current_admin.name = changes["name"].strip()
+    if "avatar_url" in changes:
+        current_admin.avatar_url = validate_avatar(changes["avatar_url"])
+    db.add(current_admin)
+    db.commit()
+    return me(current_admin, db)
+
+
+@router.post("/change-password")
+def change_password(
+    payload: PasswordChange,
+    current_admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    if not verify_password(payload.current_password, current_admin.password_hash):
+        raise ApiError("CURRENT_PASSWORD_INVALID", 'CHANGE_ME', 400)
+    if verify_password(payload.new_password, current_admin.password_hash):
+        raise ApiError("PASSWORD_UNCHANGED", 'CHANGE_ME', 400)
+
+    now = datetime.now(UTC)
+    current_admin.password_hash = hash_password(payload.new_password)
+    enforce_admin_tracking_policy(db, current_admin)
+    db.execute(
+        update(AdminRefreshToken)
+        .where(
+            AdminRefreshToken.admin_user_id == current_admin.id,
+            AdminRefreshToken.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    db.add(current_admin)
+    db.commit()
+    return success_response(data={"password_changed": True})
+
+
+@router.post("/forgot-password")
+def forgot_password(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Annotated[Session, Depends(get_db)],
+):
+    enforce_rate_limit(request, action="admin-forgot-password", limit=10, window_seconds=300)
+    matching_admins = db.scalars(
+        select(AdminUser).where(
+            func.lower(AdminUser.email) == payload.email.lower(), AdminUser.status == "active"
+        ).with_for_update()
+    ).all()
+    admin = matching_admins[0] if len(matching_admins) == 1 else None
+    if admin is not None:
+        try:
+            ensure_email_allowed(
+                db,
+                to=admin.email,
+                category="admin_password_reset",
+                cooldown_seconds=settings.password_reset_email_cooldown_seconds,
+            )
+        except ApiError as exc:
+            if exc.code != "EMAIL_COOLDOWN":
+                raise
+            return success_response(
+                data={"message": "If the account exists, reset instructions were sent."}
+            )
+        raw_token = secrets.token_urlsafe(48)
+        now = datetime.now(UTC)
+        db.execute(
+            update(AdminPasswordResetToken)
+            .where(
+                AdminPasswordResetToken.admin_user_id == admin.id,
+                AdminPasswordResetToken.used_at.is_(None),
+            )
+            .values(used_at=now)
+        )
+        db.add(
+            AdminPasswordResetToken(
+                company_id=admin.company_id,
+                admin_user_id=admin.id,
+                token_hash=hash_token(raw_token),
+                expires_at=now + timedelta(minutes=settings.password_reset_expire_minutes),
+            )
+        )
+        db.commit()
+        enqueue_admin_password_reset_link_email(
+            db,
+            background_tasks,
+            company_id=admin.company_id,
+            to=admin.email,
+            name=admin.name,
+            token=raw_token,
+            expires_in_minutes=settings.password_reset_expire_minutes,
+        )
+    return success_response(
+        data={"message": "If the account exists, reset instructions were sent."}
+    )
+
+
+@router.post("/reset-password")
+def reset_password(
+    payload: PasswordResetConfirm,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+):
+    enforce_rate_limit(request, action="admin-reset-password", limit=10, window_seconds=900)
+    now = datetime.now(UTC)
+    token = db.scalar(
+        select(AdminPasswordResetToken).where(
+            AdminPasswordResetToken.token_hash == hash_token(payload.token),
+            AdminPasswordResetToken.used_at.is_(None),
+        ).with_for_update()
+    )
+    expires_at = token.expires_at if token else None
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if token is None or expires_at is None or expires_at <= now:
+        raise ApiError(
+            "PASSWORD_RESET_TOKEN_INVALID",
+            'CHANGE_ME',
+            400,
+        )
+    admin = db.get(AdminUser, token.admin_user_id)
+    if admin is None or admin.status != "active":
+        raise ApiError("PASSWORD_RESET_TOKEN_INVALID", 'CHANGE_ME', 400)
+    admin.password_hash = hash_password(payload.new_password)
+    enforce_admin_tracking_policy(db, admin)
+    token.used_at = now
+    db.execute(
+        update(AdminRefreshToken)
+        .where(
+            AdminRefreshToken.admin_user_id == admin.id,
+            AdminRefreshToken.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    db.add_all([admin, token])
+    db.commit()
+    return success_response(data={"password_reset": True})

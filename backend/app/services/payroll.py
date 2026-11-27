@@ -1,0 +1,1133 @@
+import calendar
+from collections import defaultdict
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal, ROUND_HALF_UP
+from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from sqlalchemy import and_, or_, select, text
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import Session, selectinload
+
+from app.core.exceptions import ApiError
+from app.database.session import POSTGRES_LOCK_TIMEOUT_MILLISECONDS
+from app.models import (
+    DailyAttendance,
+    CompanyPayrollSettings,
+    Employee,
+    EmployeeWorkProfile,
+    LeaveRequest,
+    MeetingRecord,
+    OvertimeRecord,
+    PayrollAdjustment,
+    PayrollEntry,
+    PayrollRun,
+    Team,
+    TeamMember,
+    TimeAdjustmentRequest,
+    WorkScheduleOverride,
+    WorkSession,
+)
+from app.services.attendance import (
+    calculate_daily_attendance,
+    calculate_daily_attendance_bulk,
+)
+from app.services.employee_archive import cap_to_employment_end
+from app.services.work_profiles import (
+    DEFAULT_WORKING_DAYS,
+    STANDARD_MONTH_DAYS,
+    get_or_create_work_profile,
+)
+
+
+MONEY = Decimal("0.01")
+DEDUCTION_ADJUSTMENTS = {"deduction", "late_deduction", "idle_deduction", "unpaid_leave"}
+BONUS_ADJUSTMENTS = {"bonus", "overtime_exception", "salary_correction"}
+# Runs whose figures are frozen: automatic recalculation must not silently
+# change them when a source (e.g. an employee's salary) changes afterwards.
+# Approval binds the calculation (R1); an approved run can still be moved back
+# to draft through the explicit status workflow to make deliberate edits.
+FROZEN_RUN_STATUSES = frozenset({"approved", "locked", "paid"})
+# Matches cached_daily_attendance's dashboard-polling window in app.services.attendance.
+TODAY_ATTENDANCE_REFRESH_SECONDS = 30
+# Fixed namespace for payroll-run advisory locks so the two-int pg_advisory
+# key cannot collide with advisory locks taken elsewhere in the app.
+PAYROLL_RUN_LOCK_NAMESPACE = 0x7061  # "pa"
+# How long a concurrent request waits for an in-progress payroll build to
+# commit before giving up. Deliberately longer than the default lock_timeout
+# so a normal refresh is not mistaken for contention, but still bounded so a
+# stuck build surfaces a clean 503 instead of hanging a connection.
+PAYROLL_RUN_LOCK_WAIT_MILLISECONDS = 20_000
+
+
+def month_bounds(value: str | date) -> tuple[date, date]:
+    if isinstance(value, str):
+        try:
+            year, month = (int(part) for part in value.split("-", 1))
+            first = date(year, month, 1)
+        except (TypeError, ValueError):
+            raise ValueError("Month must use YYYY-MM format.") from None
+    else:
+        first = value.replace(day=1)
+    return first, first.replace(day=calendar.monthrange(first.year, first.month)[1])
+
+
+def _valid_day(year: int, month: int, requested_day: int) -> int:
+    return min(requested_day, calendar.monthrange(year, month)[1])
+
+
+def payroll_period_bounds(
+    value: str | date, cycle_start_day: int = 26, cycle_end_day: int = 25
+) -> tuple[date, date]:
+    """Return the cycle represented by YYYY-MM (the month in which the cycle ends)."""
+    label, _ = month_bounds(value)
+    if not 1 <= cycle_start_day <= 31 or not 1 <= cycle_end_day <= 31:
+        raise ValueError("Payroll cycle days must be between 1 and 31.")
+    if cycle_start_day > cycle_end_day:
+        start_year = label.year if label.month > 1 else label.year - 1
+        start_month = label.month - 1 if label.month > 1 else 12
+    else:
+        start_year, start_month = label.year, label.month
+    first = date(
+        start_year,
+        start_month,
+        _valid_day(start_year, start_month, cycle_start_day),
+    )
+    last = date(label.year, label.month, _valid_day(label.year, label.month, cycle_end_day))
+    if first > last:
+        raise ValueError("Payroll cycle start must be before its end.")
+    return first, last
+
+
+def get_or_create_payroll_settings(db: Session, company_id: UUID) -> CompanyPayrollSettings:
+    settings = db.scalar(
+        select(CompanyPayrollSettings).where(CompanyPayrollSettings.company_id == company_id)
+    )
+    if settings is None:
+        settings = CompanyPayrollSettings(
+            company_id=company_id,
+            cycle_start_day=26,
+            cycle_end_day=25,
+            timezone="Africa/Cairo",
+        )
+        db.add(settings)
+        db.flush()
+    return settings
+
+
+def utc_bounds(first: date, last: date) -> tuple[datetime, datetime]:
+    return (
+        datetime.combine(first, time.min, tzinfo=UTC),
+        datetime.combine(last, time.max, tzinfo=UTC),
+    )
+
+
+def decimal(value: object) -> Decimal:
+    return Decimal(str(value or 0))
+
+
+def money(value: Decimal) -> Decimal:
+    return value.quantize(MONEY, rounding=ROUND_HALF_UP)
+
+
+def _as_utc(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.min.replace(tzinfo=UTC)
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _lock_payroll_run(db: Session, *, company_id: UUID, month: date) -> None:
+    """Serialize run creation and entry refresh for one company/month.
+
+    Concurrent requests for the same company/month otherwise reserve the same
+    ``uq_payroll_runs_company_month`` (and, during refresh,
+    ``uq_payroll_entries_run_employee``) index entries and block on each
+    other's uncommitted transaction until ``lock_timeout`` fires, which
+    surfaces to the client as an unhandled 500. A transaction-scoped advisory
+    lock makes the second request wait for the first to commit and then read
+    its result, so the unique indexes are never contended.
+
+    The lock is released automatically when the caller commits or rolls back.
+    No-op outside PostgreSQL (SQLite tests are single-connection).
+    """
+    if db.bind is None or db.bind.dialect.name != "postgresql":
+        return
+    key = f"{company_id}:{month.isoformat()}"
+    # Wait longer for the advisory lock than for row locks: a healthy refresh
+    # is expected to hold it for a second or two, which must not be treated as
+    # contention. Restore the normal lock_timeout for the row-level work that
+    # follows so a genuinely stuck row lock still fails fast.
+    db.execute(
+        text("select set_config('lock_timeout', :wait, true)"),
+        {"wait": f"{PAYROLL_RUN_LOCK_WAIT_MILLISECONDS}ms"},
+    )
+    try:
+        db.execute(
+            text("select pg_advisory_xact_lock(:ns, hashtext(:key))"),
+            {"ns": PAYROLL_RUN_LOCK_NAMESPACE, "key": key},
+        )
+    except OperationalError as exc:
+        # The holder's build exceeded the bounded wait. Surface a clean,
+        # retryable 503 instead of a leaked lock-timeout 500.
+        db.rollback()
+        raise ApiError(
+            "PAYROLL_BUSY",
+            "Payroll for this period is being calculated. Please retry shortly.",
+            503,
+        ) from exc
+    db.execute(
+        text("select set_config('lock_timeout', :wait, true)"),
+        {"wait": f"{POSTGRES_LOCK_TIMEOUT_MILLISECONDS}ms"},
+    )
+
+
+def get_or_create_run(
+    db: Session,
+    *,
+    company_id: UUID,
+    month: date,
+    admin_user_id: UUID,
+    period_start: date | None = None,
+    period_end: date | None = None,
+    cycle_timezone: str | None = None,
+) -> PayrollRun:
+    _lock_payroll_run(db, company_id=company_id, month=month)
+    run = db.scalar(
+        select(PayrollRun).where(PayrollRun.company_id == company_id, PayrollRun.month == month)
+    )
+    if run is None:
+        run = PayrollRun(
+            company_id=company_id,
+            month=month,
+            period_start=period_start,
+            period_end=period_end,
+            cycle_timezone=cycle_timezone,
+            status="draft",
+            created_by_admin_user_id=admin_user_id,
+        )
+        db.add(run)
+        try:
+            db.flush()
+        except IntegrityError:
+            # Safety net for environments without the advisory lock (or a
+            # lost race): another transaction committed the run first. Recover
+            # its committed row instead of surfacing a duplicate-key error.
+            db.rollback()
+            run = db.scalar(
+                select(PayrollRun).where(
+                    PayrollRun.company_id == company_id, PayrollRun.month == month
+                )
+            )
+            if run is None:
+                raise
+    elif run.status not in FROZEN_RUN_STATUSES:
+        run.period_start = period_start or run.period_start
+        run.period_end = period_end or run.period_end
+        run.cycle_timezone = cycle_timezone or run.cycle_timezone
+    return run
+
+
+def _timezone(employee: Employee) -> ZoneInfo:
+    try:
+        return ZoneInfo(employee.timezone or "UTC")
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def _daily_override(
+    overrides: list[WorkScheduleOverride],
+    employee_id: UUID,
+    work_date: date,
+    team_ids: set[UUID] | None = None,
+) -> WorkScheduleOverride | None:
+    exact = [
+        item
+        for item in overrides
+        if item.effective_date == work_date and item.employee_id == employee_id
+    ]
+    if exact:
+        return max(exact, key=lambda item: item.created_at)
+    team = [
+        item
+        for item in overrides
+        if item.effective_date == work_date and item.team_id in (team_ids or set())
+    ]
+    if team:
+        return max(team, key=lambda item: item.created_at)
+    company = [
+        item
+        for item in overrides
+        if item.effective_date == work_date
+        and item.employee_id is None
+        and item.team_id is None
+        and item.scope == "company"
+    ]
+    return max(company, key=lambda item: item.created_at) if company else None
+
+
+def _day_schedule(
+    profile: EmployeeWorkProfile,
+    override: WorkScheduleOverride | None,
+) -> tuple[time | None, time | None, list[dict]]:
+    return (
+        override.shift_start if override and override.shift_start else profile.shift_start,
+        override.shift_end if override and override.shift_end else profile.shift_end,
+        override.break_rules
+        if override and override.break_rules is not None
+        else profile.break_rules or [],
+    )
+
+
+def _break_totals(rules: list[dict]) -> tuple[int, int]:
+    paid = sum(int(item.get("minutes", 0)) for item in rules if item.get("paid"))
+    unpaid = sum(int(item.get("minutes", 0)) for item in rules if not item.get("paid"))
+    return paid * 60, unpaid * 60
+
+
+def _team_names(db: Session, company_id: UUID) -> dict[UUID, str]:
+    rows = db.execute(
+        select(TeamMember.employee_id, Team.name)
+        .join(Team, Team.id == TeamMember.team_id)
+        .where(
+            Team.company_id == company_id,
+            Team.status == "active",
+            TeamMember.status == "active",
+        )
+        .order_by(Team.name)
+    ).all()
+    names: dict[UUID, list[str]] = defaultdict(list)
+    for employee_id, name in rows:
+        names[employee_id].append(name)
+    return {employee_id: ", ".join(values) for employee_id, values in names.items()}
+
+
+def calculate_employee_metrics(
+    db: Session,
+    *,
+    company_id: UUID,
+    employee: Employee,
+    profile: EmployeeWorkProfile,
+    first: date,
+    last: date,
+    overrides: list[WorkScheduleOverride],
+    sessions: list[WorkSession] | None = None,
+    adjustments: list[TimeAdjustmentRequest] | None = None,
+    overtime_records: list[OvertimeRecord] | None = None,
+    approved_leave: list[LeaveRequest] | None = None,
+    team_ids: set[UUID] | None = None,
+    stored_attendance: dict[date, DailyAttendance] | None = None,
+    meeting_dates: set[date] | None = None,
+    collect_stale_days: set[date] | None = None,
+) -> dict:
+    """Compute one employee's payroll metrics for ``first``..``last``.
+
+    With ``collect_stale_days``, nothing is recalculated: the attendance days
+    that would need a rebuild are added to the set and ``{}`` is returned, so
+    a batched caller can rebuild them all in one bulk pass first.
+    """
+    zone = _timezone(employee)
+    # An archived (fired/resigned) employee is paid only up to and including
+    # their last working day: nothing after it counts toward attendance, time,
+    # or salary for the period.
+    period_last = last
+    last = cap_to_employment_end(employee, last)
+    if sessions is None:
+        local_start = datetime.combine(first, time.min, tzinfo=zone).astimezone(UTC)
+        local_end = datetime.combine(last + timedelta(days=1), time.min, tzinfo=zone).astimezone(
+            UTC
+        )
+        sessions = db.scalars(
+            select(WorkSession).where(
+                WorkSession.company_id == company_id,
+                WorkSession.employee_id == employee.id,
+                WorkSession.started_at >= local_start,
+                WorkSession.started_at < local_end,
+            )
+        ).all()
+    if adjustments is None:
+        adjustments = db.scalars(
+            select(TimeAdjustmentRequest).where(
+                TimeAdjustmentRequest.company_id == company_id,
+                TimeAdjustmentRequest.employee_id == employee.id,
+                TimeAdjustmentRequest.requested_date.between(first, last),
+            )
+        ).all()
+    if overtime_records is None:
+        overtime_records = db.scalars(
+            select(OvertimeRecord).where(
+                OvertimeRecord.company_id == company_id,
+                OvertimeRecord.employee_id == employee.id,
+                OvertimeRecord.work_date.between(first, last),
+            )
+        ).all()
+    if approved_leave is None:
+        approved_leave = db.scalars(
+            select(LeaveRequest).where(
+                LeaveRequest.company_id == company_id,
+                LeaveRequest.employee_id == employee.id,
+                LeaveRequest.status == "approved",
+                LeaveRequest.start_date <= last,
+                LeaveRequest.end_date >= first,
+            )
+        ).all()
+
+    if last < period_last:
+        # Batched callers pre-fetch sources for the full period.
+        adjustments = [item for item in adjustments if item.requested_date <= last]
+        overtime_records = [item for item in overtime_records if item.work_date <= last]
+
+    sessions_by_day: dict[date, list[WorkSession]] = defaultdict(list)
+    month_sessions: list[WorkSession] = []
+    for session in sessions:
+        local_day = session.started_at.astimezone(zone).date()
+        if first <= local_day <= last:
+            sessions_by_day[local_day].append(session)
+            month_sessions.append(session)
+    sessions = month_sessions
+
+    leave_days: set[date] = set()
+    unpaid_leave_days: set[date] = set()
+    for leave in approved_leave:
+        cursor = max(first, leave.start_date)
+        leave_last = min(last, leave.end_date)
+        while cursor <= leave_last:
+            leave_days.add(cursor)
+            if leave.leave_type == "unpaid":
+                unpaid_leave_days.add(cursor)
+            cursor += timedelta(days=1)
+
+    expected_days = 0
+    expected_seconds = 0
+    paid_break_seconds = 0
+    unpaid_break_seconds = 0
+    late_minutes = 0
+    raw_late_minutes = 0
+    early_leave_minutes = 0
+    scheduled_leave_days = 0
+    absence_days = 0
+    elapsed_last = min(last, datetime.now(zone).date())
+    working_days = set(profile.working_days or DEFAULT_WORKING_DAYS)
+    cursor = max(first, employee.start_date) if employee.start_date else first
+    while cursor <= last:
+        if cursor.weekday() in working_days:
+            expected_days += 1
+            if cursor in leave_days:
+                scheduled_leave_days += 1
+            override = _daily_override(overrides, employee.id, cursor, team_ids)
+            shift_start, shift_end, rules = _day_schedule(profile, override)
+            if profile.schedule_type == "flexible" and not (
+                override and override.override_type in {"shift", "both"}
+            ):
+                # Flexible days owe required_daily_minutes and have no fixed
+                # start or end to be late against or leave early from.
+                shift_start = shift_end = None
+            if shift_start and shift_end and shift_end > shift_start:
+                shift_seconds = (
+                    shift_end.hour * 3600
+                    + shift_end.minute * 60
+                    - shift_start.hour * 3600
+                    - shift_start.minute * 60
+                )
+            else:
+                shift_seconds = int(profile.required_daily_minutes or 480) * 60
+            expected_seconds += shift_seconds
+            day_sessions = sessions_by_day.get(cursor, [])
+            if day_sessions:
+                paid, unpaid = _break_totals(rules)
+                paid_break_seconds += paid
+                unpaid_break_seconds += unpaid
+            if cursor <= elapsed_last and not day_sessions and cursor not in leave_days:
+                absence_days += 1
+            if day_sessions and shift_start:
+                first_start = min(item.started_at for item in day_sessions).astimezone(zone)
+                scheduled = datetime.combine(cursor, shift_start, tzinfo=zone)
+                grace = timedelta(minutes=int(profile.late_grace_minutes or 15))
+                if first_start > scheduled:
+                    raw_late_minutes += int((first_start - scheduled).total_seconds() // 60)
+                if first_start > scheduled + grace:
+                    late_minutes += int((first_start - scheduled - grace).total_seconds() // 60)
+            if day_sessions and shift_end and cursor not in leave_days:
+                scheduled_end = datetime.combine(cursor, shift_end, tzinfo=zone)
+                last_end = max(
+                    (item.ended_at or item.updated_at or item.started_at).astimezone(zone)
+                    for item in day_sessions
+                )
+                approved_early = next(
+                    (
+                        item
+                        for item in adjustments
+                        if item.requested_date == cursor
+                        and item.request_type == "early_leave"
+                        and item.status == "approved"
+                        and item.source_start_at is not None
+                    ),
+                    None,
+                )
+                expected_end = (
+                    min(scheduled_end, approved_early.source_start_at.astimezone(zone))
+                    if approved_early
+                    else scheduled_end
+                )
+                if datetime.now(zone) >= expected_end and last_end < expected_end:
+                    early_leave_minutes += int((expected_end - last_end).total_seconds() // 60)
+        cursor += timedelta(days=1)
+
+    worked_seconds = sum(max(0, item.active_seconds - item.deducted_seconds) for item in sessions)
+    idle_seconds = sum(max(0, item.idle_seconds) for item in sessions)
+    manual = {"approved": 0, "pending": 0, "rejected": 0}
+    for item in adjustments:
+        seconds = item.approved_seconds if item.status == "approved" else item.requested_seconds
+        manual[item.status] = manual.get(item.status, 0) + int(seconds or 0)
+
+    recorded_overtime = sum(max(0, item.recorded_extra_seconds) for item in overtime_records)
+    recorded_overtime = max(recorded_overtime, sum(max(0, item.extra_seconds) for item in sessions))
+    approved_overtime = sum(
+        max(0, item.approved_seconds) for item in overtime_records if item.status == "approved"
+    )
+    rejected_overtime = sum(
+        max(0, item.recorded_extra_seconds)
+        for item in overtime_records
+        if item.status == "rejected"
+    )
+
+    # DailyAttendance is the canonical attendance evidence used by payroll.
+    # Materialize days that contain a source record and reuse immutable past
+    # results until a source/profile changes. This avoids summing overlapping
+    # sessions twice and keeps subsequent payroll refreshes inexpensive.
+    # Meeting Mode periods are their own attendance evidence: an approved
+    # meeting reclassifies idle into payable time inside calculate_daily_attendance.
+    # A day with only a meeting (no session/adjustment/overtime/leave) must still
+    # materialize an attendance row, or that payable meeting time is dropped.
+    # Delayed-break claims need no special handling here — they are
+    # TimeAdjustmentRequests and already arrive via ``adjustments``.
+    if meeting_dates is None:
+        meeting_dates = set(
+            db.scalars(
+                select(MeetingRecord.work_date).where(
+                    MeetingRecord.company_id == company_id,
+                    MeetingRecord.employee_id == employee.id,
+                    MeetingRecord.work_date.between(first, last),
+                )
+            ).all()
+        )
+
+    relevant_days = set(sessions_by_day)
+    relevant_days.update(item.requested_date for item in adjustments)
+    relevant_days.update(item.work_date for item in overtime_records)
+    relevant_days.update(day for day in leave_days if first <= day <= last)
+    relevant_days.update(day for day in meeting_dates if first <= day <= last)
+    employee_today = datetime.now(zone).date()
+    if first <= employee_today <= last:
+        relevant_days.add(employee_today)
+    if stored_attendance is not None:
+        stored_rows = stored_attendance
+    else:
+        stored_rows = {
+            item.work_date: item
+            for item in db.scalars(
+                select(DailyAttendance).where(
+                    DailyAttendance.company_id == company_id,
+                    DailyAttendance.employee_id == employee.id,
+                    DailyAttendance.work_date.between(first, last),
+                )
+            ).all()
+        }
+    override_updates = {
+        item.effective_date: _as_utc(item.updated_at)
+        for item in overrides
+        if item.employee_id in {None, employee.id}
+    }
+    source_updates: dict[date, datetime] = defaultdict(lambda: _as_utc(profile.updated_at))
+    for day, items in sessions_by_day.items():
+        source_updates[day] = max(
+            source_updates[day], *(_as_utc(item.updated_at) for item in items)
+        )
+    for item in adjustments:
+        source_updates[item.requested_date] = max(
+            source_updates[item.requested_date], _as_utc(item.updated_at)
+        )
+    for item in overtime_records:
+        source_updates[item.work_date] = max(
+            source_updates[item.work_date], _as_utc(item.updated_at)
+        )
+    for item in approved_leave:
+        cursor = max(first, item.start_date)
+        leave_last = min(last, item.end_date)
+        while cursor <= leave_last:
+            source_updates[cursor] = max(source_updates[cursor], _as_utc(item.updated_at))
+            cursor += timedelta(days=1)
+    for day, updated_at in override_updates.items():
+        source_updates[day] = max(source_updates[day], updated_at)
+
+    attendance_rows: list[DailyAttendance] = []
+    now = datetime.now(UTC)
+    for work_date in sorted(day for day in relevant_days if first <= day <= last):
+        stored = stored_rows.get(work_date)
+        source_changed = stored is not None and _as_utc(stored.calculated_at) < source_updates[work_date]
+        # "Today" is never immutable, but re-running the full timeline build on
+        # every payroll poll (every employee, every request) is what made the
+        # sheet slow to load. Bound it the same way cached_daily_attendance
+        # bounds dashboard polling, instead of forcing a rebuild every time.
+        today_expired = (
+            stored is not None
+            and work_date == employee_today
+            and (now - _as_utc(stored.calculated_at)).total_seconds()
+            >= TODAY_ATTENDANCE_REFRESH_SECONDS
+        )
+        stale = stored is None or source_changed or today_expired
+        if stale and collect_stale_days is not None:
+            collect_stale_days.add(work_date)
+            continue
+        if stale:
+            stored, _ = calculate_daily_attendance(
+                db,
+                employee=employee,
+                work_date=work_date,
+                now=now,
+            )
+        attendance_rows.append(stored)
+
+    if collect_stale_days is not None:
+        return {}
+
+    if attendance_rows:
+        worked_seconds = sum(item.normal_worked_seconds for item in attendance_rows)
+        idle_seconds = sum(item.idle_seconds for item in attendance_rows)
+        manual = {
+            "approved": sum(item.approved_manual_seconds for item in attendance_rows),
+            "pending": sum(item.pending_manual_seconds for item in attendance_rows),
+            "rejected": sum(item.rejected_manual_seconds for item in attendance_rows),
+        }
+        paid_break_seconds = sum(item.paid_break_seconds for item in attendance_rows)
+        unpaid_break_seconds = sum(item.unpaid_break_seconds for item in attendance_rows)
+        raw_late_minutes = sum(item.raw_late_seconds for item in attendance_rows) // 60
+        late_minutes = sum(item.deductible_late_seconds for item in attendance_rows) // 60
+        early_leave_minutes = sum(item.early_leave_seconds for item in attendance_rows) // 60
+        recorded_overtime = sum(item.recorded_overtime_seconds for item in attendance_rows)
+        approved_overtime = sum(item.approved_overtime_seconds for item in attendance_rows)
+        rejected_overtime = sum(
+            max(0, item.recorded_extra_seconds)
+            for item in overtime_records
+            if item.status == "rejected"
+        )
+        canonical_regular_seconds = sum(
+            max(0, item.total_payable_seconds - item.approved_overtime_seconds)
+            for item in attendance_rows
+        )
+        canonical_total_payable_seconds = sum(
+            item.total_payable_seconds for item in attendance_rows
+        )
+        canonical_worked_days = sum(
+            1
+            for item in attendance_rows
+            if item.actual_first_activity_at is not None or item.approved_manual_seconds > 0
+        )
+    else:
+        # No attendance rows means the period has no sessions, meetings,
+        # adjustments, or leave (every source above feeds ``relevant_days``).
+        # The phase-1 terms — paid late allowance, delayed break, and meeting
+        # seconds — are therefore all zero by construction, so this raw-session
+        # fallback stays reconciled with the canonical stored-attendance path.
+        canonical_regular_seconds = min(
+            expected_seconds,
+            worked_seconds + manual["approved"] + paid_break_seconds,
+        )
+        canonical_total_payable_seconds = canonical_regular_seconds + approved_overtime
+        canonical_worked_days = len(sessions_by_day)
+    configured = decimal(profile.salary_amount)
+    # Salary/hourly conversion always uses a 30-day payroll month. A 31-day
+    # calendar month or a 31-day 26→25 cycle must not increase the salary basis.
+    monthly_paid_hours = (
+        Decimal(int(profile.required_daily_minutes or 480) * STANDARD_MONTH_DAYS) / Decimal(60)
+    )
+    hourly_rate = (
+        configured
+        if profile.salary_type == "hourly"
+        else (configured / monthly_paid_hours if monthly_paid_hours else Decimal(0))
+    )
+    regular_payable_seconds = min(expected_seconds, canonical_regular_seconds)
+    base_salary = (
+        configured
+        if profile.salary_type == "monthly"
+        else (Decimal(regular_payable_seconds) / Decimal(3600) * hourly_rate)
+    )
+    if profile.salary_type == "monthly" and last < period_last:
+        # Final month of an archived employee: pro-rate the monthly salary by
+        # the calendar days employed through the last working day, using the
+        # same 30-day payroll month as the hourly conversion.
+        employed_from = max(first, employee.start_date) if employee.start_date else first
+        employed_days = max(0, (last - employed_from).days + 1)
+        base_salary = min(
+            configured,
+            configured * Decimal(employed_days) / Decimal(STANDARD_MONTH_DAYS),
+        )
+    needs_review = any(
+        (
+            late_minutes,
+            idle_seconds,
+            absence_days,
+            recorded_overtime,
+            manual["pending"],
+            unpaid_leave_days,
+        )
+    )
+    return {
+        "salary_type": profile.salary_type,
+        "currency": profile.salary_currency or "EGP",
+        "salary_amount": money(configured),
+        "hourly_rate": hourly_rate.quantize(Decimal("0.0001")),
+        "expected_work_days": expected_days,
+        "worked_days": canonical_worked_days,
+        "leave_days": scheduled_leave_days,
+        "expected_seconds": expected_seconds,
+        "worked_seconds": worked_seconds,
+        "normal_seconds": regular_payable_seconds,
+        "total_payable_seconds": canonical_total_payable_seconds,
+        "approved_manual_seconds": manual["approved"],
+        "pending_manual_seconds": manual["pending"],
+        "rejected_manual_seconds": manual["rejected"],
+        "idle_seconds": idle_seconds,
+        "late_minutes": late_minutes,
+        "raw_late_minutes": raw_late_minutes,
+        "early_leave_minutes": early_leave_minutes,
+        "paid_break_seconds": paid_break_seconds,
+        "unpaid_break_seconds": unpaid_break_seconds,
+        "absence_days": absence_days,
+        "recorded_overtime_seconds": recorded_overtime,
+        "approved_overtime_seconds": approved_overtime,
+        "rejected_overtime_seconds": rejected_overtime,
+        "overtime_eligible": bool(profile.overtime_enabled),
+        "base_salary": money(base_salary),
+        "default_overtime_multiplier": decimal(profile.overtime_rate_multiplier or 1),
+        "needs_review": needs_review,
+        "unpaid_leave_days": len(unpaid_leave_days),
+        "shift_start": profile.shift_start.isoformat(timespec="minutes")
+        if profile.shift_start
+        else None,
+        "shift_end": profile.shift_end.isoformat(timespec="minutes") if profile.shift_end else None,
+        "late_grace_minutes": int(profile.late_grace_minutes or 15),
+        "last_working_day": last.isoformat() if last < period_last else None,
+    }
+
+
+def recalculate_entry(entry: PayrollEntry) -> None:
+    adjustments = entry.adjustments or []
+    adjustment_bonuses = sum(
+        (decimal(item.amount) for item in adjustments if item.adjustment_type in BONUS_ADJUSTMENTS),
+        Decimal(0),
+    )
+    adjustment_deductions = sum(
+        (
+            decimal(item.amount)
+            for item in adjustments
+            if item.adjustment_type in DEDUCTION_ADJUSTMENTS
+        ),
+        Decimal(0),
+    )
+    # The HR/Super-Admin payroll decision is itself an explicit authorization:
+    # use request-approved seconds when present, otherwise the recorded evidence
+    # that the payroll reviewer deliberately chose to pay.
+    overtime_seconds = entry.approved_overtime_seconds or entry.recorded_overtime_seconds
+    calculated_overtime = (
+        Decimal(overtime_seconds)
+        / Decimal(3600)
+        * decimal(entry.hourly_rate)
+        * decimal(entry.overtime_multiplier)
+    )
+    entry.overtime_amount = money(
+        decimal(entry.custom_overtime_amount)
+        if entry.pay_overtime and entry.custom_overtime_amount is not None
+        else calculated_overtime
+        if entry.pay_overtime
+        else Decimal(0)
+    )
+    entry.total_deductions = money(
+        (decimal(entry.lateness_deduction_amount) if entry.deduct_lateness else Decimal(0))
+        + (decimal(entry.idle_deduction_amount) if entry.deduct_idle else Decimal(0))
+        + (
+            decimal(entry.unpaid_break_deduction_amount)
+            if entry.deduct_unpaid_breaks
+            else Decimal(0)
+        )
+        + decimal(entry.additional_deduction_amount)
+        + adjustment_deductions
+    )
+    entry.total_bonuses = money(decimal(entry.bonus_amount) + adjustment_bonuses)
+    entry.final_salary = money(
+        max(
+            Decimal(0),
+            decimal(entry.base_salary)
+            + decimal(entry.overtime_amount)
+            + decimal(entry.total_bonuses)
+            - decimal(entry.total_deductions),
+        )
+    )
+    if entry.calculation_snapshot is not None:
+        entry.calculation_snapshot = {
+            **entry.calculation_snapshot,
+            "overtime_amount": float(entry.overtime_amount),
+            "total_deductions": float(entry.total_deductions),
+            "total_bonuses": float(entry.total_bonuses),
+            "final_salary": float(entry.final_salary),
+        }
+
+
+def refresh_run_entries(db: Session, run: PayrollRun) -> list[PayrollEntry]:
+    existing = {
+        item.employee_id: item
+        for item in db.scalars(
+            select(PayrollEntry)
+            .options(selectinload(PayrollEntry.adjustments))
+            .where(PayrollEntry.payroll_run_id == run.id)
+        ).all()
+    }
+    if run.status in FROZEN_RUN_STATUSES:
+        return list(existing.values())
+
+    first, last = (
+        (run.period_start, run.period_end)
+        if run.period_start is not None and run.period_end is not None
+        else month_bounds(run.month)
+    )
+    employees = db.scalars(
+        select(Employee)
+        .where(
+            Employee.company_id == run.company_id,
+            Employee.status != "deleted",
+            or_(Employee.start_date.is_(None), Employee.start_date <= last),
+            # Archived (fired/resigned) employees only appear in the period
+            # that contains their last working day; later draft payroll omits
+            # them. Frozen runs returned above keep them as records.
+            or_(
+                Employee.status != "archived",
+                and_(
+                    Employee.last_working_day.is_not(None),
+                    Employee.last_working_day >= first,
+                ),
+            ),
+        )
+        .order_by(Employee.name)
+    ).all()
+    eligible_ids = {employee.id for employee in employees}
+    for stale_employee_id, stale_entry in list(existing.items()):
+        if stale_employee_id in eligible_ids:
+            continue
+        stale_employee = db.get(Employee, stale_employee_id)
+        if stale_employee is not None and stale_employee.status == "archived":
+            # Editable (draft/review) runs drop employees archived before this
+            # period started; nothing after the last working day is payable.
+            db.delete(stale_entry)
+            del existing[stale_employee_id]
+    overrides = db.scalars(
+        select(WorkScheduleOverride).where(
+            WorkScheduleOverride.company_id == run.company_id,
+            WorkScheduleOverride.permanent.is_(False),
+            WorkScheduleOverride.effective_date.between(first, last),
+        )
+    ).all()
+    employee_ids = [employee.id for employee in employees]
+    profiles = {
+        profile.employee_id: profile
+        for profile in db.scalars(
+            select(EmployeeWorkProfile).where(
+                EmployeeWorkProfile.company_id == run.company_id,
+                EmployeeWorkProfile.employee_id.in_(employee_ids),
+            )
+        ).all()
+    }
+    # Fetch month data in batches. The two-day margin covers every practical
+    # employee timezone; each employee's local month is filtered below.
+    wide_start = datetime.combine(first - timedelta(days=2), time.min, tzinfo=UTC)
+    wide_end = datetime.combine(last + timedelta(days=2), time.max, tzinfo=UTC)
+    sessions_by_employee: dict[UUID, list[WorkSession]] = defaultdict(list)
+    for item in db.scalars(
+        select(WorkSession).where(
+            WorkSession.company_id == run.company_id,
+            WorkSession.employee_id.in_(employee_ids),
+            WorkSession.started_at.between(wide_start, wide_end),
+        )
+    ).all():
+        sessions_by_employee[item.employee_id].append(item)
+    adjustments_by_employee: dict[UUID, list[TimeAdjustmentRequest]] = defaultdict(list)
+    for item in db.scalars(
+        select(TimeAdjustmentRequest).where(
+            TimeAdjustmentRequest.company_id == run.company_id,
+            TimeAdjustmentRequest.employee_id.in_(employee_ids),
+            TimeAdjustmentRequest.requested_date.between(first, last),
+        )
+    ).all():
+        adjustments_by_employee[item.employee_id].append(item)
+    overtime_by_employee: dict[UUID, list[OvertimeRecord]] = defaultdict(list)
+    for item in db.scalars(
+        select(OvertimeRecord).where(
+            OvertimeRecord.company_id == run.company_id,
+            OvertimeRecord.employee_id.in_(employee_ids),
+            OvertimeRecord.work_date.between(first, last),
+        )
+    ).all():
+        overtime_by_employee[item.employee_id].append(item)
+    leave_by_employee: dict[UUID, list[LeaveRequest]] = defaultdict(list)
+    for item in db.scalars(
+        select(LeaveRequest).where(
+            LeaveRequest.company_id == run.company_id,
+            LeaveRequest.employee_id.in_(employee_ids),
+            LeaveRequest.status == "approved",
+            LeaveRequest.start_date <= last,
+            LeaveRequest.end_date >= first,
+        )
+    ).all():
+        leave_by_employee[item.employee_id].append(item)
+    meeting_dates_by_employee: dict[UUID, set[date]] = defaultdict(set)
+    for meeting_employee_id, meeting_date in db.execute(
+        select(MeetingRecord.employee_id, MeetingRecord.work_date).where(
+            MeetingRecord.company_id == run.company_id,
+            MeetingRecord.employee_id.in_(employee_ids),
+            MeetingRecord.work_date.between(first, last),
+        )
+    ).all():
+        meeting_dates_by_employee[meeting_employee_id].add(meeting_date)
+    teams = _team_names(db, run.company_id)
+    team_ids_by_employee: dict[UUID, set[UUID]] = defaultdict(set)
+    for member_employee_id, member_team_id in db.execute(
+        select(TeamMember.employee_id, TeamMember.team_id).where(
+            TeamMember.employee_id.in_(employee_ids), TeamMember.status == "active"
+        )
+    ).all():
+        team_ids_by_employee[member_employee_id].add(member_team_id)
+    # Pre-warm each employee's current day in one batched pass. The current day
+    # is the only routinely-stale attendance day in a payroll refresh, and
+    # recomputing it per employee issued ~20 queries each — minutes of latency
+    # over a remote database, which surfaced to the client as a payroll 503/500.
+    # The batch path fetches every input in a fixed number of queries and
+    # persists byte-identical rows, so the loop below reads them fresh instead
+    # of recomputing. Any other stale day still falls back to the per-employee
+    # path inside calculate_employee_metrics.
+    for employee in employees:
+        if profiles.get(employee.id) is None:
+            profiles[employee.id] = get_or_create_work_profile(db, employee)
+
+    # Materialized attendance for the whole period, fetched once for every
+    # employee instead of one query per employee inside calculate_employee_metrics.
+    stored_attendance_by_employee: dict[UUID, dict[date, DailyAttendance]] = defaultdict(dict)
+    for attendance_row in db.scalars(
+        select(DailyAttendance).where(
+            DailyAttendance.company_id == run.company_id,
+            DailyAttendance.employee_id.in_(employee_ids),
+            DailyAttendance.work_date.between(first, last),
+        )
+    ).all():
+        stored_attendance_by_employee[attendance_row.employee_id][
+            attendance_row.work_date
+        ] = attendance_row
+
+    prewarm_requests = [
+        (employee, employee_today)
+        for employee in employees
+        if first
+        <= (employee_today := datetime.now(_timezone(employee)).date())
+        <= cap_to_employment_end(employee, last)
+    ]
+    if prewarm_requests:
+        existing_by_key = {
+            (employee.id, work_date): stored_attendance_by_employee[employee.id].get(work_date)
+            for employee, work_date in prewarm_requests
+        }
+        warmed = calculate_daily_attendance_bulk(
+            db,
+            company_id=run.company_id,
+            requests=prewarm_requests,
+            profiles=profiles,
+            existing_by_key=existing_by_key,
+        )
+        for (warmed_employee_id, warmed_date), (warmed_row, _) in warmed.items():
+            stored_attendance_by_employee[warmed_employee_id][warmed_date] = warmed_row
+
+    def employee_metrics(employee: Employee, collect_stale_days: set[date] | None = None):
+        return calculate_employee_metrics(
+            db,
+            company_id=run.company_id,
+            employee=employee,
+            profile=profiles[employee.id],
+            first=first,
+            last=last,
+            overrides=overrides,
+            sessions=sessions_by_employee[employee.id],
+            adjustments=adjustments_by_employee[employee.id],
+            overtime_records=overtime_by_employee[employee.id],
+            approved_leave=leave_by_employee[employee.id],
+            team_ids=team_ids_by_employee[employee.id],
+            stored_attendance=stored_attendance_by_employee[employee.id],
+            meeting_dates=meeting_dates_by_employee.get(employee.id, set()),
+            collect_stale_days=collect_stale_days,
+        )
+
+    # Rebuild every other stale attendance day in one batched pass as well. A
+    # work-profile edit (shift, breaks, policy) marks every day of the period
+    # stale for that employee; rebuilding those one day at a time took minutes
+    # over the remote database, so whoever opened payroll first after such a
+    # change hit the client timeout and then PAYROLL_BUSY on the retries.
+    stale_requests: list[tuple[Employee, date]] = []
+    for employee in employees:
+        stale_days: set[date] = set()
+        employee_metrics(employee, stale_days)
+        stale_requests.extend((employee, work_date) for work_date in sorted(stale_days))
+    if stale_requests:
+        rebuilt = calculate_daily_attendance_bulk(
+            db,
+            company_id=run.company_id,
+            requests=stale_requests,
+            profiles=profiles,
+            existing_by_key={
+                (employee.id, work_date): stored_attendance_by_employee[employee.id].get(work_date)
+                for employee, work_date in stale_requests
+            },
+        )
+        for (rebuilt_employee_id, rebuilt_date), (rebuilt_row, _) in rebuilt.items():
+            stored_attendance_by_employee[rebuilt_employee_id][rebuilt_date] = rebuilt_row
+
+    result: list[PayrollEntry] = []
+    for employee in employees:
+        metrics = employee_metrics(employee)
+        entry = existing.get(employee.id)
+        if entry is None:
+            entry = PayrollEntry(
+                company_id=run.company_id,
+                payroll_run_id=run.id,
+                employee_id=employee.id,
+                overtime_multiplier=metrics["default_overtime_multiplier"],
+            )
+            db.add(entry)
+            entry.adjustments = []
+        for field in (
+            "salary_type",
+            "currency",
+            "salary_amount",
+            "hourly_rate",
+            "expected_work_days",
+            "worked_days",
+            "leave_days",
+            "expected_seconds",
+            "worked_seconds",
+            "normal_seconds",
+            "total_payable_seconds",
+            "approved_manual_seconds",
+            "pending_manual_seconds",
+            "rejected_manual_seconds",
+            "idle_seconds",
+            "late_minutes",
+            "raw_late_minutes",
+            "early_leave_minutes",
+            "paid_break_seconds",
+            "unpaid_break_seconds",
+            "absence_days",
+            "recorded_overtime_seconds",
+            "approved_overtime_seconds",
+            "rejected_overtime_seconds",
+            "overtime_eligible",
+            "base_salary",
+        ):
+            setattr(entry, field, metrics[field])
+        entry.team_name = teams.get(employee.id)
+        entry.job_title = employee.job_title
+        if entry.status in {"draft", "needs_review"}:
+            entry.status = "needs_review" if metrics["needs_review"] else "draft"
+        entry.calculation_snapshot = {
+            **metrics,
+            "base_salary": float(metrics["base_salary"]),
+            "hourly_rate": float(metrics["hourly_rate"]),
+            "salary_amount": float(metrics["salary_amount"]),
+            "default_overtime_multiplier": float(metrics["default_overtime_multiplier"]),
+        }
+        recalculate_entry(entry)
+        result.append(entry)
+    db.flush()
+    return result
+
+
+def serialize_adjustment(item: PayrollAdjustment) -> dict:
+    return {
+        "id": str(item.id),
+        "type": item.adjustment_type,
+        "amount": float(item.amount),
+        "reason": item.reason,
+        "created_by": str(item.created_by_admin_user_id),
+        "created_at": item.created_at.isoformat(),
+    }
+
+
+def serialize_entry(entry: PayrollEntry, *, include_details: bool = False) -> dict:
+    data = {
+        "id": str(entry.id),
+        "employee_id": str(entry.employee_id),
+        "employee_name": entry.employee.name if entry.employee else "Employee",
+        "team": entry.team_name,
+        "job_title": entry.job_title,
+        "salary_type": entry.salary_type,
+        "salary": float(entry.salary_amount),
+        "currency": entry.currency,
+        "hourly_rate": float(entry.hourly_rate),
+        "expected_work_days": entry.expected_work_days,
+        "worked_days": entry.worked_days,
+        "leave_days": entry.leave_days,
+        "expected_seconds": entry.expected_seconds,
+        "worked_seconds": entry.worked_seconds,
+        "normal_seconds": entry.normal_seconds,
+        "total_payable_seconds": entry.total_payable_seconds,
+        "approved_manual_seconds": entry.approved_manual_seconds,
+        "pending_manual_seconds": entry.pending_manual_seconds,
+        "rejected_manual_seconds": entry.rejected_manual_seconds,
+        "idle_seconds": entry.idle_seconds,
+        "late_minutes": entry.late_minutes,
+        "raw_late_minutes": entry.raw_late_minutes,
+        "early_leave_minutes": entry.early_leave_minutes,
+        "paid_break_seconds": entry.paid_break_seconds,
+        "unpaid_break_seconds": entry.unpaid_break_seconds,
+        "absence_days": entry.absence_days,
+        "recorded_overtime_seconds": entry.recorded_overtime_seconds,
+        "approved_overtime_seconds": entry.approved_overtime_seconds,
+        "rejected_overtime_seconds": entry.rejected_overtime_seconds,
+        "overtime_eligible": entry.overtime_eligible,
+        "deduct_lateness": entry.deduct_lateness,
+        "lateness_deduction_amount": float(entry.lateness_deduction_amount),
+        "lateness_note": entry.lateness_note,
+        "deduct_idle": entry.deduct_idle,
+        "idle_deduction_amount": float(entry.idle_deduction_amount),
+        "idle_note": entry.idle_note,
+        "pay_overtime": entry.pay_overtime,
+        "overtime_decision": entry.overtime_decision,
+        "overtime_multiplier": float(entry.overtime_multiplier),
+        "custom_overtime_amount": float(entry.custom_overtime_amount)
+        if entry.custom_overtime_amount is not None
+        else None,
+        "overtime_note": entry.overtime_note,
+        "deduct_unpaid_breaks": entry.deduct_unpaid_breaks,
+        "unpaid_break_deduction_amount": float(entry.unpaid_break_deduction_amount),
+        "unpaid_break_note": entry.unpaid_break_note,
+        "bonus_amount": float(entry.bonus_amount),
+        "additional_deduction_amount": float(entry.additional_deduction_amount),
+        "adjustment_note": entry.adjustment_note,
+        "base_salary": float(entry.base_salary),
+        "overtime_amount": float(entry.overtime_amount),
+        "total_deductions": float(entry.total_deductions),
+        "total_bonuses": float(entry.total_bonuses),
+        "final_salary": float(entry.final_salary),
+        "status": entry.status,
+    }
+    if include_details:
+        data["calculation"] = entry.calculation_snapshot or {}
+        data["adjustments"] = [serialize_adjustment(item) for item in entry.adjustments]
+    return data
+
+
+def serialize_run(run: PayrollRun) -> dict:
+    return {
+        "id": str(run.id),
+        "month": run.month.strftime("%Y-%m"),
+        "period_start": run.period_start.isoformat() if run.period_start else None,
+        "period_end": run.period_end.isoformat() if run.period_end else None,
+        "cycle_timezone": run.cycle_timezone,
+        "status": run.status,
+        "approved_at": run.approved_at.isoformat() if run.approved_at else None,
+        "locked_at": run.locked_at.isoformat() if run.locked_at else None,
+        "paid_at": run.paid_at.isoformat() if run.paid_at else None,
+    }

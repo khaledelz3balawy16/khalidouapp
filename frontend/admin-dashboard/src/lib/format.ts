@@ -1,0 +1,177 @@
+export function formatMinutes(mins: number): string {
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  if (h === 0) return `${m}m`;
+  return `${h}h ${m}m`;
+}
+
+export function formatDurationSeconds(totalSeconds: number): string {
+  const safeSeconds = Number.isFinite(totalSeconds) ? Math.max(0, Math.floor(totalSeconds)) : 0;
+  if (safeSeconds > 0 && safeSeconds < 60) return `${safeSeconds}s`;
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  return hours ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
+export function formatRelative(iso?: string): string {
+  if (!iso) return "—";
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.round(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+export function formatClock(value?: string | null, timezone?: string | null): string {
+  if (!value) return "—";
+  if (isTimeOfDay(value)) return formatTimeOfDay(value);
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: timezone || undefined,
+  }).format(date);
+}
+
+export function formatSessionStatus(
+  isRunning: boolean,
+  signedOutAt?: string | null,
+  timezone?: string | null,
+): string {
+  if (isRunning) return "Still running - no sign-out yet";
+  if (!signedOutAt) return "No sign-out recorded";
+  return `Signed out ${formatClock(signedOutAt, timezone)}`;
+}
+
+export function formatAttendanceStart(
+  actualFirstActivityAt?: string | null,
+  timezone?: string | null,
+  continuedFromPreviousDay = false,
+  continuedSessionStartedAt?: string | null,
+): string {
+  // This column describes today's attendance. A recovered session's historical
+  // origin must never replace the first activity recorded for this day.
+  if (actualFirstActivityAt) {
+    return formatClock(actualFirstActivityAt, timezone);
+  }
+  if (!continuedFromPreviousDay) {
+    return formatClock(actualFirstActivityAt, timezone);
+  }
+  const originalStart = continuedSessionStartedAt || actualFirstActivityAt;
+  if (!originalStart) {
+    return "Continued from previous day";
+  }
+  const date = new Date(originalStart);
+  if (Number.isNaN(date.getTime())) {
+    return "Continued from previous day";
+  }
+  const day = new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    timeZone: timezone || undefined,
+  }).format(date);
+  return `Continued from ${day}, ${formatClock(originalStart, timezone)}`;
+}
+
+export function formatTimeOfDay(value?: string | null): string {
+  if (!value) return "—";
+  const match = /^(\d{1,2}):(\d{2})(?::\d{2}(?:\.\d+)?)?$/.exec(value.trim());
+  if (!match) return "—";
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return "—";
+  const suffix = hours < 12 ? "AM" : "PM";
+  return `${hours % 12 || 12}:${String(minutes).padStart(2, "0")} ${suffix}`;
+}
+
+export function formatDateTime(iso?: string, timezone?: string | null): string {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: timezone || undefined,
+  }).format(date);
+}
+
+export function formatDate(iso?: string): string {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleDateString([], { dateStyle: "medium" });
+}
+
+const PLAIN_NUMBER = /^-?(?:\d+\.?\d*|\.\d+)$/;
+const FORMULA_LEAD = /^[=+\-@\t\r]/;
+
+/**
+ * Render one value as a spreadsheet-safe CSV cell.
+ *
+ * Neutralizes CSV/formula injection: a string a spreadsheet would evaluate as a
+ * formula (leading `=`, `+`, `-`, `@`, tab, or CR) is prefixed with a single
+ * quote so it imports as literal text (W10). Genuine numbers — including
+ * negative amounts — and dates are preserved. Standard CSV quoting is applied
+ * for separators, quotes, and newlines.
+ */
+export function csvCell(value: unknown): string {
+  if (value == null) return "";
+  let text = String(value);
+  const isNumeric = typeof value === "number" || typeof value === "bigint";
+  if (!isNumeric && FORMULA_LEAD.test(text) && !PLAIN_NUMBER.test(text)) {
+    text = `'${text}`;
+  }
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+export function downloadCSV(filename: string, rows: Record<string, unknown>[]) {
+  if (rows.length === 0) return;
+  const headers = Object.keys(rows[0]);
+  const csv = [
+    headers.map((h) => csvCell(h)).join(","),
+    ...rows.map((r) => headers.map((h) => csvCell(r[h])).join(",")),
+  ].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function isTimeOfDay(value: string) {
+  return /^\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(value.trim());
+}
+
+export function parseIsoDate(value?: string | null): Date | undefined {
+  if (!value) return undefined;
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return undefined;
+  return new Date(year, month - 1, day);
+}
+
+export function toIsoDate(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+/** dd/mm/yyyy for a calendar date, regardless of the browser locale. */
+export function formatDisplayDate(date: Date): string {
+  const day = String(date.getDate()).padStart(2, "0");
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  return `${day}/${month}/${date.getFullYear()}`;
+}
+
+export function isoDateToDisplay(value?: string | null): string {
+  const date = parseIsoDate(value);
+  return date ? formatDisplayDate(date) : "";
+}

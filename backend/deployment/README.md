@@ -1,0 +1,205 @@
+# Production VPS deployment
+
+The production Compose stack runs PostgreSQL, FastAPI, the Admin Dashboard, and Nginx. PostgreSQL is private to the Docker network; screenshots and database data use persistent Docker volumes.
+
+## 1. DNS
+
+Create two `A` records pointing to the VPS public IP:
+
+```text
+api.khaliduo.example.com -> VPS_PUBLIC_IP
+app.khaliduo.example.com -> VPS_PUBLIC_IP
+```
+
+## 2. Production environment
+
+Create `backend/.env` on the VPS. Never commit this file:
+
+```env
+APP_ENV=production
+APP_NAME=Khaliduo
+DATABASE_URL=postgresql://employee_tracker:CHANGE_ME@postgres:5432/employee_tracker
+JWT_SECRET_KEY=CHANGE_ME_LONG_RANDOM_VALUE
+DEVICE_TOKEN_SECRET=CHANGE_ME_DIFFERENT_LONG_RANDOM_VALUE
+CHANGE_MEhttps://app.khaliduo.example.com
+SCREENSHOT_STORAGE_TYPE=local
+SCREENSHOT_STORAGE_PATH=/app/storage/screenshots
+DESKTOP_INSTALLER_PATH=/app/downloads/KhaliduoSetup.exe
+DESKTOP_UPDATE_DIRECTORY=/app/downloads
+SCREENSHOT_MAX_FILE_SIZE_MB=10
+APP_PUBLIC_URL=https://app.khaliduo.example.com
+PASSWORD_RESET_EXPIRE_MINUTES=30
+TRUSTED_PROXY_IPS=127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+IP_GEOLOCATION_URL=https://ipwho.is/{ip}
+IP_GEOLOCATION_TIMEOUT_SECONDS=2
+IP_GEOLOCATION_RETRY_MINUTES=15
+
+# Configure Microsoft Graph (preferred) or SMTP so invitations and resets send.
+GRAPH_TENANT_ID=
+GRAPH_CLIENT_ID=
+GRAPH_CLIENT_SECRET=
+GRAPH_SENDER=contact@example.com
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASSWORD=
+SMTP_FROM=Khaliduo <contact@example.com>
+SMTP_USE_TLS=true
+```
+
+Add the Docker Compose and public routing values to the same protected `backend/.env` file:
+
+```env
+POSTGRES_DB=employee_tracker
+POSTGRES_USER=employee_tracker
+POSTGRES_PASSWORD=CHANGE_ME_STRONG_PASSWORD
+API_DOMAIN=api.khaliduo.example.com
+DASHBOARD_DOMAIN=app.khaliduo.example.com
+PUBLIC_API_BASE_URL=https://api.khaliduo.example.com/api/v1
+PUBLIC_DESKTOP_DOWNLOAD_URL=https://api.khaliduo.example.com/api/v1/downloads/windows
+```
+
+The commands below explicitly load this file for both Compose interpolation and the backend container.
+
+## 3. HTTPS certificates
+
+The first certificates must exist before the HTTPS Nginx container starts. With ports 80 and 443 free:
+
+```bash
+docker run --rm -p 80:80 -v /etc/letsencrypt:/etc/letsencrypt certbot/certbot certonly --standalone -d api.khaliduo.example.com
+docker run --rm -p 80:80 -v /etc/letsencrypt:/etc/letsencrypt certbot/certbot certonly --standalone -d app.khaliduo.example.com
+```
+
+Renew through the shared webroot, then reload Nginx after a successful renewal:
+
+```bash
+docker run --rm \
+  -v /etc/letsencrypt:/etc/letsencrypt \
+  -v "$PWD/deployment/certbot-webroot:/var/www/certbot" \
+  certbot/certbot renew --webroot -w /var/www/certbot
+docker compose --env-file .env -f docker-compose.prod.yml exec nginx nginx -s reload
+```
+
+Schedule these commands with cron or a systemd timer.
+
+## 4. Build the Windows release
+
+Increase the version in `frontend/desktop-agent/package.json`. Build on the trusted Windows signing machine:
+
+```powershell
+$env:VITE_API_BASE_URL="https://api.khaliduo.example.com/api/v1"
+$env:KHALIDUO_EMPLOYEE_PORTAL_URL="https://app.khaliduo.example.com/employee"
+$env:KHALIDUO_UPDATE_URL="https://api.khaliduo.example.com/api/v1/updates/windows"
+$env:UPDATE_CHECK_INTERVAL_MINUTES="15"
+npm run build:installer
+```
+
+Upload these three files together to `frontend/desktop-agent/release-khaliduo/` on the VPS:
+
+- `KhaliduoSetup.exe`
+- `KhaliduoSetup.exe.blockmap`
+- `latest.yml`
+
+The installer embeds the production API and portal URLs. An enrolled installation starts silently with Windows. When a higher version is published, the app checks immediately after startup, downloads it in the background, preserves the active tracking state, starts installation automatically, and restarts. The manual **Check update** and **Install update** actions remain available as fallbacks.
+
+## 5. Start or update the stack
+
+From `backend/`:
+
+```bash
+docker compose --env-file .env -f docker-compose.prod.yml up -d --build
+docker compose --env-file .env -f docker-compose.prod.yml exec backend-api alembic current
+```
+
+The backend container runs `alembic upgrade head` before starting Uvicorn. The second command verifies the active migration revision.
+
+## 6. Smoke tests
+
+Verify all of the following after deployment:
+
+- `https://api.khaliduo.example.com/api/v1/health`
+- Admin login and role restrictions.
+- Employee/Team Manager invitation email.
+- Password-reset link opens the production dashboard.
+- Device enrollment with a one-time code.
+- A device on an Egyptian public IP receives `Africa/Cairo`, while a device on
+  a British public IP receives `Europe/London`, even if Windows has the other
+  timezone selected.
+- Khaliduo starts hidden after the next Windows login.
+- Screenshot upload and protected image display.
+- Installer download from `/download`.
+- Publish a higher desktop version and verify the required update installs and restarts.
+
+## Backups
+
+PostgreSQL:
+
+```bash
+docker compose --env-file .env -f docker-compose.prod.yml exec postgres pg_dump -U employee_tracker employee_tracker > backup.sql
+```
+
+Screenshots:
+
+```bash
+docker run --rm -v khaliduo_screenshots:/data -v "$PWD:/backup" alpine tar czf /backup/screenshots.tar.gz /data
+```
+
+Back up both regularly. Nginx allows 20 MB uploads; keep this above `SCREENSHOT_MAX_FILE_SIZE_MB`.
+
+## Current systemd VPS release
+
+The current Khaliduo VPS uses the repository at
+`/var/www/khalidouapp` with the `khaliduo-api` and
+`khaliduo-dashboard` systemd services. From the trusted Windows build
+machine, deploy a tested and pushed `main` commit with:
+
+```powershell
+.\frontend\scripts\deploy-production.ps1
+```
+
+The command intentionally prompts for SSH authentication and never stores the
+password. It verifies the pushed commit and signed desktop artifacts before it
+changes the server, then:
+
+- creates a PostgreSQL backup when `pg_dump` is available;
+- migrates and restarts the API;
+- builds the dashboard into a staging directory and swaps it only after a
+  successful build;
+- enables one-minute API/database and dashboard health recovery;
+- writes a read-only session, attendance, and screenshot-storage audit under
+  `/var/backups/khaliduo/audits/`;
+- publishes the installer, blockmap, and `latest.yml` with `latest.yml` moved
+  last so clients never see metadata for an incomplete upload;
+- verifies the public database health, dashboard, and update feed.
+
+Validate all inputs without changing Production:
+
+```powershell
+.\frontend\scripts\deploy-production.ps1 -ValidateOnly
+```
+
+If the installer, blockmap, and `latest.yml` finished uploading but the final
+SSH publication step disconnected, resume only that atomic publication:
+
+```powershell
+.\frontend\scripts\deploy-production.ps1 -ResumeDesktopPublish
+```
+
+Recovery mode revalidates the local signed installer, uses the existing
+versioned staging directory on the server, verifies its size and SHA-512, and
+publishes it without redeploying the API/dashboard or uploading the installer
+again. Its remote script is passed without redirecting SSH stdin, so password
+authentication receives a clean console prompt.
+
+Run the production audit again without changing data:
+
+```bash
+cd /var/www/khalidouapp/backend
+/var/www/khalidouapp/venv/bin/python -m scripts.audit_production_state --days 7
+```
+
+Use `--employee "Employee Name"` to narrow the report. Missing screenshot
+originals require restoration from backup; missing thumbnails are regenerated
+on demand and are reported separately. Never apply attendance or payroll
+adjustments from this audit alone—confirm the last trusted heartbeat and the
+employee's real work evidence first.

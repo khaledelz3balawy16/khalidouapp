@@ -1,0 +1,830 @@
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import {
+  AlertTriangle,
+  CalendarCheck2,
+  CalendarDays,
+  Clock3,
+  ListChecks,
+  Loader2,
+  MonitorCheck,
+  TimerReset,
+  Users,
+} from "lucide-react";
+
+import { getDailyAttendance, listDailyAttendanceWithMeta } from "@/api/attendance";
+import { CorrectAttendanceButton } from "@/components/attendance/attendance-correction-dialog";
+import { listTeams } from "@/api/teams";
+import { AttendanceStatusBadges } from "@/components/attendance/attendance-status-badges";
+import { EmployeeAttendanceHistoryDialog } from "@/components/attendance/employee-attendance-history-dialog";
+import { WorkdayTimeline } from "@/components/workday-timeline";
+import { Button } from "@/components/admin/button";
+import { Card } from "@/components/admin/card";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/admin/dialog";
+import { Input } from "@/components/ui/input";
+import { DateInput } from "@/components/ui/date-input";
+import { PageHeader } from "@/components/admin/PageHeader";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/admin/select";
+import { StatusBadge } from "@/components/admin/status-badge";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/admin/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/admin/tabs";
+import { useAuth } from "@/lib/auth";
+import {
+  formatAttendanceStart,
+  formatClock,
+  formatDurationSeconds,
+  formatSessionStatus,
+} from "@/lib/format";
+import { attendanceRefetchInterval, attendanceTabIsActive } from "@/lib/attendance-query-policy";
+
+export const Route = createFileRoute("/_app/attendance")({ component: AttendancePage });
+
+const today = () => new Date().toLocaleDateString("en-CA");
+const thirtyDaysAgo = () => {
+  const value = new Date();
+  value.setDate(value.getDate() - 29);
+  return value.toLocaleDateString("en-CA");
+};
+const duration = formatDurationSeconds;
+
+function useDebouncedValue<T>(value: T, delay = 300) {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setDebouncedValue(value), delay);
+    return () => window.clearTimeout(timeout);
+  }, [delay, value]);
+
+  return debouncedValue;
+}
+
+function AttendancePage() {
+  const { scopedTeamIds } = useAuth();
+  const scope = scopedTeamIds();
+  const [activeTab, setActiveTab] = useState<"daily" | "employee-history">("daily");
+  const [day, setDay] = useState(today());
+  const [teamId, setTeamId] = useState("all");
+  const [status, setStatus] = useState("all");
+  const [issue, setIssue] = useState<
+    "all" | "late" | "missing_check_in" | "overtime" | "idle" | "leave"
+  >("all");
+  const [q, setQ] = useState("");
+  const [selectedEmployeeId, setSelectedEmployeeId] = useState<string | null>(null);
+  const [historyStartDate, setHistoryStartDate] = useState(thirtyDaysAgo());
+  const [historyEndDate, setHistoryEndDate] = useState(today());
+  const [historyTeamId, setHistoryTeamId] = useState("all");
+  const [historyQuery, setHistoryQuery] = useState("");
+  const [historyEmployee, setHistoryEmployee] = useState<{
+    id: string;
+    name: string;
+  } | null>(null);
+  const debouncedQuery = useDebouncedValue(q);
+  const debouncedHistoryQuery = useDebouncedValue(historyQuery);
+  const isToday = day === today();
+  const teams = useQuery({
+    queryKey: ["teams", scope],
+    queryFn: ({ signal }) => listTeams(scope, signal),
+    meta: { suppressGlobalLoading: true },
+    staleTime: 10 * 60_000,
+    gcTime: 30 * 60_000,
+  });
+  const attendance = useQuery({
+    queryKey: ["daily-attendance", scope, day, teamId, status, issue, debouncedQuery],
+    queryFn: ({ signal }) =>
+      listDailyAttendanceWithMeta({ day, teamId, status, issue, q: debouncedQuery }, signal),
+    meta: { suppressGlobalLoading: true },
+    enabled: attendanceTabIsActive(activeTab, "daily"),
+    staleTime: isToday ? 30_000 : 5 * 60_000,
+    refetchInterval: (query) =>
+      attendanceRefetchInterval({
+        active: attendanceTabIsActive(activeTab, "daily"),
+        pendingRefreshCount: query.state.data?.pendingRefreshCount ?? 0,
+        isToday,
+      }),
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
+    placeholderData: (previous) => previous,
+  });
+  const detail = useQuery({
+    queryKey: ["daily-attendance-detail", scope, selectedEmployeeId, day],
+    queryFn: ({ signal }) => getDailyAttendance(selectedEmployeeId!, day, signal),
+    meta: { suppressGlobalLoading: true },
+    enabled: Boolean(selectedEmployeeId),
+    staleTime: isToday ? 30_000 : 5 * 60_000,
+    refetchInterval: selectedEmployeeId && isToday ? 60_000 : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
+  });
+  const historyRoster = useQuery({
+    queryKey: [
+      "attendance-employee-history-roster",
+      scope,
+      historyEndDate,
+      historyTeamId,
+      debouncedHistoryQuery,
+    ],
+    queryFn: ({ signal }) =>
+      listDailyAttendanceWithMeta(
+        {
+          day: historyEndDate,
+          teamId: historyTeamId,
+          status: "all",
+          issue: "all",
+          q: debouncedHistoryQuery,
+        },
+        signal,
+      ),
+    meta: { suppressGlobalLoading: true },
+    enabled: attendanceTabIsActive(activeTab, "employee-history") && Boolean(historyEndDate),
+    staleTime: 55_000,
+    refetchInterval: (query) =>
+      attendanceRefetchInterval({
+        active: attendanceTabIsActive(activeTab, "employee-history") && Boolean(historyEndDate),
+        pendingRefreshCount: query.state.data?.pendingRefreshCount ?? 0,
+        isToday: historyEndDate === today(),
+      }),
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
+    placeholderData: (previous) => previous,
+  });
+  const rows = attendance.data?.rows ?? [];
+  const historyRows = historyRoster.data?.rows ?? [];
+  const historyRangeDays =
+    historyStartDate && historyEndDate
+      ? Math.floor(
+          (Date.parse(`${historyEndDate}T00:00:00Z`) -
+            Date.parse(`${historyStartDate}T00:00:00Z`)) /
+            86_400_000,
+        ) + 1
+      : 0;
+  const invalidHistoryRange = historyRangeDays < 1 || historyRangeDays > 62;
+  const summary = rows.reduce(
+    (total, row) => ({
+      present: total.present + (row.status === "present" ? 1 : 0),
+      issues: total.issues + (row.issues.length ? 1 : 0),
+      worked: total.worked + row.normalWorkedSeconds,
+      overtime: total.overtime + row.recordedOvertimeSeconds,
+    }),
+    { present: 0, issues: 0, worked: 0, overtime: 0 },
+  );
+
+  return (
+    <div className="studio-page">
+      <PageHeader
+        title="Attendance"
+        description="Review a single workday or open each employee's full attendance history."
+      />
+      <Tabs
+        value={activeTab}
+        onValueChange={(value) => setActiveTab(value as "daily" | "employee-history")}
+      >
+        <TabsList className="mb-4">
+          <TabsTrigger value="daily">
+            <ListChecks className="mr-2 h-4 w-4" />
+            Daily overview
+          </TabsTrigger>
+          <TabsTrigger value="employee-history">
+            <Users className="mr-2 h-4 w-4" />
+            Employee history
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="daily" className="mt-0">
+          <div className="mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <Metric
+              icon={CalendarCheck2}
+              label="Present"
+              value={`${summary.present} / ${rows.length}`}
+            />
+            <Metric icon={AlertTriangle} label="Need review" value={summary.issues} tone="amber" />
+            <Metric
+              icon={Clock3}
+              label="Normal worked"
+              value={duration(summary.worked)}
+              tone="green"
+            />
+            <Metric
+              icon={TimerReset}
+              label="Recorded overtime"
+              value={duration(summary.overtime)}
+              tone="violet"
+            />
+          </div>
+          <Card className="mb-4 p-4">
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
+              <DateInput value={day} onChange={(event) => setDay(event.target.value)} />
+              <Input
+                placeholder="Search employee…"
+                value={q}
+                onChange={(event) => setQ(event.target.value)}
+              />
+              <Select value={teamId} onValueChange={setTeamId}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All teams</SelectItem>
+                  {(teams.data ?? []).map((team) => (
+                    <SelectItem key={team.id} value={team.id}>
+                      {team.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Select value={status} onValueChange={setStatus}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All statuses</SelectItem>
+                  <SelectItem value="present">Present</SelectItem>
+                  <SelectItem value="late">Late</SelectItem>
+                  <SelectItem value="left_early">Left early</SelectItem>
+                  <SelectItem value="not_started">Not started</SelectItem>
+                  <SelectItem value="absent">Absent</SelectItem>
+                  <SelectItem value="approved_leave">Approved leave</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select value={issue} onValueChange={(value) => setIssue(value as typeof issue)}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All signals</SelectItem>
+                  <SelectItem value="late">Late employees</SelectItem>
+                  <SelectItem value="missing_check_in">Missing check-in</SelectItem>
+                  <SelectItem value="overtime">Recorded overtime</SelectItem>
+                  <SelectItem value="idle">Deductible idle</SelectItem>
+                  <SelectItem value="leave">On leave</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setTeamId("all");
+                  setStatus("all");
+                  setIssue("all");
+                  setQ("");
+                  setDay(today());
+                }}
+              >
+                Reset filters
+              </Button>
+            </div>
+          </Card>
+          <Card className="overflow-hidden [&>div]:max-h-[70vh] [&>div]:overflow-auto">
+            {(attendance.data?.pendingRefreshCount ?? 0) > 0 && (
+              <div
+                className="flex items-center gap-2 border-b bg-primary/5 px-4 py-2 text-xs font-semibold text-primary"
+                role="status"
+              >
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Updating {attendance.data?.pendingRefreshCount} attendance rows in the background…
+              </div>
+            )}
+            <Table>
+              <TableHeader className="sticky top-0 z-20 bg-card shadow-sm [&_th]:bg-card">
+                <TableRow>
+                  <TableHead>Employee</TableHead>
+                  <TableHead>Schedule</TableHead>
+                  <TableHead>First / last / sign-out</TableHead>
+                  <TableHead>Normal</TableHead>
+                  <TableHead>Paid break</TableHead>
+                  <TableHead>Idle</TableHead>
+                  <TableHead>Late</TableHead>
+                  <TableHead>Early leave</TableHead>
+                  <TableHead>Extra</TableHead>
+                  <TableHead>Manual</TableHead>
+                  <TableHead>Payable</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {attendance.isLoading ? (
+                  Array.from({ length: 6 }).map((_, index) => (
+                    <TableRow key={index}>
+                      <TableCell colSpan={13}>
+                        <div className="h-10 animate-pulse rounded bg-muted" />
+                      </TableCell>
+                    </TableRow>
+                  ))
+                ) : attendance.isError && rows.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={13} className="py-12 text-center">
+                      <AlertTriangle className="mx-auto h-7 w-7 text-destructive" />
+                      <p className="mt-2 font-bold">Attendance couldn&apos;t be loaded</p>
+                      <Button
+                        className="mt-3"
+                        size="sm"
+                        type="button"
+                        onClick={() => attendance.refetch()}
+                      >
+                        Retry
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  rows.map((row) => (
+                    <TableRow key={row.id}>
+                      <TableCell>
+                        <p className="font-bold">{row.employeeName}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {row.teamNames.join(", ") || row.jobTitle || "No team"}
+                        </p>
+                      </TableCell>
+                      <TableCell className="text-xs">
+                        {formatClock(row.scheduledStartAt, row.timezone)} –{" "}
+                        {formatClock(row.scheduledEndAt, row.timezone)}
+                      </TableCell>
+                      <TableCell className="text-xs">
+                        Started{" "}
+                        {formatAttendanceStart(
+                          row.actualFirstActivityAt,
+                          row.timezone,
+                          row.continuedFromPreviousDay,
+                          row.continuedSessionStartedAt,
+                        )}{" "}
+                        · Last activity {formatClock(row.actualLastActivityAt, row.timezone)}
+                        <span
+                          className={`block text-[10px] ${
+                            row.isRunning
+                              ? "font-semibold text-emerald-700"
+                              : "text-muted-foreground"
+                          }`}
+                        >
+                          {formatSessionStatus(row.isRunning, row.actualSignOutAt, row.timezone)}
+                        </span>
+                      </TableCell>
+                      <TableCell>{duration(row.normalWorkedSeconds)}</TableCell>
+                      <TableCell>{duration(row.paidBreakSeconds)}</TableCell>
+                      <TableCell>
+                        {duration(row.recordedIdleSeconds)}
+                        <span className="block text-[10px] text-muted-foreground">
+                          {duration(row.idleSeconds)} deductible
+                        </span>
+                      </TableCell>
+                      <TableCell>
+                        {duration(row.deductibleLateSeconds)}
+                        <span className="block text-[10px] text-muted-foreground">
+                          {duration(row.rawLateSeconds)} from shift start
+                        </span>
+                      </TableCell>
+                      <TableCell>{duration(row.earlyLeaveSeconds)}</TableCell>
+                      <TableCell>
+                        {duration(row.recordedOvertimeSeconds)}
+                        <span className="block text-[10px] text-muted-foreground">
+                          {duration(row.approvedOvertimeSeconds)} approved
+                        </span>
+                      </TableCell>
+                      <TableCell>
+                        {duration(row.approvedManualSeconds)}
+                        {row.pendingManualSeconds > 0 && (
+                          <span className="block text-[10px] text-amber-700">
+                            {duration(row.pendingManualSeconds)} pending
+                          </span>
+                        )}
+                      </TableCell>
+                      <TableCell className="font-bold">
+                        {duration(row.totalPayableSeconds)}
+                      </TableCell>
+                      <TableCell>
+                        {row.refreshPending ? (
+                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-primary">
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            Calculating…
+                          </span>
+                        ) : (
+                          <AttendanceStatusBadges
+                            status={row.status}
+                            deductibleLateSeconds={row.deductibleLateSeconds}
+                            earlyLeaveSeconds={row.earlyLeaveSeconds}
+                          />
+                        )}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <div className="flex justify-end gap-2">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => setSelectedEmployeeId(row.employeeId)}
+                          >
+                            Details
+                          </Button>
+                          <Button type="button" size="sm" variant="outline" asChild>
+                            <Link
+                              to="/monitoring"
+                              search={{
+                                employeeId: row.employeeId,
+                                day,
+                                tab: "attendance",
+                              }}
+                            >
+                              <MonitorCheck className="mr-1 h-4 w-4" />
+                              Monitor
+                            </Link>
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+                {!attendance.isLoading && !attendance.isError && rows.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={13} className="py-12 text-center text-muted-foreground">
+                      No attendance rows match these filters.
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="employee-history" className="mt-0 space-y-4">
+          <Card className="p-4">
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
+              <div>
+                <p className="mb-1 text-xs font-bold text-muted-foreground">From</p>
+                <DateInput
+                  value={historyStartDate}
+                  max={historyEndDate}
+                  onChange={(event) => setHistoryStartDate(event.target.value)}
+                />
+              </div>
+              <div>
+                <p className="mb-1 text-xs font-bold text-muted-foreground">Through</p>
+                <DateInput
+                  value={historyEndDate}
+                  min={historyStartDate}
+                  max={today()}
+                  onChange={(event) => setHistoryEndDate(event.target.value)}
+                />
+              </div>
+              <div>
+                <p className="mb-1 text-xs font-bold text-muted-foreground">Employee</p>
+                <Input
+                  placeholder="Search employee…"
+                  value={historyQuery}
+                  onChange={(event) => setHistoryQuery(event.target.value)}
+                />
+              </div>
+              <div>
+                <p className="mb-1 text-xs font-bold text-muted-foreground">Team</p>
+                <Select value={historyTeamId} onValueChange={setHistoryTeamId}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All teams</SelectItem>
+                    {(teams.data ?? []).map((team) => (
+                      <SelectItem key={team.id} value={team.id}>
+                        {team.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex items-end">
+                <Button
+                  className="w-full"
+                  variant="outline"
+                  onClick={() => {
+                    setHistoryStartDate(thirtyDaysAgo());
+                    setHistoryEndDate(today());
+                    setHistoryTeamId("all");
+                    setHistoryQuery("");
+                  }}
+                >
+                  Reset filters
+                </Button>
+              </div>
+              <div className="flex items-end">
+                <div
+                  className={`w-full rounded-lg border px-3 py-2 text-sm ${
+                    invalidHistoryRange
+                      ? "border-destructive/40 bg-destructive/5 text-destructive"
+                      : "bg-muted/30 text-muted-foreground"
+                  }`}
+                >
+                  <span className="block text-xs font-bold">Selected period</span>
+                  {historyRangeDays > 0 ? `${historyRangeDays} days` : "Choose valid dates"}
+                  {historyRangeDays > 62 && (
+                    <span className="block text-[10px]">Maximum is 62 days.</span>
+                  )}
+                </div>
+              </div>
+            </div>
+          </Card>
+
+          <Card className="overflow-hidden [&>div]:max-h-[70vh] [&>div]:overflow-auto">
+            {(historyRoster.data?.pendingRefreshCount ?? 0) > 0 && (
+              <div
+                className="flex items-center gap-2 border-b bg-primary/5 px-4 py-2 text-xs font-semibold text-primary"
+                role="status"
+              >
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Updating {historyRoster.data?.pendingRefreshCount} employee rows…
+              </div>
+            )}
+            <Table>
+              <TableHeader className="sticky top-0 z-20 bg-card shadow-sm [&_th]:bg-card">
+                <TableRow>
+                  <TableHead>Employee</TableHead>
+                  <TableHead>Team / job title</TableHead>
+                  <TableHead>Period</TableHead>
+                  <TableHead>Latest status</TableHead>
+                  <TableHead>Latest sign-out</TableHead>
+                  <TableHead className="text-right">Action</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {historyRoster.isLoading
+                  ? Array.from({ length: 6 }).map((_, index) => (
+                      <TableRow key={index}>
+                        <TableCell colSpan={6}>
+                          <div className="h-10 animate-pulse rounded bg-muted" />
+                        </TableCell>
+                      </TableRow>
+                    ))
+                  : historyRows.map((row) => (
+                      <TableRow key={row.employeeId}>
+                        <TableCell>
+                          <p className="font-bold">{row.employeeName}</p>
+                          <p className="text-xs text-muted-foreground">{row.employeeEmail}</p>
+                        </TableCell>
+                        <TableCell>
+                          <p className="text-sm">{row.teamNames.join(", ") || "No team"}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {row.jobTitle || "No job title"}
+                          </p>
+                        </TableCell>
+                        <TableCell className="whitespace-nowrap text-xs">
+                          <CalendarDays className="mr-1 inline h-4 w-4" />
+                          {historyStartDate} – {historyEndDate}
+                        </TableCell>
+                        <TableCell>
+                          <StatusBadge status={row.status} />
+                        </TableCell>
+                        <TableCell className="whitespace-nowrap text-xs">
+                          {formatSessionStatus(row.isRunning, row.actualSignOutAt, row.timezone)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <Button
+                            type="button"
+                            size="sm"
+                            disabled={invalidHistoryRange}
+                            onClick={() =>
+                              setHistoryEmployee({
+                                id: row.employeeId,
+                                name: row.employeeName,
+                              })
+                            }
+                          >
+                            View all days
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                {!historyRoster.isLoading && historyRows.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={6} className="py-12 text-center text-muted-foreground">
+                      No employees match these filters.
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </Card>
+        </TabsContent>
+      </Tabs>
+      <Dialog
+        open={Boolean(selectedEmployeeId)}
+        onOpenChange={(open) => !open && setSelectedEmployeeId(null)}
+      >
+        <DialogContent className="max-h-[88vh] max-w-5xl overflow-y-auto">
+          <DialogHeader>
+            <div className="flex flex-wrap items-center justify-between gap-3 pr-7">
+              <DialogTitle>
+                {detail.data?.employeeName ?? "Attendance detail"} · {day}
+              </DialogTitle>
+              {selectedEmployeeId && (
+                <div className="flex flex-wrap gap-2">
+                  <Button type="button" size="sm" variant="outline" asChild>
+                    <Link
+                      to="/monitoring"
+                      search={{
+                        employeeId: selectedEmployeeId,
+                        day,
+                        tab: "attendance",
+                      }}
+                    >
+                      <MonitorCheck className="mr-1 h-4 w-4" />
+                      Open employee monitoring
+                    </Link>
+                  </Button>
+                </div>
+              )}
+            </div>
+          </DialogHeader>
+          {detail.isLoading || (detail.isFetching && !detail.data) ? (
+            <div
+              className="grid min-h-72 place-items-center rounded-xl border border-dashed bg-muted/20"
+              role="status"
+              aria-live="polite"
+            >
+              <div className="text-center">
+                <span className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-primary/10">
+                  <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                </span>
+                <p className="mt-3 font-bold">Loading attendance details...</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Getting the employee's workday and timeline.
+                </p>
+              </div>
+            </div>
+          ) : detail.isError ? (
+            <div className="grid min-h-64 place-items-center rounded-xl border border-destructive/30 bg-destructive/5 p-6 text-center">
+              <div>
+                <AlertTriangle className="mx-auto h-8 w-8 text-destructive" />
+                <p className="mt-3 font-bold">Attendance details couldn't be loaded</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Check the connection and try again.
+                </p>
+                <Button className="mt-4" type="button" onClick={() => detail.refetch()}>
+                  Retry
+                </Button>
+              </div>
+            </div>
+          ) : detail.data ? (
+            <>
+              {detail.isFetching && (
+                <div
+                  className="flex items-center gap-2 rounded-lg bg-primary/5 px-3 py-2 text-xs font-semibold text-primary"
+                  role="status"
+                >
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  Refreshing attendance...
+                </div>
+              )}
+              <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-6">
+                <Small
+                  label="Started"
+                  value={formatAttendanceStart(
+                    detail.data.actualFirstActivityAt,
+                    detail.data.timezone,
+                    detail.data.continuedFromPreviousDay,
+                    detail.data.continuedSessionStartedAt,
+                  )}
+                />
+                <Small
+                  label="Last activity"
+                  value={formatClock(detail.data.actualLastActivityAt, detail.data.timezone)}
+                />
+                <Small
+                  label="Session"
+                  value={formatSessionStatus(
+                    detail.data.isRunning,
+                    detail.data.actualSignOutAt,
+                    detail.data.timezone,
+                  )}
+                />
+                <Small label="Paid breaks" value={duration(detail.data.paidBreakSeconds)} />
+                <Small label="Unpaid breaks" value={duration(detail.data.unpaidBreakSeconds)} />
+                <Small
+                  label="Manual approved"
+                  value={duration(detail.data.approvedManualSeconds)}
+                />
+                <Small label="Before shift" value={duration(detail.data.preShiftExtraSeconds)} />
+                <Small label="After shift" value={duration(detail.data.postShiftExtraSeconds)} />
+                {detail.data.paidLateAllowanceSeconds > 0 && (
+                  <Small
+                    label="Paid late allowance"
+                    value={duration(detail.data.paidLateAllowanceSeconds)}
+                  />
+                )}
+                {detail.data.earnedBreakCreditSeconds > 0 && (
+                  <Small
+                    label="Break bank earned"
+                    value={duration(detail.data.earnedBreakCreditSeconds)}
+                  />
+                )}
+                {detail.data.remainingBreakCreditSeconds > 0 && (
+                  <Small
+                    label="Break bank remaining"
+                    value={duration(detail.data.remainingBreakCreditSeconds)}
+                  />
+                )}
+                {detail.data.approvedMeetingSeconds > 0 && (
+                  <Small
+                    label="Meeting (approved)"
+                    value={duration(detail.data.approvedMeetingSeconds)}
+                  />
+                )}
+                {detail.data.pendingMeetingSeconds > 0 && (
+                  <Small
+                    label="Meeting (pending)"
+                    value={duration(detail.data.pendingMeetingSeconds)}
+                  />
+                )}
+                <Small label="Payable" value={duration(detail.data.totalPayableSeconds)} />
+              </div>
+              <WorkdayTimeline
+                timeline={detail.data.timeline}
+                financials={{
+                  paidLateAllowanceSeconds: detail.data.paidLateAllowanceSeconds,
+                  deductibleLateSeconds: detail.data.deductibleLateSeconds,
+                  approvedDelayedBreakSeconds: detail.data.approvedDelayedBreakSeconds,
+                  approvedMeetingSeconds: detail.data.approvedMeetingSeconds,
+                  pendingMeetingSeconds: detail.data.pendingMeetingSeconds,
+                }}
+              />
+              <div className="flex items-center justify-between gap-2 pt-1">
+                {detail.data.attendanceCorrection ? (
+                  <span className="rounded bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-700 dark:text-amber-300">
+                    Attendance corrected
+                  </span>
+                ) : (
+                  <span />
+                )}
+                <CorrectAttendanceButton
+                  employeeId={detail.data.employeeId}
+                  workDate={detail.data.date}
+                  attendance={detail.data}
+                  onSaved={async () => {
+                    await detail.refetch();
+                  }}
+                />
+              </div>
+            </>
+          ) : (
+            <div className="py-10 text-center text-sm text-muted-foreground">
+              No attendance details are available.
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+      <EmployeeAttendanceHistoryDialog
+        employeeId={historyEmployee?.id ?? null}
+        employeeName={historyEmployee?.name}
+        startDate={historyStartDate}
+        endDate={historyEndDate}
+        open={Boolean(historyEmployee)}
+        onOpenChange={(open) => !open && setHistoryEmployee(null)}
+      />
+    </div>
+  );
+}
+
+function Metric({
+  icon: Icon,
+  label,
+  value,
+  tone = "blue",
+}: {
+  icon: typeof Clock3;
+  label: string;
+  value: string | number;
+  tone?: "blue" | "green" | "amber" | "violet";
+}) {
+  const colors = {
+    blue: "bg-blue-500/10 text-blue-600",
+    green: "bg-emerald-500/10 text-emerald-600",
+    amber: "bg-amber-500/10 text-amber-700",
+    violet: "bg-violet-500/10 text-violet-600",
+  };
+  return (
+    <Card className="flex items-center gap-3 p-4">
+      <span className={`grid h-10 w-10 place-items-center rounded-lg ${colors[tone]}`}>
+        <Icon className="h-5 w-5" />
+      </span>
+      <div>
+        <p className="text-2xl font-extrabold">{value}</p>
+        <p className="text-xs font-bold text-muted-foreground">{label}</p>
+      </div>
+    </Card>
+  );
+}
+function Small({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border p-3">
+      <p className="text-[11px] font-bold uppercase text-muted-foreground">{label}</p>
+      <p className="mt-1 font-mono font-bold">{value}</p>
+    </div>
+  );
+}

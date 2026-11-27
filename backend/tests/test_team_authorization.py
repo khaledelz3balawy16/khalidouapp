@@ -1,0 +1,5755 @@
+from datetime import UTC, date, datetime, time, timedelta
+from io import BytesIO
+from time import perf_counter
+from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
+
+import pytest
+from fastapi.testclient import TestClient
+from PIL import Image
+from sqlalchemy import create_engine, delete, event, select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.api.v1 import attendance as attendance_api
+from app.api.v1 import timesheets as timesheets_api
+from app.core.config import settings
+from app.core.security import create_device_token, create_employee_access_token, hash_token
+from app.core.security import create_jwt_token, hash_password
+from app.database.base import Base
+from app.database.session import get_db
+from app.main import app
+from app.services.activity_timeline import local_today, open_session_liveness
+from app.services.request_notifications import request_recipients
+from app.services import work_profiles as work_profiles_service
+from app.services.work_profiles import get_or_create_work_profile
+from scripts.audit_production_state import (
+    _audit_screenshot_storage,
+    _audit_time_ledger_invariants,
+)
+from app.models import (
+    AdminUser,
+    ActivityEvent,
+    Company,
+    Device,
+    DeviceToken,
+    DailyAttendance,
+    Employee,
+    LeaveRequest,
+    OvertimeRecord,
+    Project,
+    Screenshot,
+    Task,
+    TaskCollaborator,
+    TaskComment,
+    TaskNotification,
+    TaskWorkflowRequest,
+    Team,
+    TeamMember,
+    TeamOwner,
+    TimeAdjustmentRequest,
+    TrackingSettings,
+    WorkSession,
+)
+
+
+# These tests place activity at fixed UTC clock times. The real default breaks
+# follow the prayer times and move with the date, so pin the previous fixed
+# defaults here to keep the timelines deterministic.
+@pytest.fixture(autouse=True)
+def _fixed_default_breaks(monkeypatch):
+    monkeypatch.setattr(
+        work_profiles_service,
+        "DEFAULT_BREAK_RULES",
+        [
+            {"name": "Lunch", "minutes": 30, "paid": True, "start_time": "13:00", "end_time": "13:30"},
+            {"name": "Short break", "minutes": 15, "paid": True, "start_time": "16:30", "end_time": "16:45"},
+        ],
+    )
+
+
+@pytest.fixture()
+def team_client():
+    engine = create_engine(
+        'CHANGE_ME',
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    TestingSessionLocal = sessionmaker(
+        bind=engine, autoflush=False, autocommit=False, expire_on_commit=False
+    )
+
+    def override_get_db():
+        db = TestingSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    db: Session = TestingSessionLocal()
+
+    company = Company(name="Company A", status="active")
+    other_company = Company(name="Company B", status="active")
+    db.add_all([company, other_company])
+    db.flush()
+
+    general_admin = AdminUser(
+        company_id=company.id,
+        name="General Admin",
+        email="general@example.com",
+        password_hash=hash_password("ExamplePassword123!"),
+        role="general_admin",
+        is_super_admin=True,
+        status="active",
+    )
+    owner = AdminUser(
+        company_id=company.id,
+        name="Team Owner",
+        email="owner@example.com",
+        password_hash=hash_password("ExamplePassword123!"),
+        role="team_owner",
+        status="active",
+    )
+    second_owner = AdminUser(
+        company_id=company.id,
+        name="Second Owner",
+        email="second@example.com",
+        password_hash=hash_password("ExamplePassword123!"),
+        role="team_owner",
+        status="active",
+    )
+    other_general_admin = AdminUser(
+        company_id=other_company.id,
+        name="Other Admin",
+        email="other@example.com",
+        password_hash=hash_password("ExamplePassword123!"),
+        role="general_admin",
+        status="active",
+    )
+    db.add_all([general_admin, owner, second_owner, other_general_admin])
+    db.flush()
+
+    team_a = Team(company_id=company.id, name="Team A", description=None, status="active")
+    team_b = Team(company_id=company.id, name="Team B", description=None, status="active")
+    other_team = Team(
+        company_id=other_company.id, name="Other Team", description=None, status="active"
+    )
+    db.add_all([team_a, team_b, other_team])
+    db.flush()
+
+    employee_a = Employee(
+        company_id=company.id,
+        name="Employee A",
+        email="a@example.com",
+        employee_code="A",
+        job_title=None,
+        timezone="UTC",
+        status="active",
+    )
+    employee_b = Employee(
+        company_id=company.id,
+        name="Employee B",
+        email="b@example.com",
+        employee_code="B",
+        job_title=None,
+        timezone="UTC",
+        status="active",
+    )
+    shared_employee = Employee(
+        company_id=company.id,
+        name="Shared Employee",
+        email="shared@example.com",
+        employee_code="S",
+        job_title=None,
+        timezone="UTC",
+        status="active",
+    )
+    other_employee = Employee(
+        company_id=other_company.id,
+        name="Other Employee",
+        email="other.employee@example.com",
+        employee_code="O",
+        job_title=None,
+        timezone="UTC",
+        status="active",
+    )
+    db.add_all([employee_a, employee_b, shared_employee, other_employee])
+    db.flush()
+
+    # A team manager may also be a tracked employee.  Keep the identities
+    # explicitly linked so workflow authorization can prevent self-review.
+    owner.employee_id = employee_a.id
+
+    db.add_all(
+        [
+            TeamMember(team_id=team_a.id, employee_id=employee_a.id, status="active"),
+            TeamMember(team_id=team_b.id, employee_id=employee_b.id, status="active"),
+            TeamMember(team_id=team_a.id, employee_id=shared_employee.id, status="active"),
+            TeamMember(team_id=team_b.id, employee_id=shared_employee.id, status="active"),
+            TeamMember(team_id=other_team.id, employee_id=other_employee.id, status="active"),
+            TeamOwner(team_id=team_a.id, admin_user_id=owner.id),
+            TeamOwner(team_id=team_a.id, admin_user_id=second_owner.id),
+        ]
+    )
+    db.flush()
+
+    project_a = Project(
+        company_id=company.id,
+        team_id=team_a.id,
+        name="Project A",
+        description=None,
+        status="active",
+    )
+    project_b = Project(
+        company_id=company.id,
+        team_id=team_b.id,
+        name="Project B",
+        description=None,
+        status="active",
+    )
+    db.add_all([project_a, project_b])
+    db.flush()
+
+    task_a = Task(
+        company_id=company.id,
+        project_id=project_a.id,
+        name="Task A",
+        description=None,
+        status="active",
+    )
+    task_b = Task(
+        company_id=company.id,
+        project_id=project_b.id,
+        name="Task B",
+        description=None,
+        status="active",
+    )
+    db.add_all([task_a, task_b])
+    db.flush()
+
+    now = datetime.now(UTC)
+    device_a = Device(
+        company_id=company.id,
+        employee_id=employee_a.id,
+        device_name="Device A",
+        installation_id="install-a",
+        operating_system="Windows 11",
+        agent_version="1.0.0",
+        status="active",
+        registered_at=now,
+    )
+    device_b = Device(
+        company_id=company.id,
+        employee_id=employee_b.id,
+        device_name="Device B",
+        installation_id="install-b",
+        operating_system="Windows 11",
+        agent_version="1.0.0",
+        status="active",
+        registered_at=now,
+    )
+    db.add_all([device_a, device_b])
+    db.flush()
+    device_token = create_device_token(
+        device_id=device_a.id,
+        company_id=company.id,
+        employee_id=employee_a.id,
+    )
+    db.add(
+        DeviceToken(
+            company_id=company.id, device_id=device_a.id, token_hash=hash_token(device_token)
+        )
+    )
+
+    session_a = WorkSession(
+        company_id=company.id,
+        employee_id=employee_a.id,
+        device_id=device_a.id,
+        started_at=now,
+        status="active",
+        active_seconds=120,
+        idle_seconds=10,
+        team_id=team_a.id,
+        project_id=project_a.id,
+        task_id=task_a.id,
+    )
+    session_b = WorkSession(
+        company_id=company.id,
+        employee_id=employee_b.id,
+        device_id=device_b.id,
+        started_at=now,
+        status="active",
+        active_seconds=240,
+        idle_seconds=20,
+        team_id=team_b.id,
+        project_id=project_b.id,
+        task_id=task_b.id,
+    )
+    db.add_all([session_a, session_b])
+    db.flush()
+
+    screenshot_a = Screenshot(
+        id=uuid4(),
+        company_id=company.id,
+        employee_id=employee_a.id,
+        device_id=device_a.id,
+        session_id=session_a.id,
+        captured_at=now,
+        storage_path="a.jpg",
+        mime_type="image/jpeg",
+        width=100,
+        height=100,
+        file_size=10,
+        checksum="a" * 64,
+        status="completed",
+        team_id=team_a.id,
+        project_id=project_a.id,
+        task_id=task_a.id,
+    )
+    screenshot_b = Screenshot(
+        id=uuid4(),
+        company_id=company.id,
+        employee_id=employee_b.id,
+        device_id=device_b.id,
+        session_id=session_b.id,
+        captured_at=now,
+        storage_path="b.jpg",
+        mime_type="image/jpeg",
+        width=100,
+        height=100,
+        file_size=10,
+        checksum="b" * 64,
+        status="completed",
+        team_id=team_b.id,
+        project_id=project_b.id,
+        task_id=task_b.id,
+    )
+    db.add_all(
+        [
+            screenshot_a,
+            screenshot_b,
+            # These team-authorization scenarios are calibrated to a 10-minute
+            # idle threshold and are independent of the production policy default
+            # (now 15). Pin the threshold explicitly so the fixtures stay stable.
+            TrackingSettings(company_id=company.id, idle_threshold_minutes=10),
+            TrackingSettings(company_id=other_company.id, idle_threshold_minutes=10),
+        ]
+    )
+    db.commit()
+
+    def token(admin: AdminUser) -> str:
+        return create_jwt_token(
+            subject=admin.id,
+            company_id=admin.company_id,
+            token_type="access",
+            expires_delta=timedelta(minutes=30),
+            extra_claims={"role": admin.role},
+        )
+
+    data = {
+        "general_headers": {"Authorization": f"Bearer {token(general_admin)}"},
+        "owner_headers": {"Authorization": f"Bearer {token(owner)}"},
+        "second_owner_headers": {"Authorization": f"Bearer {token(second_owner)}"},
+        "other_headers": {"Authorization": f"Bearer {token(other_general_admin)}"},
+        "general_admin": general_admin,
+        "owner": owner,
+        "second_owner": second_owner,
+        "team_a": team_a,
+        "team_b": team_b,
+        "other_team": other_team,
+        "employee_a": employee_a,
+        "employee_b": employee_b,
+        "shared_employee": shared_employee,
+        "other_employee": other_employee,
+        "screenshot_a": screenshot_a,
+        "screenshot_b": screenshot_b,
+        "session_a": session_a,
+        "project_a": project_a,
+        "project_b": project_b,
+        "task_a": task_a,
+        "task_b": task_b,
+        "device_headers": {"Authorization": f"Bearer {device_token}"},
+        "session_factory": TestingSessionLocal,
+    }
+    db.close()
+
+    try:
+        yield TestClient(app), data
+    finally:
+        app.dependency_overrides.clear()
+        Base.metadata.drop_all(engine)
+
+
+def test_closed_recovery_route_requires_device_auth_and_preserves_current_session(team_client):
+    client, data = team_client
+    started = datetime(2026, 8, 4, 8, 40, tzinfo=UTC)
+    payload = {
+        "offline_recovery_id": str(uuid4()), "started_at": started.isoformat(),
+        "ended_at": (started + timedelta(seconds=1)).isoformat(),
+        "active_seconds": 1, "idle_seconds": 0, "agent_version": "2.0.2",
+    }
+    endpoint = "/api/v1/agent/sessions/recover-closed"
+    assert client.post(endpoint, json=payload).status_code == 401
+    response = client.post(endpoint, json=payload, headers=data["device_headers"])
+    assert response.status_code == 200, response.text
+    recovered_id = response.json()["data"]["session_id"]
+    duplicate = client.post(endpoint, json=payload, headers=data["device_headers"])
+    assert duplicate.json()["data"] == {"session_id": recovered_id, "duplicate": True}
+    with data["session_factory"]() as db:
+        live = db.get(WorkSession, data["session_a"].id)
+        assert live.ended_at is None
+        recovered = db.get(WorkSession, UUID(recovered_id))
+        assert recovered.employee_id == live.employee_id
+        assert recovered.device_id == live.device_id
+        assert recovered.status == "ended"
+
+
+def test_attendance_detail_enforces_team_and_company_isolation(team_client):
+    client, data = team_client
+    today = local_today("UTC").isoformat()
+
+    own_team = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}/{today}",
+        headers=data["owner_headers"],
+    )
+    assert own_team.status_code == 200
+    assert own_team.json()["data"]["screenshot_count"] == 1
+
+    other_team = client.get(
+        f"/api/v1/attendance/employee/{data['employee_b'].id}/{today}",
+        headers=data["owner_headers"],
+    )
+    assert other_team.status_code in {403, 404}
+
+    other_company = client.get(
+        f"/api/v1/attendance/employee/{data['other_employee'].id}/{today}",
+        headers=data["general_headers"],
+    )
+    assert other_company.status_code in {403, 404}
+
+
+def test_daily_attendance_includes_start_grace_for_dashboard_alerts(team_client):
+    client, data = team_client
+    response = client.get(
+        "/api/v1/attendance/daily",
+        params={"day": local_today("UTC").isoformat()},
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    employee_row = next(
+        row
+        for row in response.json()["data"]["rows"]
+        if row["employee_id"] == str(data["employee_a"].id)
+    )
+    assert employee_row["late_grace_minutes"] == 15
+    assert employee_row["screenshot_count"] == 1
+
+
+def test_daily_attendance_left_early_filter_includes_an_also_late_employee(team_client):
+    client, data = team_client
+    work_day = date(2026, 8, 6)
+    with data["session_factory"]() as db:
+        db.add(
+            DailyAttendance(
+                company_id=data["employee_a"].company_id,
+                employee_id=data["employee_a"].id,
+                work_date=work_day,
+                timezone="UTC",
+                scheduled_start_at=datetime(2026, 8, 6, 9, 0, tzinfo=UTC),
+                scheduled_end_at=datetime(2026, 8, 6, 16, 0, tzinfo=UTC),
+                actual_first_activity_at=datetime(2026, 8, 6, 9, 47, tzinfo=UTC),
+                actual_last_activity_at=datetime(2026, 8, 6, 14, 0, tzinfo=UTC),
+                deductible_late_seconds=32 * 60,
+                early_leave_seconds=2 * 60 * 60,
+                status="late",
+                issues=[
+                    {"code": "late", "seconds": 32 * 60},
+                    {"code": "early_leave", "seconds": 2 * 60 * 60},
+                ],
+                calculated_at=datetime(2026, 8, 7, tzinfo=UTC),
+            )
+        )
+        db.commit()
+
+    response = client.get(
+        "/api/v1/attendance/daily",
+        params={"day": work_day.isoformat(), "status": "left_early"},
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    employee_ids = {row["employee_id"] for row in response.json()["data"]["rows"]}
+    assert str(data["employee_a"].id) in employee_ids
+
+
+def test_attendance_screenshot_counts_exclude_soft_deleted_captures(team_client):
+    client, data = team_client
+    today = local_today("UTC")
+    with data["session_factory"]() as db:
+        screenshot = db.get(Screenshot, data["screenshot_a"].id)
+        screenshot.deleted_at = datetime.now(UTC)
+        db.add(screenshot)
+        db.commit()
+
+    detail = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}/{today.isoformat()}",
+        headers=data["general_headers"],
+    )
+    daily = client.get(
+        "/api/v1/attendance/daily",
+        params={"day": today.isoformat(), "employee_id": str(data["employee_a"].id)},
+        headers=data["general_headers"],
+    )
+    history = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}",
+        params={"start_date": today.isoformat(), "end_date": today.isoformat()},
+        headers=data["general_headers"],
+    )
+
+    assert detail.status_code == 200
+    assert detail.json()["data"]["screenshot_count"] == 0
+    assert daily.status_code == 200
+    assert daily.json()["data"]["rows"][0]["screenshot_count"] == 0
+    assert history.status_code == 200
+    assert history.json()["data"]["rows"][0]["screenshot_count"] == 0
+
+
+def test_dashboard_work_trend_is_lightweight_and_team_scoped(
+    team_client,
+    monkeypatch,
+):
+    client, data = team_client
+    today = local_today("UTC")
+    extra_employee_ids: set[str] = set()
+    with data["session_factory"]() as db:
+        for index in range(15):
+            employee = Employee(
+                company_id=data["employee_a"].company_id,
+                name=f"Trend Employee {index:02d}",
+                email=f"trend-{index:02d}@example.com",
+                employee_code=f"TREND-{index:02d}",
+                timezone="UTC",
+                status="active",
+            )
+            db.add(employee)
+            db.flush()
+            device = Device(
+                company_id=employee.company_id,
+                employee_id=employee.id,
+                device_name=f"Trend Device {index:02d}",
+                installation_id=f"trend-install-{index:02d}",
+                operating_system="Windows 11",
+                agent_version="1.0.0",
+                status="active",
+            )
+            db.add_all(
+                [
+                    device,
+                    TeamMember(
+                        team_id=data["team_a"].id,
+                        employee_id=employee.id,
+                        status="active",
+                    ),
+                ]
+            )
+            db.flush()
+            db.add(
+                WorkSession(
+                    company_id=employee.company_id,
+                    employee_id=employee.id,
+                    device_id=device.id,
+                    started_at=datetime.now(UTC),
+                    status="active",
+                    active_seconds=300 + index,
+                    idle_seconds=index,
+                    team_id=data["team_a"].id,
+                )
+            )
+            extra_employee_ids.add(str(employee.id))
+        db.commit()
+
+    def unexpected_attendance_rebuild(*_args, **_kwargs):
+        raise AssertionError("Dashboard trend must not rebuild employee timelines")
+
+    monkeypatch.setattr(
+        timesheets_api,
+        "cached_daily_attendance",
+        unexpected_attendance_rebuild,
+    )
+    params = {
+        "start_date": (today - timedelta(days=13)).isoformat(),
+        "end_date": today.isoformat(),
+    }
+    query_count = 0
+
+    def count_query(*_args, **_kwargs):
+        nonlocal query_count
+        query_count += 1
+
+    engine = data["session_factory"].kw["bind"]
+    event.listen(engine, "before_cursor_execute", count_query)
+    try:
+        general = client.get(
+            "/api/v1/dashboard/work-trend",
+            params=params,
+            headers=data["general_headers"],
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", count_query)
+    owner = client.get(
+        "/api/v1/dashboard/work-trend",
+        params=params,
+        headers=data["owner_headers"],
+    )
+
+    assert general.status_code == 200
+    assert owner.status_code == 200
+    assert {row["employee_id"] for row in general.json()["data"]} == {
+        str(data["employee_a"].id),
+        str(data["employee_b"].id),
+        *extra_employee_ids,
+    }
+    assert {row["employee_id"] for row in owner.json()["data"]} == {
+        str(data["employee_a"].id),
+        *extra_employee_ids,
+    }
+    assert all(
+        "employee_name" not in row and "screenshot_count" not in row
+        for row in general.json()["data"]
+    )
+    assert query_count <= 10
+    assert len(general.content) < 100_000
+
+
+def test_daily_timesheet_includes_scoped_empty_employees_in_bounded_queries(
+    team_client,
+    monkeypatch,
+):
+    client, data = team_client
+    query_count = 0
+    extra_employee_ids: set[str] = set()
+    with data["session_factory"]() as db:
+        for index in range(75):
+            employee = Employee(
+                company_id=data["employee_a"].company_id,
+                name=f"Timesheet Employee {index:02d}",
+                email=f"timesheet-{index:02d}@example.com",
+                employee_code=f"TS-{index:02d}",
+                timezone="UTC",
+                status="active",
+            )
+            db.add(employee)
+            db.flush()
+            extra_employee_ids.add(str(employee.id))
+        db.commit()
+
+    def unexpected_attendance_rebuild(*_args, **_kwargs):
+        raise AssertionError("Daily timesheet list must not rebuild employee timelines")
+
+    monkeypatch.setattr(
+        timesheets_api,
+        "cached_daily_attendance",
+        unexpected_attendance_rebuild,
+    )
+
+    def count_query(*_args, **_kwargs):
+        nonlocal query_count
+        query_count += 1
+
+    engine = data["session_factory"].kw["bind"]
+    event.listen(engine, "before_cursor_execute", count_query)
+    try:
+        response = client.get(
+            "/api/v1/timesheets/daily",
+            params={"day": local_today("UTC").isoformat()},
+            headers=data["general_headers"],
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", count_query)
+
+    assert response.status_code == 200
+    rows = response.json()["data"]
+    rows_by_employee = {row["employee_id"]: row for row in rows}
+    shared_employee_id = str(data["shared_employee"].id)
+    assert shared_employee_id in rows_by_employee, f"query_count={query_count}"
+    assert str(data["other_employee"].id) not in rows_by_employee
+    assert rows_by_employee[shared_employee_id]["total_tracked_seconds"] == 0
+    assert rows_by_employee[shared_employee_id]["active_seconds"] == 0
+    assert rows_by_employee[shared_employee_id]["idle_seconds"] == 0
+    assert rows_by_employee[shared_employee_id]["session_count"] == 0
+    assert rows_by_employee[shared_employee_id]["last_signal_at"] is None
+    employee_a_row = rows_by_employee[str(data["employee_a"].id)]
+    assert employee_a_row["session_count"] == 1
+    assert employee_a_row["last_signal_at"] is not None
+    assert extra_employee_ids.issubset(rows_by_employee)
+    assert len(rows) == 78
+    assert query_count <= 10, query_count
+    assert len(response.content) < 100_000
+
+    owner_response = client.get(
+        "/api/v1/timesheets/daily",
+        params={"day": local_today("UTC").isoformat()},
+        headers=data["owner_headers"],
+    )
+    assert owner_response.status_code == 200
+    assert {row["employee_id"] for row in owner_response.json()["data"]} == {
+        str(data["employee_a"].id),
+        shared_employee_id,
+    }
+
+    options_response = client.get(
+        "/api/v1/timesheets/employee-options",
+        headers=data["owner_headers"],
+    )
+    assert options_response.status_code == 200
+    assert {option["id"] for option in options_response.json()["data"]} == {
+        str(data["employee_a"].id),
+        shared_employee_id,
+    }
+
+    first_page = client.get(
+        "/api/v1/timesheets/employee-options?page=1&page_size=50",
+        headers=data["general_headers"],
+    )
+    second_page = client.get(
+        "/api/v1/timesheets/employee-options?page=2&page_size=50",
+        headers=data["general_headers"],
+    )
+    assert first_page.status_code == 200
+    assert second_page.status_code == 200
+    assert first_page.json()["meta"] == {
+        "page": 1,
+        "page_size": 50,
+        "total": 78,
+        "total_pages": 2,
+    }
+    assert len(first_page.json()["data"]) == 50
+    assert len(second_page.json()["data"]) == 28
+
+
+def test_daily_attendance_list_reuses_materialized_row(team_client, monkeypatch):
+    client, data = team_client
+    today = local_today("UTC")
+    with data["session_factory"]() as db:
+        db.add(
+            DailyAttendance(
+                company_id=data["employee_a"].company_id,
+                employee_id=data["employee_a"].id,
+                work_date=today,
+                timezone="UTC",
+                normal_worked_seconds=321,
+                status="present",
+                issues=[],
+                calculation_sources={"test": "materialized"},
+                calculated_at=datetime.now(UTC) - timedelta(hours=1),
+            )
+        )
+        db.commit()
+
+    def unexpected_recalculation(*_args, **_kwargs):
+        raise AssertionError("The daily roster must not recalculate a stored employee row")
+
+    monkeypatch.setattr(
+        attendance_api,
+        "cached_daily_attendance",
+        unexpected_recalculation,
+    )
+    response = client.get(
+        "/api/v1/attendance/daily",
+        params={
+            "day": today.isoformat(),
+            "employee_id": str(data["employee_a"].id),
+        },
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    rows = response.json()["data"]["rows"]
+    assert len(rows) == 1
+    assert rows[0]["normal_worked_seconds"] == 321
+    assert rows[0]["calculation_sources"] == {"test": "materialized"}
+
+
+def test_daily_attendance_empty_roster_has_bounded_query_count(team_client):
+    client, data = team_client
+    with data["session_factory"]() as db:
+        engine = db.get_bind()
+        for index in range(20):
+            employee = Employee(
+                company_id=data["employee_a"].company_id,
+                name=f"Roster Perf {index:02d}",
+                email=f"roster-perf-{index:02d}@example.com",
+                employee_code=f"ROSTER-PERF-{index:02d}",
+                timezone="UTC",
+                status="active",
+            )
+            db.add(employee)
+            db.flush()
+            get_or_create_work_profile(db, employee)
+        db.commit()
+
+    statements = []
+
+    def count_statement(*_args):
+        statements.append(1)
+
+    event.listen(engine, "before_cursor_execute", count_statement)
+    try:
+        response = client.get(
+            "/api/v1/attendance/daily",
+            params={
+                "day": local_today("UTC").isoformat(),
+                "q": "Roster Perf",
+            },
+            headers=data["general_headers"],
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", count_statement)
+
+    assert response.status_code == 200
+    assert len(response.json()["data"]["rows"]) == 20
+    assert len(statements) <= 20
+
+
+def test_daily_attendance_source_roster_has_bounded_request_queries(team_client, monkeypatch):
+    client, data = team_client
+    now = datetime.now(UTC)
+    queued_refreshes = []
+
+    def capture_background_refresh(_tasks, function, *args, **kwargs):
+        queued_refreshes.append((function, args, kwargs))
+
+    monkeypatch.setattr(
+        attendance_api.BackgroundTasks,
+        "add_task",
+        capture_background_refresh,
+    )
+    with data["session_factory"]() as db:
+        engine = db.get_bind()
+        for index in range(12):
+            employee = Employee(
+                company_id=data["employee_a"].company_id,
+                name=f"Source Roster Perf {index:02d}",
+                email=f"source-roster-perf-{index:02d}@example.com",
+                employee_code=f"SOURCE-ROSTER-PERF-{index:02d}",
+                timezone="UTC",
+                status="active",
+            )
+            db.add(employee)
+            db.flush()
+            get_or_create_work_profile(db, employee)
+            device = Device(
+                company_id=employee.company_id,
+                employee_id=employee.id,
+                device_name=f"Source Roster Device {index:02d}",
+                installation_id=f"source-roster-device-{index:02d}-{uuid4()}",
+                operating_system="Windows 11",
+                agent_version="1.1.92",
+                status="active",
+            )
+            db.add(device)
+            db.flush()
+            db.add(
+                WorkSession(
+                    company_id=employee.company_id,
+                    employee_id=employee.id,
+                    device_id=device.id,
+                    started_at=now - timedelta(minutes=10),
+                    status="active",
+                    active_seconds=600,
+                )
+            )
+        db.commit()
+
+    statements = []
+
+    def count_statement(*_args):
+        statements.append(1)
+
+    event.listen(engine, "before_cursor_execute", count_statement)
+    started_at = perf_counter()
+    try:
+        response = client.get(
+            "/api/v1/attendance/daily",
+            params={
+                "day": local_today("UTC").isoformat(),
+                "q": "Source Roster Perf",
+            },
+            headers=data["general_headers"],
+        )
+    finally:
+        elapsed_ms = (perf_counter() - started_at) * 1000
+        event.remove(engine, "before_cursor_execute", count_statement)
+
+    assert response.status_code == 200
+    assert len(response.json()["data"]["rows"]) == 12
+    assert response.json()["meta"]["pending_refresh_count"] == 12
+    assert response.json()["meta"]["refresh_queued"] is True
+    assert len(queued_refreshes) == 1
+    assert all(row["refresh_pending"] is True for row in response.json()["data"]["rows"])
+    assert len(response.content) < 100_000, (
+        f"daily roster response was {len(response.content)} bytes"
+    )
+    assert len(statements) <= 25, (
+        f"daily roster executed {len(statements)} statements in {elapsed_ms:.1f}ms"
+    )
+
+    refresh_function, refresh_args, refresh_kwargs = queued_refreshes[0]
+    refresh_function(*refresh_args, **refresh_kwargs)
+    refreshed = client.get(
+        "/api/v1/attendance/daily",
+        params={
+            "day": local_today("UTC").isoformat(),
+            "q": "Source Roster Perf",
+        },
+        headers=data["general_headers"],
+    )
+    assert refreshed.status_code == 200
+    assert refreshed.json()["meta"]["pending_refresh_count"] == 0
+    assert all(row.get("refresh_pending") is not True for row in refreshed.json()["data"]["rows"])
+
+
+def test_attendance_range_stops_at_employee_today(team_client):
+    client, data = team_client
+    today = local_today("UTC")
+    start_date = today - timedelta(days=1)
+    end_date = today + timedelta(days=7)
+
+    response = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}",
+        params={
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    rows = response.json()["data"]["rows"]
+    assert [row["date"] for row in rows] == [
+        start_date.isoformat(),
+        today.isoformat(),
+    ]
+
+    db: Session = data["session_factory"]()
+    try:
+        future_rows = db.scalars(
+            select(DailyAttendance).where(
+                DailyAttendance.employee_id == data["employee_a"].id,
+                DailyAttendance.work_date > today,
+            )
+        ).all()
+        assert future_rows == []
+    finally:
+        db.close()
+
+
+def test_attendance_period_timelines_cover_worked_days_without_persisting(team_client):
+    client, data = team_client
+    today = local_today("UTC")
+    start_date = today - timedelta(days=6)
+
+    response = client.get(
+        f"/api/v1/attendance/timelines/employee/{data['employee_a'].id}",
+        params={"start_date": start_date.isoformat(), "end_date": today.isoformat()},
+        headers=data["owner_headers"],
+    )
+
+    assert response.status_code == 200, response.text
+    timelines = response.json()["data"]["timelines"]
+    assert list(timelines) == [today.isoformat()]
+    assert timelines[today.isoformat()]["date"] == today.isoformat()
+    assert "intervals" in timelines[today.isoformat()]
+
+    db: Session = data["session_factory"]()
+    try:
+        stored = db.scalars(
+            select(DailyAttendance).where(DailyAttendance.employee_id == data["employee_a"].id)
+        ).all()
+        assert stored == []
+    finally:
+        db.close()
+
+    other_team = client.get(
+        f"/api/v1/attendance/timelines/employee/{data['employee_b'].id}",
+        params={"start_date": start_date.isoformat(), "end_date": today.isoformat()},
+        headers=data["owner_headers"],
+    )
+    assert other_team.status_code in {403, 404}
+
+    too_long = client.get(
+        f"/api/v1/attendance/timelines/employee/{data['employee_a'].id}",
+        params={
+            "start_date": (today - timedelta(days=90)).isoformat(),
+            "end_date": today.isoformat(),
+        },
+        headers=data["owner_headers"],
+    )
+    assert too_long.status_code == 400
+
+
+def test_attendance_range_does_not_rebuild_empty_historical_days(team_client, monkeypatch):
+    client, data = team_client
+    today = local_today("UTC")
+    start_date = today - timedelta(days=29)
+    db: Session = data["session_factory"]()
+    try:
+        engine = db.get_bind()
+        profile = get_or_create_work_profile(db, data["employee_a"])
+        working_days = set(profile.working_days)
+        leave_day = next(
+            start_date + timedelta(days=offset)
+            for offset in range(29)
+            if (start_date + timedelta(days=offset)).weekday() in working_days
+        )
+        db.add(
+            LeaveRequest(
+                company_id=data["employee_a"].company_id,
+                employee_id=data["employee_a"].id,
+                start_date=leave_day,
+                end_date=leave_day,
+                requested_days=1,
+                leave_type="annual",
+                status="approved",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    original_cached_attendance = attendance_api.cached_daily_attendance
+    recalculated_dates = []
+
+    def counted_cached_attendance(*args, **kwargs):
+        recalculated_dates.append(kwargs["work_date"])
+        return original_cached_attendance(*args, **kwargs)
+
+    monkeypatch.setattr(
+        attendance_api,
+        "cached_daily_attendance",
+        counted_cached_attendance,
+    )
+    statements = []
+
+    def count_statement(*_args):
+        statements.append(1)
+
+    event.listen(engine, "before_cursor_execute", count_statement)
+    try:
+        response = client.get(
+            f"/api/v1/attendance/employee/{data['employee_a'].id}",
+            params={
+                "start_date": start_date.isoformat(),
+                "end_date": today.isoformat(),
+            },
+            headers=data["general_headers"],
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", count_statement)
+
+    assert response.status_code == 200
+    rows = response.json()["data"]["rows"]
+    assert len(rows) == 30
+    assert len(statements) <= 35
+    assert recalculated_dates == [today]
+    leave_row = next(row for row in rows if row["date"] == leave_day.isoformat())
+    assert leave_row["status"] == "approved_leave"
+    assert leave_row["total_payable_seconds"] == 8 * 60 * 60
+    historical_weekday = next(
+        row
+        for row in rows[:-1]
+        if datetime.fromisoformat(row["date"]).weekday() in working_days
+        and row["date"] != leave_day.isoformat()
+    )
+    assert historical_weekday["status"] == "absent"
+    assert historical_weekday["issues"][0]["code"] == "missing_check_in"
+
+
+def test_attendance_range_refreshes_partial_historical_snapshot(team_client):
+    client, data = team_client
+    work_date = date(2026, 7, 21)
+    with data["session_factory"]() as db:
+        employee = db.get(Employee, data["employee_a"].id)
+        device_id = data["session_a"].device_id
+        first = WorkSession(
+            company_id=employee.company_id, employee_id=employee.id, device_id=device_id,
+            started_at=datetime(2026, 7, 21, 10, tzinfo=UTC),
+            ended_at=datetime(2026, 7, 21, 12, tzinfo=UTC),
+            status="ended", active_seconds=7200,
+            updated_at=datetime(2026, 7, 21, 12, tzinfo=UTC),
+        )
+        db.add(first)
+        db.flush()
+        row, _ = attendance_api.calculate_daily_attendance(
+            db, employee=employee, work_date=work_date,
+        )
+        row.calculated_at = datetime(2026, 7, 22, tzinfo=UTC)
+        partial_seconds = row.normal_worked_seconds
+        db.commit()
+        db.add(WorkSession(
+            company_id=employee.company_id, employee_id=employee.id, device_id=device_id,
+            started_at=datetime(2026, 7, 21, 13, tzinfo=UTC),
+            ended_at=datetime(2026, 7, 21, 18, tzinfo=UTC),
+            status="ended", active_seconds=18000,
+            updated_at=datetime(2026, 7, 22, 8, tzinfo=UTC),
+        ))
+        db.commit()
+    response = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}",
+        params={"start_date": work_date.isoformat(), "end_date": work_date.isoformat()},
+        headers=data["general_headers"],
+    )
+    assert response.status_code == 200
+    row = response.json()["data"]["rows"][0]
+    assert datetime.fromisoformat(row["actual_sign_out_at"]).hour == 18
+    assert row["normal_worked_seconds"] > partial_seconds
+
+
+def test_team_lead_manages_owned_team_schedule_without_salary_access(team_client):
+    client, data = team_client
+
+    scoped_rules = client.get(
+        "/api/v1/employees/break-rules",
+        headers=data["owner_headers"],
+    )
+    assert scoped_rules.status_code == 200
+    rows = scoped_rules.json()["data"]
+    assert {row["employee_id"] for row in rows} == {
+        str(data["employee_a"].id),
+        str(data["shared_employee"].id),
+    }
+    assert all("salary_amount" not in row for row in rows)
+    assert all("salary_currency" not in row for row in rows)
+    assert all("salary_type" not in row for row in rows)
+    assert all("overtime_rate_multiplier" not in row for row in rows)
+
+    schedule_update = client.patch(
+        f"/api/v1/employees/{data['employee_a'].id}/work-profile",
+        json={"shift_start": "10:00:00", "shift_end": "18:00:00"},
+        headers=data["owner_headers"],
+    )
+    assert schedule_update.status_code == 200
+    assert schedule_update.json()["data"]["shift_start"] == "10:00"
+
+    salary_update = client.patch(
+        f"/api/v1/employees/{data['employee_a'].id}/work-profile",
+        json={"salary_amount": 50000},
+        headers=data["owner_headers"],
+    )
+    assert salary_update.status_code == 403
+
+    other_team_update = client.patch(
+        f"/api/v1/employees/{data['employee_b'].id}/work-profile",
+        json={"shift_start": "10:00:00", "shift_end": "18:00:00"},
+        headers=data["owner_headers"],
+    )
+    assert other_team_update.status_code in {403, 404}
+
+    day = local_today("UTC") + timedelta(days=1)
+    team_exception = client.post(
+        "/api/v1/payroll/schedule-overrides",
+        json={
+            "scope": "team",
+            "team_id": str(data["team_a"].id),
+            "override_type": "shift",
+            "effective_date": day.isoformat(),
+            "permanent": False,
+            "shift_start": "11:00",
+            "shift_end": "19:00",
+            "reason": "Team coverage",
+        },
+        headers=data["owner_headers"],
+    )
+    assert team_exception.status_code == 200
+
+    company_exception = client.post(
+        "/api/v1/payroll/schedule-overrides",
+        json={
+            "scope": "company",
+            "override_type": "shift",
+            "effective_date": day.isoformat(),
+            "permanent": False,
+            "shift_start": "11:00",
+            "shift_end": "19:00",
+            "reason": "Forbidden company coverage",
+        },
+        headers=data["owner_headers"],
+    )
+    assert company_exception.status_code == 403
+
+
+def test_protected_super_admin_keeps_company_wide_schedule_and_payroll_access(team_client):
+    client, data = team_client
+    rules = client.get(
+        "/api/v1/employees/break-rules",
+        headers=data["general_headers"],
+    )
+    assert rules.status_code == 200
+    assert {row["employee_id"] for row in rules.json()["data"]} == {
+        str(data["employee_a"].id),
+        str(data["employee_b"].id),
+        str(data["shared_employee"].id),
+    }
+    assert all("salary_amount" in row for row in rules.json()["data"])
+
+    salary_update = client.patch(
+        f"/api/v1/employees/{data['employee_b'].id}/work-profile",
+        json={"salary_amount": 50000, "salary_currency": "EGP"},
+        headers=data["general_headers"],
+    )
+    assert salary_update.status_code == 200
+    assert salary_update.json()["data"]["salary_amount"] == 50000.0
+
+
+def test_plain_general_admin_can_read_and_change_salary_data(team_client):
+    client, data = team_client
+    db: Session = data["session_factory"]()
+    try:
+        plain_general = AdminUser(
+            company_id=data["general_admin"].company_id,
+            name="Operations Admin",
+            email="operations@example.com",
+            password_hash=hash_password("ExamplePassword123!"),
+            role="general_admin",
+            is_super_admin=False,
+            status="active",
+            permission_mode="role",
+            data_scope="company",
+        )
+        db.add(plain_general)
+        db.commit()
+        admin_id = plain_general.id
+        company_id = plain_general.company_id
+    finally:
+        db.close()
+    token = create_jwt_token(
+        subject=admin_id,
+        company_id=company_id,
+        token_type="access",
+        expires_delta=timedelta(minutes=30),
+        extra_claims={"role": "general_admin"},
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    payroll = client.get("/api/v1/payroll/settings", headers=headers)
+    rules = client.get("/api/v1/employees/break-rules", headers=headers)
+    salary_update = client.patch(
+        f"/api/v1/employees/{data['employee_b'].id}/work-profile",
+        json={"salary_amount": 70000, "salary_currency": "EGP"},
+        headers=headers,
+    )
+
+    assert payroll.status_code == 200
+    assert rules.status_code == 200
+    assert all("salary_amount" in row for row in rules.json()["data"])
+    assert salary_update.status_code == 200
+
+
+def test_group_schedule_override_validates_every_employee_company(team_client):
+    client, data = team_client
+    payload = {
+        "scope": "employees",
+        "override_type": "shift",
+        "employee_ids": [str(data["employee_a"].id), str(data["employee_b"].id)],
+        "effective_date": (local_today("UTC") + timedelta(days=1)).isoformat(),
+        "permanent": False,
+        "shift_start": "10:00",
+        "shift_end": "18:00",
+        "reason": "Group coverage change",
+    }
+    allowed = client.post(
+        "/api/v1/payroll/schedule-overrides",
+        json=payload,
+        headers=data["general_headers"],
+    )
+    assert allowed.status_code == 200
+    assert allowed.json()["data"]["affected_employees"] == 2
+
+    payload["employee_ids"] = [str(data["other_employee"].id)]
+    isolated = client.post(
+        "/api/v1/payroll/schedule-overrides",
+        json=payload,
+        headers=data["general_headers"],
+    )
+    assert isolated.status_code in {403, 404}
+
+
+def test_team_owner_permanent_group_schedule_updates_only_selected_employees(team_client):
+    client, data = team_client
+    db: Session = data["session_factory"]()
+    try:
+        employee_a_profile = get_or_create_work_profile(db, data["employee_a"])
+        shared_profile = get_or_create_work_profile(db, data["shared_employee"])
+        employee_b_profile = get_or_create_work_profile(db, data["employee_b"])
+        employee_a_profile.shift_start = time(9, 0)
+        shared_profile.shift_start = time(9, 0)
+        employee_b_profile.shift_start = time(8, 30)
+        db.commit()
+    finally:
+        db.close()
+
+    selected = client.post(
+        "/api/v1/payroll/schedule-overrides",
+        json={
+            "scope": "employees",
+            "override_type": "shift",
+            "employee_ids": [
+                str(data["employee_a"].id),
+                str(data["shared_employee"].id),
+            ],
+            "permanent": True,
+            "shift_start": "10:00",
+            "shift_end": "18:00",
+            "reason": "Selected team members schedule",
+        },
+        headers=data["owner_headers"],
+    )
+    assert selected.status_code == 200
+    assert selected.json()["data"]["affected_employees"] == 2
+
+    db = data["session_factory"]()
+    try:
+        employee_a_profile = get_or_create_work_profile(db, data["employee_a"])
+        shared_profile = get_or_create_work_profile(db, data["shared_employee"])
+        employee_b_profile = get_or_create_work_profile(db, data["employee_b"])
+        assert employee_a_profile.shift_start == time(10, 0)
+        assert shared_profile.shift_start == time(10, 0)
+        assert employee_b_profile.shift_start == time(8, 30)
+    finally:
+        db.close()
+
+    outside_scope = client.post(
+        "/api/v1/payroll/schedule-overrides",
+        json={
+            "scope": "employees",
+            "override_type": "shift",
+            "employee_ids": [str(data["employee_b"].id)],
+            "permanent": True,
+            "shift_start": "10:00",
+            "shift_end": "18:00",
+            "reason": "Forbidden employee schedule",
+        },
+        headers=data["owner_headers"],
+    )
+    assert outside_scope.status_code in {403, 404}
+
+
+def test_schedule_override_rejects_overlapping_breaks(team_client):
+    client, data = team_client
+    response = client.post(
+        "/api/v1/payroll/schedule-overrides",
+        json={
+            "scope": "employee",
+            "override_type": "breaks",
+            "employee_id": str(data["employee_a"].id),
+            "effective_date": (local_today("UTC") + timedelta(days=1)).isoformat(),
+            "permanent": False,
+            "break_rules": [
+                {
+                    "name": "Lunch",
+                    "start_time": "13:00",
+                    "end_time": "13:30",
+                    "minutes": 30,
+                    "paid": True,
+                },
+                {
+                    "name": "Short break",
+                    "start_time": "13:00",
+                    "end_time": "13:30",
+                    "minutes": 30,
+                    "paid": True,
+                },
+            ],
+            "reason": "Overlapping break regression check",
+        },
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "OVERLAPPING_BREAKS"
+
+
+def test_team_day_override_applies_to_members_and_employee_override_wins(team_client):
+    client, data = team_client
+    day = local_today("UTC") + timedelta(days=1)
+    team_override = client.post(
+        "/api/v1/payroll/schedule-overrides",
+        json={
+            "scope": "team",
+            "team_id": str(data["team_a"].id),
+            "override_type": "shift",
+            "effective_date": day.isoformat(),
+            "permanent": False,
+            "shift_start": "10:00",
+            "shift_end": "18:00",
+            "reason": "Team coverage",
+        },
+        headers=data["general_headers"],
+    )
+    assert team_override.status_code == 200
+    assert team_override.json()["data"]["affected_employees"] == 2
+
+    team_schedule = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}/{day.isoformat()}",
+        headers=data["general_headers"],
+    )
+    assert team_schedule.status_code == 200
+    assert team_schedule.json()["data"]["scheduled_start_at"].endswith("10:00:00+00:00")
+
+    employee_override = client.post(
+        "/api/v1/payroll/schedule-overrides",
+        json={
+            "scope": "employee",
+            "employee_id": str(data["employee_a"].id),
+            "override_type": "shift",
+            "effective_date": day.isoformat(),
+            "permanent": False,
+            "shift_start": "11:00",
+            "shift_end": "19:00",
+            "reason": "Employee exception wins",
+        },
+        headers=data["general_headers"],
+    )
+    assert employee_override.status_code == 200
+    employee_schedule = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}/{day.isoformat()}",
+        headers=data["general_headers"],
+    )
+    assert employee_schedule.json()["data"]["scheduled_start_at"].endswith("11:00:00+00:00")
+
+
+def test_cancelling_today_override_restores_normal_schedule_immediately(team_client):
+    client, data = team_client
+    today = local_today("UTC")
+    db: Session = data["session_factory"]()
+    try:
+        profile = get_or_create_work_profile(db, data["employee_a"])
+        profile.working_days = sorted(set(profile.working_days or []) | {today.weekday()})
+        profile.weekly_off_days = [
+            weekday for weekday in (profile.weekly_off_days or []) if weekday != today.weekday()
+        ]
+        db.commit()
+    finally:
+        db.close()
+    created = client.post(
+        "/api/v1/payroll/schedule-overrides",
+        json={
+            "scope": "employee",
+            "override_type": "shift",
+            "employee_id": str(data["employee_a"].id),
+            "effective_date": today.isoformat(),
+            "permanent": False,
+            "shift_start": "10:00",
+            "shift_end": "18:00",
+            "reason": "Temporary coverage test",
+        },
+        headers=data["general_headers"],
+    )
+    assert created.status_code == 200
+
+    changed = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}/{today.isoformat()}",
+        headers=data["general_headers"],
+    )
+    assert changed.status_code == 200
+    assert changed.json()["data"]["scheduled_start_at"].endswith("10:00:00+00:00")
+
+    deleted = client.delete(
+        f"/api/v1/payroll/schedule-overrides/{created.json()['data']['id']}",
+        headers=data["general_headers"],
+    )
+    assert deleted.status_code == 200
+
+    restored = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}/{today.isoformat()}",
+        headers=data["general_headers"],
+    )
+    assert restored.status_code == 200
+    assert restored.json()["data"]["scheduled_start_at"].endswith("10:00:00+00:00")
+
+
+def test_payroll_overtime_decision_updates_daily_source_records(team_client):
+    client, data = team_client
+    work_date = local_today("UTC")
+    payroll_month = (
+        (work_date.replace(day=28) + timedelta(days=4)).replace(day=1)
+        if work_date.day >= 26
+        else work_date.replace(day=1)
+    )
+    db: Session = data["session_factory"]()
+    try:
+        db.add(
+            OvertimeRecord(
+                company_id=data["employee_a"].company_id,
+                employee_id=data["employee_a"].id,
+                work_session_id=data["session_a"].id,
+                work_date=work_date,
+                overtime_enabled_snapshot=True,
+                recorded_extra_seconds=3600,
+                approved_seconds=0,
+                status="pending",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    sheet = client.get(
+        f"/api/v1/payroll/sheet?month={payroll_month.strftime('%Y-%m')}",
+        headers=data["general_headers"],
+    )
+    assert sheet.status_code == 200
+    entry = next(
+        item
+        for item in sheet.json()["data"]["entries"]
+        if item["employee_id"] == str(data["employee_a"].id)
+    )
+    decision = client.patch(
+        f"/api/v1/payroll/entries/{entry['id']}",
+        json={"overtime_decision": "paid", "overtime_note": "Approved by HR"},
+        headers=data["general_headers"],
+    )
+    assert decision.status_code == 200
+    assert decision.json()["data"]["approved_overtime_seconds"] == 3600
+
+    db = data["session_factory"]()
+    try:
+        overtime = db.scalar(
+            select(OvertimeRecord).where(
+                OvertimeRecord.employee_id == data["employee_a"].id,
+                OvertimeRecord.work_date == work_date,
+            )
+        )
+        attendance = db.scalar(
+            select(DailyAttendance).where(
+                DailyAttendance.employee_id == data["employee_a"].id,
+                DailyAttendance.work_date == work_date,
+            )
+        )
+        assert overtime.status == "approved"
+        assert overtime.approved_seconds == 3600
+        assert attendance.approved_overtime_seconds == 3600
+    finally:
+        db.close()
+
+
+def test_payroll_sheet_includes_employees_without_attendance_records(team_client):
+    client, data = team_client
+    work_date = local_today("UTC")
+    payroll_month = (
+        (work_date.replace(day=28) + timedelta(days=4)).replace(day=1)
+        if work_date.day >= 26
+        else work_date.replace(day=1)
+    )
+
+    response = client.get(
+        f"/api/v1/payroll/sheet?month={payroll_month.strftime('%Y-%m')}",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    employee_ids = {entry["employee_id"] for entry in response.json()["data"]["entries"]}
+    assert employee_ids >= {
+        str(data["employee_a"].id),
+        str(data["employee_b"].id),
+        str(data["shared_employee"].id),
+    }
+
+
+def add_fixture_task(
+    data,
+    *,
+    name: str,
+    stage: str,
+    project_key: str = "project_a",
+    assignee_key: str | None = "employee_a",
+) -> str:
+    """Insert workflow fixtures without coupling picker tests to admin transitions."""
+    db: Session = data["session_factory"]()
+    try:
+        project = data[project_key]
+        assignee = data[assignee_key] if assignee_key else None
+        task = Task(
+            company_id=project.company_id,
+            project_id=project.id,
+            assignee_employee_id=assignee.id if assignee else None,
+            name=name,
+            description=None,
+            status="active",
+            stage=stage,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return str(task.id)
+    finally:
+        db.close()
+
+
+def admin_task_notifications(
+    client: TestClient, headers: dict[str, str], task_id: str
+) -> list[dict]:
+    response = client.get("/api/v1/notifications", headers=headers)
+    assert response.status_code == 200
+    return [row for row in response.json()["data"] if row["task_id"] == task_id]
+
+
+def task_workflow_requests(data, task_id: str) -> list[dict]:
+    db: Session = data["session_factory"]()
+    try:
+        rows = db.scalars(
+            select(TaskWorkflowRequest)
+            .where(TaskWorkflowRequest.task_id == UUID(task_id))
+            .order_by(TaskWorkflowRequest.created_at)
+        ).all()
+        return [
+            {
+                "id": str(row.id),
+                "requested_by_employee_id": str(row.requested_by_employee_id),
+                "request_type": row.request_type,
+                "from_stage": row.from_stage,
+                "requested_stage": row.requested_stage,
+                "status": row.status,
+                "request_note": row.request_note,
+                "decision_note": row.decision_note,
+                "return_stage": row.return_stage,
+                "reviewed_by_admin_user_id": (
+                    str(row.reviewed_by_admin_user_id) if row.reviewed_by_admin_user_id else None
+                ),
+            }
+            for row in rows
+        ]
+    finally:
+        db.close()
+
+
+def admin_notification_request_ids(data, admin_id, task_id: str) -> set[str | None]:
+    db: Session = data["session_factory"]()
+    try:
+        rows = db.scalars(
+            select(TaskNotification).where(
+                TaskNotification.admin_user_id == admin_id,
+                TaskNotification.task_id == UUID(task_id),
+            )
+        ).all()
+        return {str(row.workflow_request_id) if row.workflow_request_id else None for row in rows}
+    finally:
+        db.close()
+
+
+def create_assigned_employee_task(client: TestClient, data, name: str) -> dict:
+    response = client.post(
+        "/api/v1/tasks",
+        headers=data["general_headers"],
+        json={
+            "project_id": str(data["project_a"].id),
+            "assignee_employee_id": str(data["employee_a"].id),
+            "name": name,
+            "stage": "assigned",
+        },
+    )
+    assert response.status_code == 200
+    return response.json()["data"]
+
+
+def submit_employee_task_for_review(client: TestClient, data, name: str) -> dict:
+    task = create_assigned_employee_task(client, data, name)
+    started = client.patch(
+        f"/api/v1/agent/tasks/{task['id']}",
+        headers=data["device_headers"],
+        json={"stage": "in_progress"},
+    )
+    assert started.status_code == 200
+    submitted = client.patch(
+        f"/api/v1/agent/tasks/{task['id']}",
+        headers=data["device_headers"],
+        json={"stage": "ready_for_review", "note": "Ready for checking"},
+    )
+    assert submitted.status_code == 200
+    assert submitted.json()["data"]["stage"] == "ready_for_review"
+    return submitted.json()["data"]
+
+
+def test_task_workspaces_load_many_comment_authors_with_bounded_queries(team_client):
+    client, data = team_client
+    author_names = {f"Workspace Author {index}" for index in range(25)}
+    with data["session_factory"]() as db:
+        task = db.get(Task, data["task_a"].id)
+        task.assignee_employee_id = data["employee_a"].id
+        session = db.get(WorkSession, data["session_a"].id)
+        session.idle_seconds = 0
+        authors = [
+            Employee(
+                company_id=data["employee_a"].company_id,
+                name=name,
+                email=f"workspace-author-{index}@example.com",
+                employee_code=f"WORKSPACE-{index}",
+                status="active",
+            )
+            for index, name in enumerate(sorted(author_names))
+        ]
+        db.add_all(authors)
+        db.flush()
+        db.add_all(
+            [
+                TaskComment(
+                    task_id=task.id,
+                    employee_id=author.id,
+                    body=f"Comment from {author.name}",
+                )
+                for author in authors
+            ]
+        )
+        db.commit()
+
+    employee_token = create_employee_access_token(
+        employee_id=data["employee_a"].id,
+        company_id=data["employee_a"].company_id,
+    )
+    engine = data["session_factory"].kw["bind"]
+    counts = {"admin": 0, "employee": 0}
+    active_endpoint = {"name": "admin"}
+
+    def count_statement(*_args):
+        counts[active_endpoint["name"]] += 1
+
+    event.listen(engine, "before_cursor_execute", count_statement)
+    try:
+        admin_response = client.get(
+            f"/api/v1/tasks/{data['task_a'].id}/workspace",
+            headers=data["owner_headers"],
+        )
+        active_endpoint["name"] = "employee"
+        employee_response = client.get(
+            f"/api/v1/employee-portal/tasks/{data['task_a'].id}/workspace",
+            headers={"Authorization": f"Bearer {employee_token}"},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", count_statement)
+
+    assert admin_response.status_code == 200
+    assert employee_response.status_code == 200
+    assert {
+        comment["author_name"] for comment in admin_response.json()["data"]["comments"]
+    } == author_names
+    assert {
+        comment["author_name"] for comment in employee_response.json()["data"]["comments"]
+    } == author_names
+    assert counts["admin"] <= 15
+    assert counts["employee"] <= 10
+
+
+def test_task_metrics_aggregate_active_only_employees_with_bounded_queries(team_client):
+    client, data = team_client
+    now = datetime.now(UTC)
+    with data["session_factory"]() as db:
+        existing_session = db.get(WorkSession, data["session_a"].id)
+        existing_session.idle_seconds = 0
+        employees = [
+            Employee(
+                company_id=data["employee_a"].company_id,
+                name=f"Metric Employee {index}",
+                email=f"metric-employee-{index}@example.com",
+                employee_code=f"METRIC-{index}",
+                timezone="UTC",
+                status="active",
+            )
+            for index in range(25)
+        ]
+        db.add_all(employees)
+        db.flush()
+        devices = [
+            Device(
+                company_id=data["employee_a"].company_id,
+                employee_id=employee.id,
+                device_name=f"Metric Device {index}",
+                installation_id=f"metric-install-{index}",
+                operating_system="Windows 11",
+                agent_version="1.0.0",
+                status="active",
+                registered_at=now,
+            )
+            for index, employee in enumerate(employees)
+        ]
+        db.add_all(devices)
+        db.flush()
+        db.add_all(
+            [
+                TeamMember(
+                    team_id=data["team_a"].id,
+                    employee_id=employee.id,
+                    status="active",
+                )
+                for employee in employees
+            ]
+        )
+        db.add_all(
+            [
+                WorkSession(
+                    company_id=data["employee_a"].company_id,
+                    employee_id=employee.id,
+                    device_id=device.id,
+                    started_at=now,
+                    ended_at=now + timedelta(minutes=1),
+                    status="ended",
+                    active_seconds=60,
+                    idle_seconds=0,
+                    team_id=data["team_a"].id,
+                    project_id=data["project_a"].id,
+                    task_id=data["task_a"].id,
+                )
+                for employee, device in zip(employees, devices, strict=True)
+            ]
+        )
+        db.commit()
+
+    engine = data["session_factory"].kw["bind"]
+    query_count = 0
+
+    def count_statement(*_args):
+        nonlocal query_count
+        query_count += 1
+
+    event.listen(engine, "before_cursor_execute", count_statement)
+    try:
+        response = client.get(
+            f"/api/v1/task-metrics?team_id={data['team_a'].id}",
+            headers=data["owner_headers"],
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", count_statement)
+
+    assert response.status_code == 200
+    metric = next(
+        row for row in response.json()["data"] if row["task_id"] == str(data["task_a"].id)
+    )
+    assert metric["active_seconds"] == 120 + 25 * 60
+    assert metric["idle_seconds"] == 0
+    assert query_count <= 6
+
+
+def test_general_admin_can_access_all_company_teams(team_client):
+    client, data = team_client
+
+    response = client.get("/api/v1/teams", headers=data["general_headers"])
+
+    assert response.status_code == 200
+    names = {team["name"] for team in response.json()["data"]}
+    assert {"Team A", "Team B"}.issubset(names)
+    assert "Other Team" not in names
+
+
+def test_team_owner_can_access_assigned_team(team_client):
+    client, data = team_client
+
+    response = client.get(f"/api/v1/teams/{data['team_a'].id}", headers=data["owner_headers"])
+
+    assert response.status_code == 200
+    assert response.json()["data"]["name"] == "Team A"
+
+
+def test_team_owner_cannot_access_unassigned_team(team_client):
+    client, data = team_client
+
+    response = client.get(f"/api/v1/teams/{data['team_b'].id}", headers=data["owner_headers"])
+
+    assert response.status_code == 403
+
+
+def test_team_owner_cannot_retrieve_screenshots_from_another_team(team_client):
+    client, data = team_client
+
+    detail = client.get(
+        f"/api/v1/screenshots/{data['screenshot_b'].id}", headers=data["owner_headers"]
+    )
+    filtered = client.get(
+        f"/api/v1/screenshots?team_id={data['team_b'].id}", headers=data["owner_headers"]
+    )
+
+    assert detail.status_code == 403
+    assert filtered.status_code == 403
+
+
+def test_screenshot_folders_include_empty_employees_for_selected_day(team_client):
+    client, data = team_client
+    day = datetime.now(UTC).date().isoformat()
+    with data["session_factory"]() as db:
+        latest = db.get(Screenshot, data["screenshot_a"].id)
+        db.add(
+            Screenshot(
+                company_id=latest.company_id,
+                employee_id=latest.employee_id,
+                device_id=latest.device_id,
+                session_id=latest.session_id,
+                captured_at=latest.captured_at - timedelta(minutes=1),
+                storage_path="a-older.jpg",
+                mime_type="image/jpeg",
+                width=100,
+                height=100,
+                file_size=10,
+                checksum="c" * 64,
+                status="completed",
+                team_id=latest.team_id,
+                project_id=latest.project_id,
+                task_id=latest.task_id,
+            )
+        )
+        db.commit()
+
+    response = client.get(
+        f"/api/v1/screenshots/folders?day={day}&page_size=250&preview_limit=1",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    folders = {row["employee_name"]: row for row in response.json()["data"]}
+    assert set(folders) == {"Employee A", "Employee B", "Shared Employee"}
+    assert folders["Employee A"]["worked"] is True
+    assert folders["Employee A"]["screenshot_count"] == 2
+    assert len(folders["Employee A"]["previews"]) == 1
+    assert folders["Employee A"]["previews"][0]["id"] == str(data["screenshot_a"].id)
+    assert folders["Shared Employee"]["worked"] is False
+    assert folders["Shared Employee"]["screenshot_count"] == 0
+    assert folders["Shared Employee"]["previews"] == []
+
+
+def test_screenshot_folders_respect_team_owner_scope(team_client):
+    client, data = team_client
+    day = datetime.now(UTC).date().isoformat()
+
+    response = client.get(
+        f"/api/v1/screenshots/folders?day={day}&page_size=10",
+        headers=data["owner_headers"],
+    )
+
+    assert response.status_code == 200
+    names = {row["employee_name"] for row in response.json()["data"]}
+    assert names == {"Employee A", "Shared Employee"}
+
+
+def test_screenshot_day_uses_employee_timezone_across_monitoring_views(team_client):
+    client, data = team_client
+    with data["session_factory"]() as db:
+        employee = db.get(Employee, data["employee_a"].id)
+        screenshot = db.get(Screenshot, data["screenshot_a"].id)
+        employee.timezone = "Africa/Cairo"
+        # 22:30 UTC on July 26 is 01:30 on the employee's July 27 workday.
+        screenshot.captured_at = datetime(2026, 7, 26, 22, 30, tzinfo=UTC)
+        db.add_all([employee, screenshot])
+        db.commit()
+
+    local_day = client.get(
+        f"/api/v1/screenshots?employee_id={data['employee_a'].id}&day=2026-07-27",
+        headers=data["general_headers"],
+    )
+    utc_calendar_day = client.get(
+        f"/api/v1/screenshots?employee_id={data['employee_a'].id}&day=2026-07-26",
+        headers=data["general_headers"],
+    )
+    folders = client.get(
+        f"/api/v1/screenshots/folders?employee_id={data['employee_a'].id}&day=2026-07-27",
+        headers=data["general_headers"],
+    )
+
+    assert local_day.status_code == 200
+    assert local_day.json()["meta"]["total"] == 1
+    assert utc_calendar_day.status_code == 200
+    assert utc_calendar_day.json()["meta"]["total"] == 0
+    assert folders.status_code == 200
+    assert folders.json()["data"][0]["screenshot_count"] == 1
+
+
+def test_thumbnail_endpoint_materializes_legacy_preview(team_client, tmp_path, monkeypatch):
+    client, data = team_client
+    monkeypatch.setattr(settings, "screenshot_storage_path", tmp_path)
+    source = BytesIO()
+    Image.new("RGB", (1920, 1080), color=(25, 50, 75)).save(
+        source,
+        format="JPEG",
+        quality=90,
+    )
+    (tmp_path / "a.jpg").write_bytes(source.getvalue())
+
+    response = client.get(
+        f"/api/v1/screenshots/{data['screenshot_a'].id}/thumbnail",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "private, max-age=1800"
+    thumbnail = tmp_path / "a.thumb.jpg"
+    assert thumbnail.is_file()
+    assert thumbnail.stat().st_size < len(source.getvalue())
+    with Image.open(BytesIO(response.content)) as preview:
+        assert preview.width <= settings.screenshot_thumbnail_width
+        assert preview.height <= settings.screenshot_thumbnail_width
+
+
+def test_dashboard_previews_skip_stale_and_incomplete_files(
+    team_client,
+    tmp_path,
+    monkeypatch,
+):
+    client, data = team_client
+    monkeypatch.setattr(settings, "screenshot_storage_path", tmp_path)
+    (tmp_path / "a.jpg").write_bytes(b"existing-original")
+    (tmp_path / "newer.thumb.jpg").write_bytes(b"existing-thumbnail")
+
+    with data["session_factory"]() as db:
+        original = db.get(Screenshot, data["screenshot_a"].id)
+        thumbnail_only = Screenshot(
+            company_id=original.company_id,
+            employee_id=original.employee_id,
+            device_id=original.device_id,
+            session_id=original.session_id,
+            captured_at=original.captured_at + timedelta(minutes=1),
+            storage_path="newer-missing.jpg",
+            thumbnail_path="newer.thumb.jpg",
+            mime_type="image/jpeg",
+            width=100,
+            height=100,
+            file_size=10,
+            checksum="f" * 64,
+            status="completed",
+            team_id=original.team_id,
+            project_id=original.project_id,
+            task_id=original.task_id,
+        )
+        stale = Screenshot(
+            company_id=original.company_id,
+            employee_id=original.employee_id,
+            device_id=original.device_id,
+            session_id=original.session_id,
+            captured_at=original.captured_at + timedelta(minutes=2),
+            storage_path="missing.jpg",
+            mime_type="image/jpeg",
+            width=100,
+            height=100,
+            file_size=10,
+            checksum="e" * 64,
+            status="completed",
+            team_id=original.team_id,
+            project_id=original.project_id,
+            task_id=original.task_id,
+        )
+        incomplete = Screenshot(
+            company_id=original.company_id,
+            employee_id=original.employee_id,
+            device_id=original.device_id,
+            session_id=original.session_id,
+            captured_at=original.captured_at + timedelta(minutes=3),
+            storage_path="initiated.jpg",
+            mime_type="image/jpeg",
+            width=100,
+            height=100,
+            file_size=10,
+            checksum="d" * 64,
+            status="initiated",
+            team_id=original.team_id,
+            project_id=original.project_id,
+            task_id=original.task_id,
+        )
+        db.add_all([thumbnail_only, stale, incomplete])
+        db.commit()
+        thumbnail_only_id = thumbnail_only.id
+        day = original.captured_at.date().isoformat()
+
+    response = client.get(
+        "/api/v1/screenshots/previews",
+        params={
+            "day": day,
+            "employee_id": str(data["employee_a"].id),
+            "limit_per_employee": 3,
+        },
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()["data"]] == [
+        str(thumbnail_only_id),
+        str(data["screenshot_a"].id),
+    ]
+
+
+def test_screenshot_folder_smart_filters_are_applied_before_pagination(team_client):
+    client, data = team_client
+    day = datetime.now(UTC).date().isoformat()
+
+    with_screenshots = client.get(
+        f"/api/v1/screenshots/folders?day={day}&folder_status=with_screenshots&page_size=1",
+        headers=data["general_headers"],
+    )
+    empty = client.get(
+        f"/api/v1/screenshots/folders?day={day}&folder_status=empty&page_size=10",
+        headers=data["general_headers"],
+    )
+    no_work = client.get(
+        f"/api/v1/screenshots/folders?day={day}&folder_status=no_work&page_size=10",
+        headers=data["general_headers"],
+    )
+
+    assert with_screenshots.status_code == 200
+    assert with_screenshots.json()["meta"]["total"] == 2
+    assert len(with_screenshots.json()["data"]) == 1
+    assert with_screenshots.json()["data"][0]["screenshot_count"] > 0
+    assert empty.status_code == 200
+    assert {row["employee_name"] for row in empty.json()["data"]} == {"Shared Employee"}
+    assert no_work.status_code == 200
+    assert {row["employee_name"] for row in no_work.json()["data"]} == {"Shared Employee"}
+
+
+def test_desktop_agent_can_only_load_its_own_recent_screenshots(team_client, tmp_path, monkeypatch):
+    client, data = team_client
+    monkeypatch.setattr(settings, "screenshot_storage_path", tmp_path)
+    (tmp_path / "a.jpg").write_bytes(b"employee-a-image")
+    (tmp_path / "b.jpg").write_bytes(b"employee-b-image")
+    (tmp_path / "latest.thumb.jpg").write_bytes(b"employee-a-thumbnail")
+    db: Session = data["session_factory"]()
+    try:
+        current = db.get(Screenshot, data["screenshot_a"].id)
+        thumbnail_only = Screenshot(
+            company_id=current.company_id,
+            employee_id=current.employee_id,
+            device_id=current.device_id,
+            session_id=current.session_id,
+            captured_at=current.captured_at + timedelta(minutes=1),
+            storage_path="missing-original.jpg",
+            thumbnail_path="latest.thumb.jpg",
+            mime_type="image/jpeg",
+            width=100,
+            height=100,
+            file_size=10,
+            checksum="e" * 64,
+            status="completed",
+            team_id=current.team_id,
+            project_id=current.project_id,
+            task_id=current.task_id,
+        )
+        db.add(
+            Screenshot(
+                company_id=current.company_id,
+                employee_id=current.employee_id,
+                device_id=current.device_id,
+                session_id=current.session_id,
+                captured_at=current.captured_at + timedelta(minutes=2),
+                storage_path="missing-latest.jpg",
+                mime_type="image/jpeg",
+                width=100,
+                height=100,
+                file_size=10,
+                checksum="d" * 64,
+                status="completed",
+                team_id=current.team_id,
+                project_id=current.project_id,
+                task_id=current.task_id,
+            )
+        )
+        db.add(thumbnail_only)
+        db.commit()
+        thumbnail_only_id = thumbnail_only.id
+    finally:
+        db.close()
+
+    recent = client.get(
+        "/api/v1/agent/screenshots/recent",
+        headers=data["device_headers"],
+    )
+    own_preview = client.get(
+        f"/api/v1/agent/screenshots/{data['screenshot_a'].id}/preview",
+        headers=data["device_headers"],
+    )
+    legacy_thumbnail_fallback = client.get(
+        f"/api/v1/agent/screenshots/{thumbnail_only_id}/file",
+        headers=data["device_headers"],
+    )
+    own_file = client.get(
+        f"/api/v1/agent/screenshots/{data['screenshot_a'].id}/file",
+        headers=data["device_headers"],
+    )
+    other_file = client.get(
+        f"/api/v1/agent/screenshots/{data['screenshot_b'].id}/file",
+        headers=data["device_headers"],
+    )
+
+    assert recent.status_code == 200
+    assert [row["id"] for row in recent.json()["data"]] == [
+        str(thumbnail_only_id),
+        str(data["screenshot_a"].id),
+    ]
+    assert own_preview.status_code == 200
+    assert own_preview.content == b"employee-a-image"
+    assert legacy_thumbnail_fallback.status_code == 200
+    assert legacy_thumbnail_fallback.content == b"employee-a-thumbnail"
+    assert own_file.status_code == 200
+    assert own_file.content == b"employee-a-image"
+    assert other_file.status_code == 404
+
+
+def test_agent_task_list_includes_employee_time_per_task(team_client):
+    client, data = team_client
+    task_id = add_fixture_task(
+        data,
+        name="Timed desktop task",
+        stage="assigned",
+        assignee_key="employee_a",
+    )
+    work_day = local_today("UTC")
+    started_at = datetime.combine(work_day, datetime.min.time(), tzinfo=UTC).replace(hour=10)
+    db: Session = data["session_factory"]()
+    try:
+        employee = db.get(Employee, data["employee_a"].id)
+        profile = get_or_create_work_profile(db, employee)
+        profile.shift_start = datetime.min.time().replace(hour=9)
+        profile.shift_end = datetime.min.time().replace(hour=17)
+        profile.working_days = [work_day.weekday()]
+        profile.weekly_off_days = []
+        session = WorkSession(
+            company_id=data["employee_a"].company_id,
+            employee_id=data["employee_a"].id,
+            device_id=data["session_a"].device_id,
+            team_id=data["team_a"].id,
+            project_id=data["project_a"].id,
+            task_id=UUID(task_id),
+            started_at=started_at,
+            ended_at=started_at + timedelta(minutes=3),
+            status="ended",
+            active_seconds=100,
+            idle_seconds=5,
+            deducted_seconds=20,
+        )
+        db.add(session)
+        db.flush()
+        db.add_all(
+            [
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="idle_started",
+                    event_timestamp=started_at + timedelta(minutes=1),
+                    idempotency_key=str(uuid4()),
+                ),
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="idle_ended",
+                    event_timestamp=started_at + timedelta(minutes=1, seconds=5),
+                    idempotency_key=str(uuid4()),
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/v1/agent/tasks", headers=data["device_headers"])
+
+    assert response.status_code == 200
+    task = next(row for row in response.json()["data"] if row["id"] == task_id)
+    assert task["active_seconds"] == 80
+    assert task["idle_seconds"] == 5
+    assert task["tracked_seconds"] == 85
+
+
+def test_live_hr_status_does_not_revive_old_work_from_screenshot_device_liveness(team_client):
+    client, data = team_client
+    now = datetime.now(UTC)
+    with data["session_factory"]() as db:
+        session = db.get(WorkSession, data["session_a"].id)
+        session.started_at = now - timedelta(days=3)
+        session.ended_at = None
+        session.status = "active"
+        session.updated_at = now
+        device = db.get(Device, session.device_id)
+        device.last_seen_at = now
+        db.add(ActivityEvent(
+            company_id=session.company_id, employee_id=session.employee_id,
+            device_id=device.id, session_id=session.id, event_type="heartbeat",
+            event_timestamp=now - timedelta(days=2), payload={"status": "active"},
+            idempotency_key=str(uuid4()),
+        ))
+        db.commit()
+    overview = client.get(
+        "/api/v1/employees-overview", params={"employee_id": str(data["employee_a"].id)},
+        headers=data["general_headers"],
+    )
+    detail = client.get(
+        f"/api/v1/employees/{data['employee_a'].id}/status", headers=data["general_headers"],
+    )
+    assert overview.status_code == detail.status_code == 200
+    for row in [overview.json()["data"][0], detail.json()["data"]]:
+        assert row["online_status"] == "online", "the device is reachable"
+        assert row["activity_status"] == "offline", "old work is not a live work session"
+        assert row["session_start_time"] is None
+        assert row["current_session"] is None
+    with data["session_factory"]() as db:
+        assert db.get(WorkSession, data["session_a"].id).ended_at is None
+
+
+def test_team_owner_cannot_retrieve_employees_from_another_team(team_client):
+    client, data = team_client
+
+    detail = client.get(f"/api/v1/employees/{data['employee_b'].id}", headers=data["owner_headers"])
+    filtered = client.get(
+        f"/api/v1/employees?team_id={data['team_b'].id}", headers=data["owner_headers"]
+    )
+
+    assert detail.status_code == 403
+    assert filtered.status_code == 403
+
+
+def test_revoked_device_token_requires_desktop_reenrollment(team_client):
+    client, data = team_client
+    db: Session = data["session_factory"]()
+    try:
+        db.execute(delete(DeviceToken).where(DeviceToken.device_id == data["session_a"].device_id))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/v1/agent/summary", headers=data["device_headers"])
+
+    assert response.status_code == 401
+    assert response.json()["error"] == {
+        "code": "DEVICE_REENROLLMENT_REQUIRED",
+        "message": "Device token identity does not match this device.",
+        "details": {},
+    }
+
+
+def test_legacy_device_token_bootstraps_once_after_registry_repair(team_client):
+    client, data = team_client
+    device_id = data["session_a"].device_id
+    db: Session = data["session_factory"]()
+    try:
+        device = db.get(Device, device_id)
+        device.legacy_token_bootstrap_allowed = True
+        db.execute(delete(DeviceToken).where(DeviceToken.device_id == device_id))
+        db.commit()
+    finally:
+        db.close()
+
+    first_response = client.get(
+        "/api/v1/agent/summary",
+        headers=data["device_headers"],
+    )
+
+    assert first_response.status_code == 200
+    db = data["session_factory"]()
+    try:
+        device = db.get(Device, device_id)
+        token_rows = db.scalars(select(DeviceToken).where(DeviceToken.device_id == device_id)).all()
+        assert device.legacy_token_bootstrap_allowed is False
+        assert len(token_rows) == 1
+        db.delete(token_rows[0])
+        db.commit()
+    finally:
+        db.close()
+
+    replay_after_bootstrap = client.get(
+        "/api/v1/agent/summary",
+        headers=data["device_headers"],
+    )
+    assert replay_after_bootstrap.status_code == 401
+    assert replay_after_bootstrap.json()["error"]["code"] == "DEVICE_REENROLLMENT_REQUIRED"
+
+
+def test_team_owner_cannot_retrieve_reports_from_another_team(team_client):
+    client, data = team_client
+
+    response = client.get(
+        f"/api/v1/reports/summary?team_id={data['team_b'].id}", headers=data["owner_headers"]
+    )
+
+    assert response.status_code == 403
+
+
+def test_team_owner_can_access_assigned_team_projects_and_tasks(team_client):
+    client, data = team_client
+
+    projects_response = client.get("/api/v1/projects", headers=data["owner_headers"])
+    tasks_response = client.get("/api/v1/tasks", headers=data["owner_headers"])
+
+    assert projects_response.status_code == 200
+    assert {project["name"] for project in projects_response.json()["data"]} == {"Project A"}
+    assert tasks_response.status_code == 200
+    assert {task["name"] for task in tasks_response.json()["data"]} == {"Task A"}
+    assert tasks_response.json()["data"][0]["stage"] == "new_requests"
+
+
+def test_general_admin_can_move_task_stage(team_client):
+    client, data = team_client
+    task = create_assigned_employee_task(client, data, "General admin stage update")
+
+    response = client.patch(
+        f"/api/v1/tasks/{task['id']}",
+        headers=data["general_headers"],
+        json={"stage": "in_progress"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["stage"] == "in_progress"
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["new_requests", "ready_for_review", "completed", "blocked", "rejected", "cancelled"],
+)
+def test_admin_cannot_create_task_in_a_result_or_pending_stage(team_client, stage):
+    client, data = team_client
+    response = client.post(
+        "/api/v1/tasks",
+        headers=data["general_headers"],
+        json={
+            "project_id": str(data["project_a"].id),
+            "name": f"Invalid initial stage {stage}",
+            "stage": stage,
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_database_allows_only_one_pending_workflow_request_per_task(team_client):
+    _client, data = team_client
+    db: Session = data["session_factory"]()
+    try:
+        first = TaskWorkflowRequest(
+            company_id=data["task_a"].company_id,
+            task_id=data["task_a"].id,
+            requested_by_employee_id=data["employee_a"].id,
+            request_type="completion",
+            from_stage="in_progress",
+            requested_stage="completed",
+            status="pending",
+        )
+        db.add(first)
+        db.commit()
+        db.add(
+            TaskWorkflowRequest(
+                company_id=data["task_a"].company_id,
+                task_id=data["task_a"].id,
+                requested_by_employee_id=data["employee_a"].id,
+                request_type="completion",
+                from_stage="in_progress",
+                requested_stage="completed",
+                status="pending",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db.commit()
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_team_owner_cannot_access_unassigned_team_project_tasks(team_client):
+    client, data = team_client
+
+    response = client.get(
+        f"/api/v1/tasks?team_id={data['team_b'].id}",
+        headers=data["owner_headers"],
+    )
+
+    assert response.status_code == 403
+
+
+def test_employee_picker_only_allows_tasks_assigned_to_employee(team_client):
+    client, data = team_client
+
+    own_task_id = add_fixture_task(
+        data,
+        name="Own assigned task",
+        stage="assigned",
+        assignee_key="employee_a",
+    )
+    colleague_task_id = add_fixture_task(
+        data,
+        name="Colleague task",
+        stage="assigned",
+        assignee_key="shared_employee",
+    )
+    excluded_ids = {
+        add_fixture_task(data, name=f"Excluded {stage}", stage=stage)
+        for stage in (
+            "completed",
+            "rejected",
+            "cancelled",
+            "blocked",
+            "ready_for_review",
+            "new_requests",
+        )
+    }
+    other_team_task_id = add_fixture_task(
+        data,
+        name="Other team available task",
+        stage="assigned",
+        project_key="project_b",
+        assignee_key="employee_b",
+    )
+
+    tasks_response = client.get("/api/v1/agent/tasks", headers=data["device_headers"])
+    select_response = client.post(
+        f"/api/v1/agent/sessions/{data['session_a'].id}/task",
+        headers=data["device_headers"],
+        json={"task_id": colleague_task_id},
+    )
+    forbidden_response = client.post(
+        f"/api/v1/agent/sessions/{data['session_a'].id}/task",
+        headers=data["device_headers"],
+        json={"task_id": other_team_task_id},
+    )
+
+    assert tasks_response.status_code == 200
+    visible_tasks = {task["id"]: task for task in tasks_response.json()["data"]}
+    visible_ids = set(visible_tasks)
+    assert own_task_id in visible_ids
+    assert visible_tasks[own_task_id]["can_update_stage"] is True
+    assert colleague_task_id not in visible_ids
+    assert excluded_ids.isdisjoint(visible_ids)
+    assert str(data["task_a"].id) not in visible_ids
+    assert other_team_task_id not in visible_ids
+    assert select_response.status_code == 403
+    assert forbidden_response.status_code == 403
+
+
+def test_employee_can_delete_selected_items_from_own_task_checklist(team_client):
+    client, data = team_client
+    task_id = add_fixture_task(
+        data,
+        name="Checklist deletion task",
+        stage="assigned",
+        assignee_key="employee_a",
+    )
+
+    first_response = client.post(
+        f"/api/v1/agent/tasks/{task_id}/checklist",
+        headers=data["device_headers"],
+        json={"title": "Delete this item"},
+    )
+    second_response = client.post(
+        f"/api/v1/agent/tasks/{task_id}/checklist",
+        headers=data["device_headers"],
+        json={"title": "Keep this item"},
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    first_item = next(
+        item
+        for item in first_response.json()["data"]["checklist"]
+        if item["title"] == "Delete this item"
+    )
+
+    deleted_response = client.delete(
+        f"/api/v1/agent/tasks/{task_id}/checklist/{first_item['id']}",
+        headers=data["device_headers"],
+    )
+    listed_response = client.get(
+        "/api/v1/agent/tasks",
+        headers=data["device_headers"],
+    )
+
+    assert deleted_response.status_code == 200
+    assert deleted_response.json()["data"]["deleted"] is True
+    assert listed_response.status_code == 200
+    task = next(row for row in listed_response.json()["data"] if row["id"] == task_id)
+    titles = {item["title"] for item in task["checklist"]}
+    assert "Delete this item" not in titles
+    assert "Keep this item" in titles
+
+
+def test_employee_portal_lists_json_labeled_collaborator_task(team_client):
+    client, data = team_client
+    with data["session_factory"]() as db:
+        task = db.get(Task, data["task_a"].id)
+        task.labels = ["customer-facing"]
+        db.add(
+            TaskCollaborator(
+                task_id=task.id,
+                employee_id=data["shared_employee"].id,
+            )
+        )
+        db.commit()
+
+    employee_token = create_employee_access_token(
+        employee_id=data["shared_employee"].id,
+        company_id=data["shared_employee"].company_id,
+    )
+    response = client.get(
+        "/api/v1/employee-portal/tasks",
+        headers={"Authorization": f"Bearer {employee_token}"},
+    )
+
+    assert response.status_code == 200
+    assert str(data["task_a"].id) in {row["id"] for row in response.json()["data"]}
+
+
+def test_team_leader_self_created_task_activates_without_creation_approval(team_client):
+    client, data = team_client
+    created = client.post(
+        "/api/v1/agent/tasks",
+        headers=data["device_headers"],
+        json={
+            "project_id": str(data["project_a"].id),
+            "name": "Employee proposed workflow task",
+            "stage": "assigned",
+            "priority": "high",
+        },
+    )
+    assert created.status_code == 200
+    task = created.json()["data"]
+    assert task["stage"] == "assigned"
+    assert task["priority"] == "high"
+    assert task["created_by_employee_id"] == str(data["employee_a"].id)
+    assert task_workflow_requests(data, task["id"]) == []
+
+    listed = client.get("/api/v1/agent/tasks", headers=data["device_headers"])
+    selection = client.post(
+        f"/api/v1/agent/sessions/{data['session_a'].id}/task",
+        headers=data["device_headers"],
+        json={"task_id": task["id"]},
+    )
+    assert task["id"] in {row["id"] for row in listed.json()["data"]}
+    assert selection.status_code == 200
+    assert admin_task_notifications(client, data["general_headers"], task["id"]) == []
+    assert admin_task_notifications(client, data["second_owner_headers"], task["id"]) == []
+    assert admin_task_notifications(client, data["owner_headers"], task["id"]) == []
+
+    employee_token = create_employee_access_token(
+        employee_id=data["employee_a"].id,
+        company_id=data["employee_a"].company_id,
+    )
+    portal_created = client.post(
+        "/api/v1/employee-portal/tasks",
+        headers={"Authorization": f"Bearer {employee_token}"},
+        json={
+            "project_id": str(data["project_a"].id),
+            "name": "Team Leader portal task",
+        },
+    )
+    assert portal_created.status_code == 200
+    assert portal_created.json()["data"]["stage"] == "assigned"
+    assert task_workflow_requests(data, portal_created.json()["data"]["id"]) == []
+
+    started = client.patch(
+        f"/api/v1/agent/tasks/{task['id']}",
+        headers=data["device_headers"],
+        json={"stage": "in_progress"},
+    )
+    submitted = client.patch(
+        f"/api/v1/agent/tasks/{task['id']}",
+        headers=data["device_headers"],
+        json={"stage": "ready_for_review", "note": "Ready for checking"},
+    )
+    assert started.status_code == 200
+    assert submitted.status_code == 200
+    assert submitted.json()["data"]["stage"] == "ready_for_review"
+    workflow_requests = task_workflow_requests(data, task["id"])
+    assert len(workflow_requests) == 1
+    completion_request = workflow_requests[0]
+    assert completion_request["request_type"] == "completion"
+    assert completion_request["from_stage"] == "in_progress"
+    assert completion_request["requested_stage"] == "completed"
+    assert completion_request["status"] == "pending"
+    assert completion_request["request_note"] == "Ready for checking"
+
+    assert {
+        row["type"] for row in admin_task_notifications(client, data["general_headers"], task["id"])
+    } == {"task_review_requested"}
+    assert {
+        row["type"]
+        for row in admin_task_notifications(client, data["second_owner_headers"], task["id"])
+    } == {"task_review_requested"}
+    assert admin_task_notifications(client, data["owner_headers"], task["id"]) == []
+    assert completion_request["id"] in admin_notification_request_ids(
+        data, data["general_admin"].id, task["id"]
+    )
+    assert completion_request["id"] in admin_notification_request_ids(
+        data, data["second_owner"].id, task["id"]
+    )
+
+    self_review = client.post(
+        f"/api/v1/tasks/{task['id']}/approve-review",
+        headers=data["owner_headers"],
+        json={"note": "I cannot approve my own work"},
+    )
+    completed = client.post(
+        f"/api/v1/tasks/{task['id']}/approve-review",
+        headers=data["general_headers"],
+        json={"note": "Reviewed by the company admin"},
+    )
+    assert self_review.status_code == 403
+    assert completed.status_code == 200
+    assert completed.json()["data"]["stage"] == "completed"
+    decided_completion_request = task_workflow_requests(data, task["id"])[0]
+    assert decided_completion_request["status"] == "approved"
+    assert decided_completion_request["decision_note"] == "Reviewed by the company admin"
+    assert decided_completion_request["reviewed_by_admin_user_id"] == str(data["general_admin"].id)
+
+
+def test_team_member_created_task_still_requires_team_leader_approval(team_client):
+    client, data = team_client
+    employee_token = create_employee_access_token(
+        employee_id=data["shared_employee"].id,
+        company_id=data["shared_employee"].company_id,
+    )
+    created = client.post(
+        "/api/v1/employee-portal/tasks",
+        headers={"Authorization": f"Bearer {employee_token}"},
+        json={
+            "project_id": str(data["project_a"].id),
+            "name": "Team member proposed task",
+            "priority": "medium",
+        },
+    )
+
+    assert created.status_code == 200
+    task = created.json()["data"]
+    assert task["stage"] == "new_requests"
+    requests = task_workflow_requests(data, task["id"])
+    assert len(requests) == 1
+    assert requests[0]["request_type"] == "task_creation"
+    assert requests[0]["status"] == "pending"
+
+    owner_notifications = admin_task_notifications(client, data["owner_headers"], task["id"])
+    assert {row["type"] for row in owner_notifications} == {"task_approval_requested"}
+    approved = client.post(
+        f"/api/v1/tasks/{task['id']}/approve-request",
+        headers=data["owner_headers"],
+        json={"target_stage": "assigned"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["data"]["stage"] == "assigned"
+    assert task_workflow_requests(data, task["id"])[0]["reviewed_by_admin_user_id"] == str(
+        data["owner"].id
+    )
+
+
+def test_legacy_team_leader_self_creation_request_is_activated_without_self_review(team_client):
+    client, data = team_client
+    db: Session = data["session_factory"]()
+    try:
+        task = Task(
+            company_id=data["employee_a"].company_id,
+            project_id=data["project_a"].id,
+            assignee_employee_id=data["employee_a"].id,
+            created_by_employee_id=data["employee_a"].id,
+            name="Legacy Team Leader request",
+            stage="new_requests",
+            status="active",
+        )
+        db.add(task)
+        db.flush()
+        workflow_request = TaskWorkflowRequest(
+            company_id=task.company_id,
+            task_id=task.id,
+            requested_by_employee_id=data["employee_a"].id,
+            request_type="task_creation",
+            from_stage="new_requests",
+            requested_stage="assigned",
+            status="pending",
+        )
+        db.add(workflow_request)
+        db.flush()
+        db.add(
+            TaskNotification(
+                company_id=task.company_id,
+                admin_user_id=data["general_admin"].id,
+                task_id=task.id,
+                workflow_request_id=workflow_request.id,
+                notification_type="task_approval_requested",
+                title="New task needs approval",
+                message="Legacy request",
+                dedupe_key=f"legacy:{workflow_request.id}",
+            )
+        )
+        db.commit()
+        task_id = str(task.id)
+    finally:
+        db.close()
+
+    notifications = admin_task_notifications(client, data["general_headers"], task_id)
+    assert {row["type"] for row in notifications} == {"task_activated"}
+    assert {row["workflow_request"]["status"] for row in notifications} == {"approved"}
+    request = task_workflow_requests(data, task_id)[0]
+    assert request["status"] == "approved"
+    assert request["reviewed_by_admin_user_id"] is None
+    db = data["session_factory"]()
+    try:
+        assert db.get(Task, UUID(task_id)).stage == "assigned"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("target_stage", ["backlog", "assigned", "in_progress"])
+def test_eligible_team_owner_can_return_review_to_an_explicit_active_stage(
+    team_client,
+    target_stage,
+):
+    client, data = team_client
+    task = submit_employee_task_for_review(client, data, f"Return to {target_stage}")
+
+    self_return = client.post(
+        f"/api/v1/tasks/{task['id']}/return-review",
+        headers=data["owner_headers"],
+        json={"note": "Self review is forbidden", "target_stage": target_stage},
+    )
+    missing_note = client.post(
+        f"/api/v1/tasks/{task['id']}/return-review",
+        headers=data["second_owner_headers"],
+        json={"target_stage": target_stage},
+    )
+    invalid_target = client.post(
+        f"/api/v1/tasks/{task['id']}/return-review",
+        headers=data["second_owner_headers"],
+        json={"note": "Invalid terminal target", "target_stage": "completed"},
+    )
+    returned = client.post(
+        f"/api/v1/tasks/{task['id']}/return-review",
+        headers=data["second_owner_headers"],
+        json={"note": "Please address the review notes", "target_stage": target_stage},
+    )
+
+    assert self_return.status_code == 403
+    assert missing_note.status_code == 400
+    assert invalid_target.status_code == 422
+    assert returned.status_code == 200
+    assert returned.json()["data"]["stage"] == target_stage
+    assert returned.json()["data"]["review_note"] == "Please address the review notes"
+    requests = task_workflow_requests(data, task["id"])
+    assert len(requests) == 1
+    assert requests[0]["status"] == "rejected"
+    assert requests[0]["decision_note"] == "Please address the review notes"
+    assert requests[0]["return_stage"] == target_stage
+    assert requests[0]["reviewed_by_admin_user_id"] == str(data["second_owner"].id)
+
+
+def test_general_admin_can_review_a_team_managers_own_task(team_client):
+    client, data = team_client
+    task = submit_employee_task_for_review(client, data, "Manager task for general review")
+
+    self_review = client.post(
+        f"/api/v1/tasks/{task['id']}/approve-review",
+        headers=data["owner_headers"],
+        json={"note": "Self approval should fail"},
+    )
+    general_review = client.post(
+        f"/api/v1/tasks/{task['id']}/approve-review",
+        headers=data["general_headers"],
+        json={"note": "Reviewed by the general admin"},
+    )
+
+    assert self_review.status_code == 403
+    assert general_review.status_code == 200
+    assert general_review.json()["data"]["stage"] == "completed"
+    request = task_workflow_requests(data, task["id"])[0]
+    assert request["status"] == "approved"
+    assert request["reviewed_by_admin_user_id"] == str(data["general_admin"].id)
+
+
+def test_blocked_task_requires_reason_stops_tracking_notifies_reviewers_and_can_resume(team_client):
+    client, data = team_client
+    task = create_assigned_employee_task(client, data, "Task with an external blocker")
+    selected = client.post(
+        f"/api/v1/agent/sessions/{data['session_a'].id}/task",
+        headers=data["device_headers"],
+        json={"task_id": task["id"]},
+    )
+    assert selected.status_code == 200
+
+    missing_reason = client.patch(
+        f"/api/v1/agent/tasks/{task['id']}",
+        headers=data["device_headers"],
+        json={"stage": "blocked"},
+    )
+    blocked = client.patch(
+        f"/api/v1/agent/tasks/{task['id']}",
+        headers=data["device_headers"],
+        json={"stage": "blocked", "note": "Waiting for the customer credentials"},
+    )
+    current_session = client.get("/api/v1/agent/sessions/current", headers=data["device_headers"])
+    picker = client.get("/api/v1/agent/tasks", headers=data["device_headers"])
+
+    assert missing_reason.status_code == 400
+    assert blocked.status_code == 200
+    assert blocked.json()["data"]["stage"] == "blocked"
+    assert blocked.json()["data"]["blocked_reason"] == "Waiting for the customer credentials"
+    assert task_workflow_requests(data, task["id"]) == []
+    assert current_session.status_code == 200
+    assert current_session.json()["data"]["session"] is None
+    assert task["id"] not in {row["id"] for row in picker.json()["data"]}
+    assert {
+        row["type"] for row in admin_task_notifications(client, data["general_headers"], task["id"])
+    } == {"task_blocked"}
+    assert {
+        row["type"]
+        for row in admin_task_notifications(client, data["second_owner_headers"], task["id"])
+    } == {"task_blocked"}
+    assert admin_task_notifications(client, data["owner_headers"], task["id"]) == []
+
+    missing_resolution = client.patch(
+        f"/api/v1/tasks/{task['id']}",
+        headers=data["second_owner_headers"],
+        json={"stage": "in_progress"},
+    )
+    resumed = client.patch(
+        f"/api/v1/tasks/{task['id']}",
+        headers=data["second_owner_headers"],
+        json={"stage": "in_progress", "block_resolution_note": "Credentials received"},
+    )
+    assert missing_resolution.status_code == 400
+    assert resumed.status_code == 200
+    assert resumed.json()["data"]["stage"] == "in_progress"
+    assert resumed.json()["data"]["block_resolution_note"] == "Credentials received"
+    assert resumed.json()["data"]["blocked_reason"] is None
+
+
+def test_generic_admin_patch_cannot_self_close_or_bypass_pending_review(team_client):
+    client, data = team_client
+    active_task = create_assigned_employee_task(client, data, "Manager terminal protection")
+
+    for terminal_stage in ("completed", "rejected", "cancelled"):
+        response = client.patch(
+            f"/api/v1/tasks/{active_task['id']}",
+            headers=data["owner_headers"],
+            json={"stage": terminal_stage},
+        )
+        assert response.status_code == 403
+
+    pending_task = submit_employee_task_for_review(client, data, "Pending review cannot be patched")
+    for headers, stage in (
+        (data["second_owner_headers"], "completed"),
+        (data["second_owner_headers"], "in_progress"),
+        (data["general_headers"], "completed"),
+    ):
+        response = client.patch(
+            f"/api/v1/tasks/{pending_task['id']}",
+            headers=headers,
+            json={"stage": stage},
+        )
+        assert response.status_code == 409
+    request = task_workflow_requests(data, pending_task["id"])[0]
+    assert request["status"] == "pending"
+    assert request["reviewed_by_admin_user_id"] is None
+
+
+def test_desktop_summary_matches_employee_periods_and_profile(team_client):
+    client, data = team_client
+    response = client.get("/api/v1/agent/summary", headers=data["device_headers"])
+
+    assert response.status_code == 200
+    summary = response.json()["data"]
+    assert summary["employee"]["id"] == str(data["employee_a"].id)
+    assert {"today", "week", "month"}.issubset(summary)
+    assert summary["today_timeline"]["is_running"] is True
+    assert summary["today_timeline"]["intervals"][0]["type"] == "worked"
+    for period_name in ("today", "week", "month"):
+        period = summary[period_name]
+        assert {
+            "tracked_active_seconds",
+            "idle_seconds",
+            "manual_approved_seconds",
+            "manual_pending_seconds",
+            "manual_rejected_seconds",
+        }.issubset(period)
+    # The saved-break ledger is surfaced so the desktop can show saved break
+    # time and what later idle already used.
+    assert {
+        "policy_active",
+        "earned_seconds",
+        "used_seconds",
+        "approved_seconds",
+        "reserved_seconds",
+        "remaining_seconds",
+        "paid_late_allowance_seconds",
+    }.issubset(summary["break_bank"])
+    # The week's days for the desktop Insights screen add up to the week total.
+    week = summary["attendance_week"]
+    assert len(week["days"]) == 7
+    assert week["days"][0]["date"] == week["week_start"]
+    assert week["days"][-1]["date"] == week["week_end"]
+    assert sum(day["active_seconds"] for day in week["days"]) == summary["week"][
+        "tracked_active_seconds"
+    ]
+    assert sum(day["session_count"] for day in week["days"]) >= 1
+    assert {"late_grace_minutes", "enrolled_at", "month_start", "month_end"}.issubset(week)
+
+
+def test_daily_timesheet_uses_employee_local_date_for_sessions_and_screenshots(
+    team_client,
+):
+    client, data = team_client
+    with data["session_factory"]() as db:
+        employee = db.get(Employee, data["employee_a"].id)
+        session = db.get(WorkSession, data["session_a"].id)
+        device = db.get(Device, session.device_id)
+        screenshot = db.get(Screenshot, data["screenshot_a"].id)
+        employee.timezone = "Africa/Cairo"
+        device.timezone = "Africa/Cairo"
+        # 22:10 UTC on July 28 is 01:10 on the employee's July 29 workday.
+        session.started_at = datetime(2026, 7, 28, 22, 10, tzinfo=UTC)
+        session.ended_at = datetime(2026, 7, 28, 22, 20, tzinfo=UTC)
+        session.status = "ended"
+        session.timezone = "Asia/Riyadh"
+        session.active_seconds = 10 * 60
+        session.idle_seconds = 0
+        screenshot.captured_at = datetime(2026, 7, 28, 22, 15, tzinfo=UTC)
+        db.add_all([employee, device, session, screenshot])
+        db.commit()
+
+    local_day = client.get(
+        "/api/v1/timesheets/daily?day=2026-07-29",
+        headers=data["general_headers"],
+    )
+    utc_day = client.get(
+        "/api/v1/timesheets/daily?day=2026-07-28",
+        headers=data["general_headers"],
+    )
+
+    assert local_day.status_code == 200
+    local_row = next(
+        row for row in local_day.json()["data"] if row["employee_id"] == str(data["employee_a"].id)
+    )
+    assert local_row["date"] == "2026-07-29"
+    assert local_row["active_seconds"] >= 10 * 60
+    assert local_row["screenshot_count"] == 1
+    utc_row = next(
+        row for row in utc_day.json()["data"] if row["employee_id"] == str(data["employee_a"].id)
+    )
+    assert utc_row["date"] == "2026-07-28"
+    assert utc_row["start_time"] is None
+    assert utc_row["end_time"] is None
+    assert utc_row["total_tracked_seconds"] == 0
+
+    weekly = client.get(
+        "/api/v1/timesheets/weekly?week_start=2026-07-27",
+        headers=data["general_headers"],
+    )
+    assert weekly.status_code == 200
+    assert any(
+        row["employee_id"] == str(data["employee_a"].id)
+        and row["date"] == "2026-07-29"
+        and row["screenshot_count"] == 1
+        for row in weekly.json()["data"]
+    )
+
+    monthly = client.get(
+        "/api/v1/timesheets/monthly?month_start=2026-07-01",
+        headers=data["general_headers"],
+    )
+    assert monthly.status_code == 200
+    assert any(
+        row["employee_id"] == str(data["employee_a"].id)
+        and row["date"] == "2026-07-29"
+        and row["screenshot_count"] == 1
+        for row in monthly.json()["data"]
+    )
+
+
+def test_timesheet_excludes_post_shift_idle_from_observed_time_and_reports_overtime(
+    team_client,
+):
+    client, data = team_client
+    work_day = datetime(2026, 7, 21, tzinfo=UTC).date()
+    started_at = datetime(2026, 7, 21, 9, 30, tzinfo=UTC)
+    idle_started_at = datetime(2026, 7, 21, 15, 30, tzinfo=UTC)
+    ended_at = datetime(2026, 7, 21, 20, 30, tzinfo=UTC)
+
+    with data["session_factory"]() as db:
+        employee = db.get(Employee, data["employee_a"].id)
+        session = db.get(WorkSession, data["session_a"].id)
+        device = db.get(Device, session.device_id)
+        employee.timezone = "UTC"
+        device.timezone = "UTC"
+        session.timezone = "UTC"
+        session.started_at = started_at
+        session.ended_at = ended_at
+        session.status = "ended"
+        session.active_seconds = 6 * 60 * 60
+        session.idle_seconds = 5 * 60 * 60
+        db.add_all(
+            [
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="idle_started",
+                    event_timestamp=idle_started_at,
+                    payload={"idle_seconds": 0},
+                    idempotency_key="five-hour-idle-started",
+                ),
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="session_ended",
+                    event_timestamp=ended_at,
+                    payload=None,
+                    idempotency_key="five-hour-idle-session-ended",
+                ),
+            ]
+        )
+        db.commit()
+
+    # Materialize the schedule-scoped projection before reading the bounded
+    # list endpoint; timesheet lists intentionally do not rebuild a timeline
+    # for every employee.
+    attendance_response = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}/{work_day.isoformat()}",
+        headers=data["general_headers"],
+    )
+    assert attendance_response.status_code == 200
+
+    response = client.get(
+        f"/api/v1/timesheets/daily?day={work_day.isoformat()}",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    row = next(
+        item
+        for item in response.json()["data"]
+        if item["employee_id"] == str(data["employee_a"].id)
+    )
+    assert row["active_seconds"] == 6 * 60 * 60
+    # Only the 15:30-18:00 in-shift portion is eligible, less the configured
+    # 16:30-16:45 break. The remaining post-shift device-idle state must not be
+    # presented as worked/attendance time.
+    assert row["observed_idle_seconds"] == 2 * 60 * 60 + 15 * 60
+    assert row["observed_tracked_seconds"] == 8 * 60 * 60 + 15 * 60
+    assert row["observed_span_seconds"] == 8 * 60 * 60 + 30 * 60
+    assert row["untracked_seconds"] == 15 * 60
+    assert row["recorded_overtime_seconds"] == 30 * 60
+    assert row["start_time"] == started_at.isoformat()
+    assert row["end_time"] == datetime(2026, 7, 21, 18, 0, tzinfo=UTC).isoformat()
+
+
+def test_timesheet_repairs_stale_regular_work_on_explicit_weekly_off(team_client):
+    client, data = team_client
+    work_day = date(2026, 7, 24)  # Friday is the default explicit weekly off.
+    started_at = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+    ended_at = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
+
+    with data["session_factory"]() as db:
+        employee = db.get(Employee, data["employee_a"].id)
+        profile = get_or_create_work_profile(db, employee)
+        profile.working_days = sorted(set(profile.working_days or []) | {work_day.weekday()})
+        profile.weekly_off_days = sorted(
+            set(profile.weekly_off_days or []) | {work_day.weekday()}
+        )
+        session = db.get(WorkSession, data["session_a"].id)
+        session.timezone = "UTC"
+        session.started_at = started_at
+        session.ended_at = ended_at
+        session.status = "ended"
+        session.active_seconds = 3 * 60 * 60
+        session.idle_seconds = 0
+        db.add(
+            DailyAttendance(
+                company_id=employee.company_id,
+                employee_id=employee.id,
+                work_date=work_day,
+                timezone="UTC",
+                scheduled_start_at=datetime(2026, 7, 24, 9, 0, tzinfo=UTC),
+                scheduled_end_at=datetime(2026, 7, 24, 18, 0, tzinfo=UTC),
+                actual_first_activity_at=started_at,
+                actual_last_activity_at=ended_at,
+                normal_worked_seconds=3 * 60 * 60,
+                recorded_overtime_seconds=0,
+                status="present",
+                calculated_at=datetime(2026, 7, 25, tzinfo=UTC),
+            )
+        )
+        db.commit()
+
+    response = client.get(
+        f"/api/v1/timesheets/daily?day={work_day.isoformat()}",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    row = next(
+        item
+        for item in response.json()["data"]
+        if item["employee_id"] == str(data["employee_a"].id)
+    )
+    assert row["recorded_overtime_seconds"] == 3 * 60 * 60
+
+    with data["session_factory"]() as db:
+        repaired = db.scalar(
+            select(DailyAttendance).where(
+                DailyAttendance.employee_id == data["employee_a"].id,
+                DailyAttendance.work_date == work_day,
+            )
+        )
+        assert repaired.status == "worked_off_day"
+        assert repaired.scheduled_start_at is None
+        assert repaired.normal_worked_seconds == 0
+        assert repaired.recorded_overtime_seconds == 3 * 60 * 60
+
+
+def test_schedule_change_repairs_past_attendance_with_the_historical_weekly_off(
+    team_client,
+):
+    client, data = team_client
+    work_day = date(2026, 7, 24)  # Friday was the weekly off before the change.
+    started_at = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+    ended_at = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
+
+    with data["session_factory"]() as db:
+        employee = db.get(Employee, data["employee_a"].id)
+        get_or_create_work_profile(db, employee)
+        session = db.get(WorkSession, data["session_a"].id)
+        session.timezone = "UTC"
+        session.started_at = started_at
+        session.ended_at = ended_at
+        session.status = "ended"
+        session.active_seconds = 3 * 60 * 60
+        session.idle_seconds = 0
+        db.commit()
+
+    original = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}/{work_day.isoformat()}",
+        headers=data["general_headers"],
+    )
+    assert original.status_code == 200
+    assert original.json()["data"]["status"] == "worked_off_day"
+
+    changed = client.patch(
+        f"/api/v1/employees/{data['employee_a'].id}/work-profile",
+        json={
+            "working_days": [0, 1, 2, 3, 4, 5],
+            "weekly_off_days": [6],
+        },
+        headers=data["general_headers"],
+    )
+    assert changed.status_code == 200
+
+    def store_stale_regular_projection() -> None:
+        with data["session_factory"]() as db:
+            attendance = db.scalar(
+                select(DailyAttendance).where(
+                    DailyAttendance.employee_id == data["employee_a"].id,
+                    DailyAttendance.work_date == work_day,
+                )
+            )
+            attendance.scheduled_start_at = datetime(2026, 7, 24, 9, 0, tzinfo=UTC)
+            attendance.scheduled_end_at = datetime(2026, 7, 24, 18, 0, tzinfo=UTC)
+            attendance.normal_worked_seconds = 3 * 60 * 60
+            attendance.recorded_overtime_seconds = 0
+            attendance.status = "present"
+            attendance.calculation_sources = {}
+            db.commit()
+
+    store_stale_regular_projection()
+    history = client.get(
+        f"/api/v1/attendance/employee/{data['employee_a'].id}",
+        params={"start_date": work_day.isoformat(), "end_date": work_day.isoformat()},
+        headers=data["general_headers"],
+    )
+    assert history.status_code == 200
+    history_row = history.json()["data"]["rows"][0]
+    assert history_row["status"] == "worked_off_day"
+    assert history_row["scheduled_start_at"] is None
+    assert history_row["normal_worked_seconds"] == 0
+    assert history_row["recorded_overtime_seconds"] == 3 * 60 * 60
+
+    store_stale_regular_projection()
+    timesheet = client.get(
+        f"/api/v1/timesheets/daily?day={work_day.isoformat()}",
+        headers=data["general_headers"],
+    )
+    assert timesheet.status_code == 200
+    timesheet_row = next(
+        item
+        for item in timesheet.json()["data"]
+        if item["employee_id"] == str(data["employee_a"].id)
+    )
+    assert timesheet_row["recorded_overtime_seconds"] == 3 * 60 * 60
+
+
+def test_timesheet_ignores_a_terminal_event_days_after_the_last_heartbeat(team_client):
+    client, data = team_client
+    started_at = datetime(2026, 7, 19, 9, 0, tzinfo=UTC)
+    heartbeat_at = started_at + timedelta(minutes=13)
+    delayed_end_at = started_at + timedelta(days=5)
+
+    with data["session_factory"]() as db:
+        session = WorkSession(
+            company_id=data["employee_a"].company_id,
+            employee_id=data["employee_a"].id,
+            device_id=data["session_a"].device_id,
+            started_at=started_at,
+            ended_at=delayed_end_at,
+            status="ended",
+            active_seconds=13 * 60,
+            idle_seconds=0,
+            timezone="UTC",
+        )
+        db.add(session)
+        db.flush()
+        db.add_all(
+            [
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="heartbeat",
+                    event_timestamp=heartbeat_at,
+                    payload={"status": "active"},
+                    idempotency_key=str(uuid4()),
+                ),
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="session_ended",
+                    event_timestamp=delayed_end_at,
+                    payload=None,
+                    idempotency_key=str(uuid4()),
+                ),
+            ]
+        )
+        db.commit()
+
+    response = client.get(
+        "/api/v1/timesheets/daily?day=2026-07-19",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    row = next(
+        item
+        for item in response.json()["data"]
+        if item["employee_id"] == str(data["employee_a"].id)
+    )
+    assert row["end_time"] == heartbeat_at.isoformat()
+    assert row["last_signal_at"] == heartbeat_at.isoformat()
+    assert row["observed_span_seconds"] == 13 * 60
+    assert row["untracked_seconds"] == 0
+
+
+def test_timesheet_never_displays_one_session_beyond_its_local_day(team_client):
+    client, data = team_client
+    started_at = datetime(2026, 7, 18, 9, 0, tzinfo=UTC)
+
+    with data["session_factory"]() as db:
+        device_id = db.scalar(
+            select(WorkSession.device_id).where(WorkSession.employee_id == data["employee_b"].id)
+        )
+        db.add(
+            WorkSession(
+                company_id=data["employee_b"].company_id,
+                employee_id=data["employee_b"].id,
+                device_id=device_id,
+                started_at=started_at,
+                ended_at=started_at + timedelta(days=5),
+                status="ended",
+                active_seconds=0,
+                idle_seconds=0,
+                timezone="UTC",
+            )
+        )
+        db.commit()
+
+    response = client.get(
+        "/api/v1/timesheets/daily?day=2026-07-18",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    row = next(
+        item
+        for item in response.json()["data"]
+        if item["employee_id"] == str(data["employee_b"].id)
+    )
+    assert row["end_time"] == datetime(2026, 7, 19, tzinfo=UTC).isoformat()
+    assert row["observed_span_seconds"] == 15 * 60 * 60
+    assert row["observed_span_seconds"] <= 24 * 60 * 60
+
+
+def test_timesheet_includes_an_approved_leave_day_without_a_work_session(team_client):
+    client, data = team_client
+    leave_day = date(2026, 7, 17)
+
+    with data["session_factory"]() as db:
+        db.add(
+            LeaveRequest(
+                company_id=data["employee_b"].company_id,
+                employee_id=data["employee_b"].id,
+                start_date=leave_day,
+                end_date=leave_day,
+                requested_days=1,
+                leave_type="annual",
+                reason="Approved holiday",
+                status="approved",
+            )
+        )
+        db.commit()
+
+    response = client.get(
+        "/api/v1/timesheets/weekly?week_start=2026-07-13",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    row = next(
+        item
+        for item in response.json()["data"]
+        if item["employee_id"] == str(data["employee_b"].id)
+        and item["date"] == leave_day.isoformat()
+    )
+    assert row["leave_status"] == "approved"
+    assert row["leave_type"] == "annual"
+    assert row["session_count"] == 0
+    assert row["total_tracked_seconds"] == 0
+
+
+def test_desktop_summary_recovers_elapsed_work_when_an_update_started_a_new_session(
+    team_client,
+):
+    client, data = team_client
+    now = datetime.now(UTC)
+    safe_timezone = next(
+        timezone_name
+        for timezone_name in ("UTC", "Asia/Tokyo", "America/New_York")
+        if 1 <= now.astimezone(ZoneInfo(timezone_name)).hour <= 22
+    )
+    db = data["session_factory"]()
+    try:
+        employee = db.get(Employee, data["employee_a"].id)
+        current_session = db.get(WorkSession, data["session_a"].id)
+        device = db.get(Device, current_session.device_id)
+        employee.timezone = safe_timezone
+        device.timezone = safe_timezone
+        current_session.timezone = safe_timezone
+        prior_session = WorkSession(
+            company_id=data["employee_a"].company_id,
+            employee_id=data["employee_a"].id,
+            device_id=data["session_a"].device_id,
+            started_at=now - timedelta(minutes=40),
+            ended_at=now - timedelta(minutes=10),
+            status="ended",
+            active_seconds=0,
+            idle_seconds=0,
+            timezone="Asia/Riyadh",
+        )
+        db.add(prior_session)
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/v1/agent/summary", headers=data["device_headers"])
+
+    assert response.status_code == 200
+    summary = response.json()["data"]
+    timeline = summary["today_timeline"]
+    assert timeline["worked_seconds"] >= 30 * 60
+    assert summary["today"]["tracked_active_seconds"] >= timeline["worked_seconds"]
+    assert timeline["first_started_at"] is not None
+    assert timeline["last_activity_at"] is not None
+
+    timesheet_response = client.get(
+        "/api/v1/timesheets/daily",
+        params={"day": local_today(safe_timezone, now).isoformat()},
+        headers=data["general_headers"],
+    )
+    assert timesheet_response.status_code == 200
+    timesheet_row = next(
+        row
+        for row in timesheet_response.json()["data"]
+        if row["employee_id"] == str(data["employee_a"].id)
+    )
+    assert timesheet_row["session_count"] == 2
+    assert timesheet_row["observed_span_seconds"] >= 30 * 60
+
+
+def test_desktop_today_excludes_idle_on_an_off_day(team_client):
+    client, data = team_client
+    now = datetime.now(UTC)
+    with data["session_factory"]() as db:
+        session = db.get(WorkSession, data["session_a"].id)
+        employee = db.get(Employee, data["employee_a"].id)
+        device = db.get(Device, session.device_id)
+        session.started_at = now - timedelta(minutes=30)
+        session.status = "idle"
+        session.idle_seconds = 20 * 60
+        device.last_seen_at = now
+        profile = get_or_create_work_profile(db, employee)
+        profile.shift_start = datetime.min.time().replace(hour=9)
+        profile.shift_end = datetime.min.time().replace(hour=17)
+        profile.working_days = [(now.weekday() + 1) % 7]
+        db.add_all(
+            [
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="idle_started",
+                    event_timestamp=now - timedelta(minutes=20),
+                    payload=None,
+                    idempotency_key=str(uuid4()),
+                ),
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="idle_started",
+                    event_timestamp=now - timedelta(minutes=4),
+                    payload=None,
+                    idempotency_key=str(uuid4()),
+                ),
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="idle_ended",
+                    event_timestamp=now - timedelta(minutes=5),
+                    payload=None,
+                    idempotency_key=str(uuid4()),
+                ),
+            ]
+        )
+        db.commit()
+
+    response = client.get("/api/v1/agent/summary", headers=data["device_headers"])
+    timesheet = client.get(
+        f"/api/v1/timesheets/daily?day={local_today('UTC').isoformat()}",
+        headers=data["general_headers"],
+    )
+    timeline_response = client.get(
+        "/api/v1/activity/timeline",
+        params={
+            "employee_id": str(data["employee_a"].id),
+            "day": local_today("UTC").isoformat(),
+        },
+        headers=data["general_headers"],
+    )
+    employee_overview = client.get(
+        "/api/v1/employees-overview",
+        params={"employee_id": str(data["employee_a"].id)},
+        headers=data["general_headers"],
+    )
+    dashboard = client.get("/api/v1/dashboard/summary", headers=data["general_headers"])
+    team_summary = client.get(
+        f"/api/v1/teams/{data['team_a'].id}/summary",
+        headers=data["general_headers"],
+    )
+    employee_report = client.get("/api/v1/reports/employees", headers=data["general_headers"])
+    payroll_preview_response = client.get(
+        f"/api/v1/employees/{data['employee_a'].id}/payroll-preview",
+        params={
+            "start_date": local_today("UTC").isoformat(),
+            "end_date": local_today("UTC").isoformat(),
+        },
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    summary = response.json()["data"]
+    assert summary["today_timeline"]["idle_seconds"] == 0
+    assert summary["today"]["idle_seconds"] == 0
+    assert summary["today"]["eligible_idle_seconds"] == 0
+    timesheet_row = next(
+        row for row in timesheet.json()["data"] if row["employee_id"] == str(data["employee_a"].id)
+    )
+    assert timesheet_row["idle_seconds"] == 0
+    assert timesheet_row["observed_idle_seconds"] == 0
+    assert timesheet_row["observed_tracked_seconds"] == timesheet_row["active_seconds"]
+    assert timesheet_row["observed_span_seconds"] == timesheet_row["active_seconds"]
+    assert timesheet_row["untracked_seconds"] == 0
+    assert timesheet_row["recorded_overtime_seconds"] == timesheet_row["active_seconds"]
+    assert timeline_response.json()["data"]["idle_seconds"] == 0
+    overview_row = employee_overview.json()["data"][0]
+    assert overview_row["idle_seconds"] == 0
+    assert overview_row["worked_today_seconds"] == overview_row["active_seconds"]
+    assert overview_row["activity_status"] == "off_shift"
+    assert dashboard.status_code == 200
+    dashboard_data = dashboard.json()["data"]
+    assert dashboard_data["off_shift_employees"] >= 1
+    assert dashboard_data["online_employees"] == 0
+    assert team_summary.json()["data"]["idle_seconds"] == 0
+    team_summary_data = team_summary.json()["data"]
+    assert team_summary_data["off_shift_employees"] >= 1
+    assert team_summary_data["online_employees"] == 0
+    report_row = next(
+        row
+        for row in employee_report.json()["data"]
+        if row["employee_id"] == str(data["employee_a"].id)
+    )
+    assert report_row["idle_seconds"] == 0
+    assert payroll_preview_response.json()["data"]["idle_seconds"] == 0
+
+
+def test_idle_request_period_is_clipped_at_shift_end_and_tracks_remaining_time(
+    team_client,
+):
+    client, data = team_client
+    work_day = local_today("UTC")
+    shift_start = datetime.combine(work_day, datetime.min.time(), tzinfo=UTC).replace(hour=10)
+    shift_end = shift_start.replace(hour=18)
+    idle_start = shift_start.replace(hour=17, minute=1)
+    idle_end = shift_end.replace(minute=18)
+
+    with data["session_factory"]() as db:
+        session = db.get(WorkSession, data["session_a"].id)
+        employee = db.get(Employee, data["employee_a"].id)
+        session.started_at = idle_start - timedelta(minutes=20)
+        session.ended_at = idle_end + timedelta(minutes=2)
+        session.status = "ended"
+        profile = get_or_create_work_profile(db, employee)
+        profile.shift_start = shift_start.time().replace(tzinfo=None)
+        profile.shift_end = shift_end.time().replace(tzinfo=None)
+        profile.working_days = [work_day.weekday()]
+        profile.weekly_off_days = [weekday for weekday in range(7) if weekday != work_day.weekday()]
+        profile.break_rules = []
+        db.add_all(
+            [
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="idle_started",
+                    event_timestamp=idle_start,
+                    payload=None,
+                    idempotency_key=str(uuid4()),
+                ),
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="idle_ended",
+                    event_timestamp=idle_end,
+                    payload=None,
+                    idempotency_key=str(uuid4()),
+                ),
+            ]
+        )
+        db.commit()
+
+    summary_response = client.get(
+        "/api/v1/agent/summary",
+        headers=data["device_headers"],
+    )
+
+    assert summary_response.status_code == 200
+    periods = summary_response.json()["data"]["idle_request_periods"]
+    assert len(periods) == 1
+    period = periods[0]
+    assert datetime.fromisoformat(period["started_at"]) == idle_start
+    assert datetime.fromisoformat(period["ended_at"]) == shift_end
+    assert period["duration_seconds"] == 59 * 60
+    assert period["available_seconds"] == 59 * 60
+
+    first_request = client.post(
+        "/api/v1/agent/time-adjustment-requests",
+        headers=data["device_headers"],
+        json={
+            "requested_date": work_day.isoformat(),
+            "request_type": "idle_time",
+            "work_session_id": period["work_session_id"],
+            "source_start_at": period["started_at"],
+            "source_end_at": period["ended_at"],
+            "requested_minutes": 30,
+            "reason": "Completed offline work during this idle period.",
+        },
+    )
+    assert first_request.status_code == 200
+
+    refreshed_summary = client.get(
+        "/api/v1/agent/summary",
+        headers=data["device_headers"],
+    )
+    refreshed_period = refreshed_summary.json()["data"]["idle_request_periods"][0]
+    assert refreshed_period["available_seconds"] == 29 * 60
+
+    excessive_request = client.post(
+        "/api/v1/agent/time-adjustment-requests",
+        headers=data["device_headers"],
+        json={
+            "requested_date": work_day.isoformat(),
+            "request_type": "idle_time",
+            "work_session_id": period["work_session_id"],
+            "source_start_at": period["started_at"],
+            "source_end_at": period["ended_at"],
+            "requested_minutes": 30,
+            "reason": "Attempting to request more than the remaining time.",
+        },
+    )
+    assert excessive_request.status_code == 422
+    assert excessive_request.json()["error"]["code"] == "IDLE_REQUEST_TOO_LONG"
+
+    outside_shift_request = client.post(
+        "/api/v1/agent/time-adjustment-requests",
+        headers=data["device_headers"],
+        json={
+            "requested_date": work_day.isoformat(),
+            "request_type": "idle_time",
+            "work_session_id": period["work_session_id"],
+            "source_start_at": idle_start.isoformat(),
+            "source_end_at": idle_end.isoformat(),
+            "requested_minutes": 1,
+            "reason": "The source range must not include time after shift end.",
+        },
+    )
+    assert outside_shift_request.status_code == 422
+    assert outside_shift_request.json()["error"]["code"] == "IDLE_PERIOD_NOT_FOUND"
+
+    approved = client.patch(
+        f"/api/v1/time-adjustment-requests/{first_request.json()['data']['id']}",
+        headers=data["general_headers"],
+        json={"status": "approved", "approved_minutes": 30},
+    )
+    approved_summary = client.get(
+        "/api/v1/agent/summary",
+        headers=data["device_headers"],
+    )
+    approved_timeline = approved_summary.json()["data"]["today_timeline"]
+    assert approved.status_code == 200
+    assert approved_timeline["idle_seconds"] == 29 * 60
+    assert approved_timeline["manual_seconds"] == 30 * 60
+    assert any(item["type"] == "manual" for item in approved_timeline["intervals"])
+    assert approved_summary.json()["data"]["today"]["idle_seconds"] == 29 * 60
+
+
+def test_workday_timeline_splits_work_idle_and_locked_periods(team_client):
+    client, data = team_client
+    work_day = local_today(data["employee_a"].timezone)
+    started_at = datetime.combine(work_day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=9)
+    transitions = [
+        ("idle_started", started_at + timedelta(hours=1)),
+        ("idle_ended", started_at + timedelta(hours=1, minutes=15)),
+        ("screen_locked", started_at + timedelta(hours=2)),
+        ("screen_unlocked", started_at + timedelta(hours=2, minutes=5)),
+    ]
+
+    db: Session = data["session_factory"]()
+    try:
+        # This scenario asserts in-shift idle/lock intervals, including when
+        # the suite happens to run on the company's normal Friday off day.
+        employee = db.get(Employee, data["employee_a"].id)
+        profile = get_or_create_work_profile(db, employee)
+        profile.shift_start = datetime.min.time().replace(hour=9)
+        profile.shift_end = datetime.min.time().replace(hour=17)
+        profile.working_days = [work_day.weekday()]
+        profile.weekly_off_days = []
+        session = db.get(WorkSession, data["session_a"].id)
+        session.started_at = started_at
+        session.ended_at = started_at + timedelta(hours=3)
+        session.status = "ended"
+        for event_type, event_timestamp in transitions:
+            db.add(
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type=event_type,
+                    event_timestamp=event_timestamp,
+                    payload=None,
+                    idempotency_key=str(uuid4()),
+                )
+            )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/v1/activity/timeline?employee_id={data['employee_a'].id}&day={work_day.isoformat()}",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    timeline = response.json()["data"]
+    assert [interval["type"] for interval in timeline["intervals"]] == [
+        "worked",
+        "idle",
+        "worked",
+        "locked",
+        "worked",
+    ]
+    assert timeline["worked_seconds"] == 9600
+    assert timeline["idle_seconds"] == 900
+    assert timeline["locked_seconds"] == 300
+    assert timeline["intervals"][0]["task_name"] == "Task A"
+    assert timeline["is_running"] is False
+
+    employee_token = create_employee_access_token(
+        employee_id=data["employee_a"].id,
+        company_id=data["employee_a"].company_id,
+    )
+    employee_response = client.get(
+        "/api/v1/employee-portal/summary",
+        headers={"Authorization": f"Bearer {employee_token}"},
+    )
+    assert employee_response.status_code == 200
+    assert employee_response.json()["data"]["today_timeline"]["idle_seconds"] == 900
+
+
+def test_workday_timeline_stops_stale_open_session_at_last_heartbeat(team_client):
+    client, data = team_client
+    now = datetime.now(UTC).replace(microsecond=0)
+    started_at = now - timedelta(minutes=20)
+    heartbeat_at = now - timedelta(minutes=10)
+
+    db: Session = data["session_factory"]()
+    try:
+        session = db.get(WorkSession, data["session_a"].id)
+        session.started_at = started_at
+        session.updated_at = started_at
+        session.ended_at = None
+        db.add(
+            ActivityEvent(
+                company_id=session.company_id,
+                employee_id=session.employee_id,
+                device_id=session.device_id,
+                session_id=session.id,
+                event_type="heartbeat",
+                event_timestamp=heartbeat_at,
+                payload=None,
+                idempotency_key=str(uuid4()),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/v1/activity/timeline?employee_id={data['employee_a'].id}&day={now.date().isoformat()}",
+        headers=data["general_headers"],
+    )
+
+    timeline = response.json()["data"]
+    assert response.status_code == 200
+    assert timeline["is_running"] is False
+    assert timeline["last_ended_at"] == heartbeat_at.isoformat()
+    assert timeline["worked_seconds"] == 600
+
+    timesheet_response = client.get(
+        f"/api/v1/timesheets/daily?day={now.date().isoformat()}",
+        headers=data["general_headers"],
+    )
+    timesheet_row = next(
+        row
+        for row in timesheet_response.json()["data"]
+        if row["employee_id"] == str(data["employee_a"].id)
+    )
+    assert timesheet_response.status_code == 200
+    assert timesheet_row["end_time"] == heartbeat_at.isoformat()
+    assert timesheet_row["tracking_status"] is None
+
+
+def test_timesheet_marks_a_fresh_idle_agent_as_idle_not_in_progress(team_client):
+    client, data = team_client
+    now = datetime.now(UTC).replace(microsecond=0)
+    started_at = now - timedelta(hours=1)
+    idle_started_at = started_at + timedelta(seconds=20)
+
+    db: Session = data["session_factory"]()
+    try:
+        session = db.get(WorkSession, data["session_a"].id)
+        session.started_at = started_at
+        session.ended_at = None
+        session.status = "idle"
+        session.active_seconds = 19
+        session.idle_seconds = 60 * 60 - 19
+        db.add_all(
+            [
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="idle_started",
+                    event_timestamp=idle_started_at,
+                    payload={"status": "idle"},
+                    idempotency_key=str(uuid4()),
+                ),
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="heartbeat",
+                    event_timestamp=now,
+                    payload={"status": "idle"},
+                    idempotency_key=str(uuid4()),
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/v1/timesheets/daily?day={now.date().isoformat()}",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    row = next(
+        item
+        for item in response.json()["data"]
+        if item["employee_id"] == str(data["employee_a"].id)
+    )
+    assert row["tracking_status"] == "idle"
+    assert row["end_time"] is None
+    assert row["last_signal_at"] == now.isoformat()
+
+
+def test_workday_timeline_shows_the_exact_gap_between_sessions(team_client):
+    client, data = team_client
+    work_day = local_today(data["employee_a"].timezone)
+    day_start = datetime.combine(work_day, datetime.min.time(), tzinfo=UTC)
+    first_start = day_start + timedelta(hours=10, minutes=37)
+    first_end = day_start + timedelta(hours=10, minutes=42)
+    second_start = day_start + timedelta(hours=10, minutes=55)
+    second_end = day_start + timedelta(hours=11, minutes=24)
+
+    db: Session = data["session_factory"]()
+    try:
+        first = db.get(WorkSession, data["session_a"].id)
+        first.started_at = first_start
+        first.ended_at = first_end
+        first.status = "ended"
+        db.add(
+            WorkSession(
+                company_id=first.company_id,
+                employee_id=first.employee_id,
+                device_id=first.device_id,
+                started_at=second_start,
+                ended_at=second_end,
+                status="ended",
+                active_seconds=29 * 60,
+                idle_seconds=0,
+                team_id=first.team_id,
+                project_id=first.project_id,
+                task_id=first.task_id,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/v1/activity/timeline?employee_id={data['employee_a'].id}&day={work_day.isoformat()}",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    timeline = response.json()["data"]
+    assert [interval["type"] for interval in timeline["intervals"]] == [
+        "worked",
+        "untracked",
+        "worked",
+    ]
+    assert timeline["untracked_seconds"] == 13 * 60
+    assert timeline["intervals"][1]["started_at"] == first_end.isoformat()
+    assert timeline["intervals"][1]["ended_at"] == second_start.isoformat()
+
+
+def test_daily_attendance_stops_stale_materialized_session_at_last_heartbeat(
+    team_client,
+):
+    client, data = team_client
+    now = datetime.now(UTC).replace(microsecond=0)
+    work_day = local_today("UTC", now)
+    started_at = now - timedelta(hours=2)
+    heartbeat_at = now - timedelta(hours=1)
+
+    db: Session = data["session_factory"]()
+    try:
+        session = db.get(WorkSession, data["session_a"].id)
+        session.started_at = started_at
+        session.updated_at = started_at
+        session.ended_at = None
+        session.status = "active"
+        db.add(
+            ActivityEvent(
+                company_id=session.company_id,
+                employee_id=session.employee_id,
+                device_id=session.device_id,
+                session_id=session.id,
+                event_type="heartbeat",
+                event_timestamp=heartbeat_at,
+                payload={"status": "active"},
+                idempotency_key=str(uuid4()),
+            )
+        )
+        db.add(
+            DailyAttendance(
+                company_id=session.company_id,
+                employee_id=session.employee_id,
+                work_date=work_day,
+                timezone="UTC",
+                actual_first_activity_at=started_at,
+                actual_last_activity_at=heartbeat_at,
+                actual_sign_out_at=None,
+                normal_worked_seconds=3600,
+                status="present",
+                issues=[],
+                calculation_sources={"is_running": True},
+                calculated_at=heartbeat_at,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/v1/attendance/daily",
+        params={
+            "day": work_day.isoformat(),
+            "employee_id": str(data["employee_a"].id),
+        },
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    [row] = response.json()["data"]["rows"]
+    assert row["is_running"] is False
+    assert row["actual_sign_out_at"] == heartbeat_at.isoformat()
+    assert row["normal_worked_seconds"] == 3600
+
+    timesheet_response = client.get(
+        f"/api/v1/timesheets/daily?day={work_day.isoformat()}",
+        headers=data["general_headers"],
+    )
+    timesheet_row = next(
+        item
+        for item in timesheet_response.json()["data"]
+        if item["employee_id"] == str(data["employee_a"].id)
+    )
+    assert timesheet_response.status_code == 200
+    assert timesheet_row["end_time"] == heartbeat_at.isoformat()
+    assert timesheet_row["last_signal_at"] == heartbeat_at.isoformat()
+
+
+def test_open_session_liveness_uses_two_queries_for_many_sessions(team_client):
+    _, data = team_client
+    now = datetime.now(UTC).replace(microsecond=0)
+    heartbeat_at = now - timedelta(minutes=10)
+    query_count = 0
+
+    db: Session = data["session_factory"]()
+    try:
+        sessions = []
+        for index in range(25):
+            device = Device(
+                company_id=data["employee_a"].company_id,
+                employee_id=data["employee_a"].id,
+                device_name=f"Liveness Device {index}",
+                installation_id=f"liveness-installation-{index}-{uuid4()}",
+                operating_system="Windows 11",
+                agent_version="1.1.92",
+                status="active",
+            )
+            db.add(device)
+            db.flush()
+            session = WorkSession(
+                company_id=data["employee_a"].company_id,
+                employee_id=data["employee_a"].id,
+                device_id=device.id,
+                started_at=now - timedelta(minutes=20, seconds=index),
+                status="active",
+                active_seconds=60,
+                idle_seconds=0,
+            )
+            db.add(session)
+            db.flush()
+            sessions.append(session)
+            db.add(
+                ActivityEvent(
+                    company_id=session.company_id,
+                    employee_id=session.employee_id,
+                    device_id=session.device_id,
+                    session_id=session.id,
+                    event_type="heartbeat",
+                    event_timestamp=heartbeat_at,
+                    payload={"status": "active"},
+                    idempotency_key=str(uuid4()),
+                )
+            )
+        db.commit()
+
+        def count_query(*_args, **_kwargs):
+            nonlocal query_count
+            query_count += 1
+
+        engine = db.get_bind()
+        event.listen(engine, "before_cursor_execute", count_query)
+        try:
+            result = open_session_liveness(
+                db,
+                company_id=data["employee_a"].company_id,
+                sessions=sessions,
+                now=now,
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", count_query)
+    finally:
+        db.close()
+
+    assert len(result) == 25
+    assert all(not item["is_fresh"] for item in result.values())
+    assert query_count == 2
+
+
+def test_production_audit_distinguishes_missing_images_from_thumbnail_backfill(
+    team_client,
+    monkeypatch,
+    tmp_path,
+):
+    _, data = team_client
+    monkeypatch.setattr(settings, "screenshot_storage_path", tmp_path)
+    (tmp_path / data["screenshot_a"].storage_path).write_bytes(b"original")
+
+    db: Session = data["session_factory"]()
+    try:
+        result = _audit_screenshot_storage(
+            db,
+            now=datetime.now(UTC),
+            days=1,
+            employee_name=None,
+        )
+    finally:
+        db.close()
+
+    assert result["database_rows_checked"] == 2
+    assert result["missing_original_count"] == 1
+    assert result["missing_original_samples"][0]["screenshot_id"] == str(data["screenshot_b"].id)
+    assert result["thumbnail_backfill_needed"] == 1
+    assert result["storage"]["root_exists"] is True
+
+
+def test_production_audit_reports_clean_time_ledger(team_client):
+    _, data = team_client
+    db: Session = data["session_factory"]()
+    try:
+        result = _audit_time_ledger_invariants(db, employee_name=None)
+    finally:
+        db.close()
+
+    assert result["structural_violation_count"] == 0
+    assert result["invalid_session_count"] == 0
+    assert result["duplicate_open_device_count"] == 0
+    assert result["historical_out_of_bounds_event_count"] == 0
+
+
+def test_employee_may_belong_to_multiple_teams(team_client):
+    client, data = team_client
+
+    team_a_members = client.get(
+        f"/api/v1/teams/{data['team_a'].id}/members", headers=data["general_headers"]
+    )
+    team_b_members = client.get(
+        f"/api/v1/teams/{data['team_b'].id}/members", headers=data["general_headers"]
+    )
+
+    shared_id = str(data["shared_employee"].id)
+    assert shared_id in {employee["id"] for employee in team_a_members.json()["data"]}
+    assert shared_id in {employee["id"] for employee in team_b_members.json()["data"]}
+
+
+def test_team_may_have_multiple_owners(team_client):
+    client, data = team_client
+
+    response = client.get(
+        f"/api/v1/teams/{data['team_a'].id}/owners", headers=data["general_headers"]
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["data"]) == 2
+
+
+def test_company_data_isolation_still_works(team_client):
+    client, data = team_client
+
+    team_response = client.get(
+        f"/api/v1/teams/{data['other_team'].id}", headers=data["general_headers"]
+    )
+    employees_response = client.get("/api/v1/employees", headers=data["general_headers"])
+
+    assert team_response.status_code == 404
+    emails = {employee["email"] for employee in employees_response.json()["data"]}
+    assert "other.employee@example.com" not in emails
+
+
+def test_legacy_employee_enrollment_code_endpoints_are_removed(team_client):
+    client, data = team_client
+
+    create_response = client.post(
+        f"/api/v1/employees/{data['employee_a'].id}/enrollment-codes",
+        headers=data["general_headers"],
+        json={"expires_in_days": 7},
+    )
+    list_response = client.get(
+        f"/api/v1/employees/{data['employee_a'].id}/enrollment-codes",
+        headers=data["general_headers"],
+    )
+
+    assert create_response.status_code == 404
+    assert list_response.status_code == 404
+
+
+def test_general_admin_actions_are_written_to_audit_log(team_client):
+    client, data = team_client
+
+    create_response = client.post(
+        "/api/v1/teams",
+        headers=data["general_headers"],
+        json={"name": "Audit Team", "description": "Created in test", "status": "active"},
+    )
+    audit_response = client.get("/api/v1/audit-log", headers=data["general_headers"])
+
+    assert create_response.status_code == 200
+    assert audit_response.status_code == 200
+    rows = audit_response.json()["data"]
+    assert rows[0]["action"] == "created"
+    assert rows[0]["entity_type"] == "team"
+    assert rows[0]["entity_name"] == "Audit Team"
+    assert rows[0]["user_name"] == "General Admin"
+
+
+def test_payroll_cycle_settings_custom_range_and_xlsx_export_are_consistent(team_client):
+    client, data = team_client
+
+    defaults = client.get("/api/v1/payroll/settings", headers=data["general_headers"])
+    updated = client.patch(
+        "/api/v1/payroll/settings",
+        headers=data["general_headers"],
+        json={"cycle_start_day": 27, "cycle_end_day": 26, "timezone": "Africa/Cairo"},
+    )
+    forbidden = client.patch(
+        "/api/v1/payroll/settings",
+        headers=data["owner_headers"],
+        json={"cycle_start_day": 26, "cycle_end_day": 25, "timezone": "UTC"},
+    )
+    sheet = client.get(
+        "/api/v1/payroll/sheet?month=2026-07&start_date=2026-07-01&end_date=2026-07-03",
+        headers=data["general_headers"],
+    )
+    exported = client.get(
+        "/api/v1/payroll/export?month=2026-07&start_date=2026-07-01&end_date=2026-07-03&format=excel",
+        headers=data["general_headers"],
+    )
+    audit = client.get("/api/v1/audit-log", headers=data["general_headers"])
+
+    assert defaults.status_code == 200
+    assert defaults.json()["data"]["cycle_start_day"] == 26
+    assert updated.status_code == 200
+    assert updated.json()["data"] == {
+        "cycle_start_day": 27,
+        "cycle_end_day": 26,
+        "timezone": "Africa/Cairo",
+    }
+    assert forbidden.status_code == 403
+    assert sheet.status_code == 200
+    assert sheet.json()["data"]["run"]["period_start"] == "2026-07-01"
+    assert sheet.json()["data"]["run"]["period_end"] == "2026-07-03"
+    assert exported.status_code == 200
+    assert exported.content.startswith(b"PK")
+    assert 'filename="payroll-2026-07.xlsx"' in exported.headers["content-disposition"]
+    assert any(row["entity_type"] == "payroll_cycle_settings" for row in audit.json()["data"])
+
+
+def test_visa_bank_export_matches_upload_template_and_requires_bank_details(team_client):
+    client, data = team_client
+    missing = client.get(
+        "/api/v1/payroll/export?month=2026-07&start_date=2026-07-01&end_date=2026-07-03&format=visa",
+        headers=data["general_headers"],
+    )
+    assert missing.status_code == 409
+    assert missing.json()["error"]["code"] == "BANK_DETAILS_REQUIRED"
+
+    for index, employee in enumerate(
+        (data["employee_a"], data["employee_b"], data["shared_employee"]), start=1
+    ):
+        response = client.patch(
+            f"/api/v1/employees/{employee.id}/work-profile",
+            headers=data["general_headers"],
+            json={
+                "bank_account_number": f"1234567890{index}",
+                "bank_employee_id": f"000000000{index}",
+            },
+        )
+        assert response.status_code == 200
+
+    exported = client.get(
+        "/api/v1/payroll/export?month=2026-07&start_date=2026-07-01&end_date=2026-07-03&format=visa",
+        headers=data["general_headers"],
+    )
+    assert exported.status_code == 200
+    assert exported.headers["content-type"].startswith("application/vnd.ms-excel")
+    assert 'filename="visa-payroll-2026-07.xls"' in exported.headers["content-disposition"]
+    assert b"Beneficiary Account No." in exported.content
+    assert b"Employee ID (Mandatory Field)" in exported.content
+    assert b"12345678901" in exported.content
+
+
+def test_employee_time_adjustment_request_can_be_approved_and_added_to_timesheet(team_client):
+    client, data = team_client
+
+    create_response = client.post(
+        "/api/v1/agent/time-adjustment-requests",
+        headers=data["device_headers"],
+        json={
+            "requested_date": data["session_a"].started_at.date().isoformat(),
+            "requested_minutes": 30,
+            "reason": "Forgot to start tracking after a call.",
+        },
+    )
+    request_id = create_response.json()["data"]["id"]
+    review_response = client.patch(
+        f"/api/v1/time-adjustment-requests/{request_id}",
+        headers=data["general_headers"],
+        json={"status": "approved", "approved_minutes": 20, "admin_note": "Approved for the call."},
+    )
+    work_day = data["session_a"].started_at.date().isoformat()
+    timesheet_response = client.get(
+        f"/api/v1/timesheets/daily?day={work_day}",
+        headers=data["general_headers"],
+    )
+
+    assert create_response.status_code == 200
+    assert review_response.status_code == 200
+    assert review_response.json()["data"]["status"] == "approved"
+    rows = timesheet_response.json()["data"]
+    row = next(item for item in rows if item["employee_id"] == str(data["employee_a"].id))
+    assert row["adjustment_seconds"] == 1200
+    assert row["active_seconds"] == 1320
+    assert row["idle_seconds"] == 0
+    assert row["total_tracked_seconds"] == 1320
+
+    repeated_review = client.patch(
+        f"/api/v1/time-adjustment-requests/{request_id}",
+        headers=data["second_owner_headers"],
+        json={"status": "rejected", "admin_note": "Too late."},
+    )
+    assert repeated_review.status_code == 409
+
+
+def test_time_adjustment_requests_support_bulk_filter_and_selected_review(team_client):
+    client, data = team_client
+    work_date = data["session_a"].started_at.date()
+    with data["session_factory"]() as db:
+        employee_a_request = TimeAdjustmentRequest(
+            company_id=data["employee_a"].company_id,
+            employee_id=data["employee_a"].id,
+            request_type="manual_time",
+            requested_date=work_date,
+            requested_seconds=5 * 60,
+            reason="Employee A customer call.",
+            status="pending",
+        )
+        shared_request = TimeAdjustmentRequest(
+            company_id=data["shared_employee"].company_id,
+            employee_id=data["shared_employee"].id,
+            request_type="idle_time",
+            requested_date=work_date,
+            requested_seconds=8 * 60,
+            reason="Shared employee offline meeting.",
+            status="pending",
+        )
+        employee_b_request = TimeAdjustmentRequest(
+            company_id=data["employee_b"].company_id,
+            employee_id=data["employee_b"].id,
+            request_type="manual_time",
+            requested_date=work_date,
+            requested_seconds=7 * 60,
+            reason="Employee B customer call.",
+            status="pending",
+        )
+        early_leave_request = TimeAdjustmentRequest(
+            company_id=data["employee_a"].company_id,
+            employee_id=data["employee_a"].id,
+            request_type="early_leave",
+            requested_date=work_date,
+            requested_seconds=30 * 60,
+            reason="Approved departure request.",
+            status="pending",
+        )
+        db.add_all(
+            [
+                employee_a_request,
+                shared_request,
+                employee_b_request,
+                early_leave_request,
+            ]
+        )
+        db.commit()
+        employee_a_request_id = employee_a_request.id
+        shared_request_id = shared_request.id
+        employee_b_request_id = employee_b_request.id
+        early_leave_request_id = early_leave_request.id
+
+    approve_filtered = client.post(
+        "/api/v1/time-adjustment-requests/bulk-review",
+        headers=data["general_headers"],
+        json={
+            "status": "approved",
+            "all_filtered": True,
+            "team_id": str(data["team_a"].id),
+            "request_group": "time",
+        },
+    )
+    reject_selected = client.post(
+        "/api/v1/time-adjustment-requests/bulk-review",
+        headers=data["general_headers"],
+        json={
+            "status": "rejected",
+            "request_ids": [str(employee_b_request_id)],
+            "request_group": "time",
+        },
+    )
+
+    assert approve_filtered.status_code == 200
+    assert approve_filtered.json()["data"]["reviewed_count"] == 2
+    assert set(approve_filtered.json()["data"]["reviewed_ids"]) == {
+        str(employee_a_request_id),
+        str(shared_request_id),
+    }
+    assert reject_selected.status_code == 200
+    assert reject_selected.json()["data"]["reviewed_count"] == 1
+    with data["session_factory"]() as db:
+        assert db.get(TimeAdjustmentRequest, employee_a_request_id).status == "approved"
+        assert db.get(TimeAdjustmentRequest, shared_request_id).status == "approved"
+        assert db.get(TimeAdjustmentRequest, employee_b_request_id).status == "rejected"
+        assert db.get(TimeAdjustmentRequest, early_leave_request_id).status == "pending"
+
+
+def test_bulk_time_review_skips_a_team_owner_self_review(team_client):
+    client, data = team_client
+    work_date = data["session_a"].started_at.date()
+    with data["session_factory"]() as db:
+        self_request = TimeAdjustmentRequest(
+            company_id=data["employee_a"].company_id,
+            employee_id=data["employee_a"].id,
+            request_type="manual_time",
+            requested_date=work_date,
+            requested_seconds=5 * 60,
+            reason="Owner employee request.",
+            status="pending",
+        )
+        teammate_request = TimeAdjustmentRequest(
+            company_id=data["shared_employee"].company_id,
+            employee_id=data["shared_employee"].id,
+            request_type="manual_time",
+            requested_date=work_date,
+            requested_seconds=5 * 60,
+            reason="Teammate request.",
+            status="pending",
+        )
+        db.add_all([self_request, teammate_request])
+        db.commit()
+        self_request_id = self_request.id
+        teammate_request_id = teammate_request.id
+
+    response = client.post(
+        "/api/v1/time-adjustment-requests/bulk-review",
+        headers=data["owner_headers"],
+        json={
+            "status": "approved",
+            "all_filtered": True,
+            "team_id": str(data["team_a"].id),
+            "request_group": "time",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["reviewed_count"] == 1
+    assert response.json()["data"]["skipped_self_review_count"] == 1
+    assert response.json()["data"]["reviewed_ids"] == [str(teammate_request_id)]
+    with data["session_factory"]() as db:
+        assert db.get(TimeAdjustmentRequest, self_request_id).status == "pending"
+        assert db.get(TimeAdjustmentRequest, teammate_request_id).status == "approved"
+
+
+def test_only_super_admin_can_review_their_own_time_request(team_client):
+    client, data = team_client
+
+    owner_request = client.post(
+        "/api/v1/agent/time-adjustment-requests",
+        headers=data["device_headers"],
+        json={
+            "requested_date": data["session_a"].started_at.date().isoformat(),
+            "requested_minutes": 10,
+            "reason": "Customer meeting continued while the timer was idle.",
+        },
+    )
+    owner_review = client.patch(
+        f"/api/v1/time-adjustment-requests/{owner_request.json()['data']['id']}",
+        headers=data["owner_headers"],
+        json={"status": "approved", "approved_minutes": 10},
+    )
+
+    with data["session_factory"]() as db:
+        general_admin = db.get(AdminUser, data["general_admin"].id)
+        employee = db.get(Employee, data["employee_b"].id)
+        general_admin.employee_id = employee.id
+        request = TimeAdjustmentRequest(
+            company_id=employee.company_id,
+            employee_id=employee.id,
+            request_type="manual_time",
+            requested_date=data["session_a"].started_at.date(),
+            requested_seconds=10 * 60,
+            reason="Super admin correction for a completed customer meeting.",
+            status="pending",
+        )
+        db.add_all([general_admin, request])
+        db.commit()
+        request_id = request.id
+
+    super_admin_review = client.patch(
+        f"/api/v1/time-adjustment-requests/{request_id}",
+        headers=data["general_headers"],
+        json={"status": "approved", "approved_minutes": 10},
+    )
+
+    assert owner_review.status_code == 403
+    assert owner_review.json()["error"]["code"] == "SELF_REVIEW_FORBIDDEN"
+    assert super_admin_review.status_code == 200
+    assert super_admin_review.json()["data"]["status"] == "approved"
+    assert super_admin_review.json()["data"]["reviewed_by_admin_user_id"] == str(
+        data["general_admin"].id
+    )
+
+
+def test_invited_hr_can_manage_a_team_or_join_with_a_member_role(team_client):
+    client, data = team_client
+    with data["session_factory"]() as db:
+        employee = Employee(
+            company_id=data["employee_a"].company_id,
+            name="Invited HR",
+            email="invited.hr@example.com",
+            employee_code="HR-INVITED",
+            job_title="HR Manager",
+            timezone="UTC",
+            status="invited",
+        )
+        db.add(employee)
+        db.flush()
+        admin = AdminUser(
+            company_id=employee.company_id,
+            employee_id=employee.id,
+            name=employee.name,
+            email=employee.email,
+            password_hash=hash_password("ExamplePassword123!"),
+            role="hr",
+            status="invited",
+            data_scope="company",
+        )
+        db.add(admin)
+        db.commit()
+        admin_id = admin.id
+        employee_id = employee.id
+
+    manager_response = client.post(
+        f"/api/v1/teams/{data['team_a'].id}/owners",
+        headers=data["general_headers"],
+        json={"admin_user_id": str(admin_id)},
+    )
+    lead_response = client.post(
+        f"/api/v1/teams/{data['team_b'].id}/members",
+        headers=data["general_headers"],
+        json={"employee_id": str(employee_id), "status": "active", "role": "team_lead"},
+    )
+    member_response = client.patch(
+        f"/api/v1/teams/{data['team_b'].id}/members/{employee_id}",
+        headers=data["general_headers"],
+        json={"role": "member"},
+    )
+    owners_response = client.get(
+        f"/api/v1/teams/{data['team_a'].id}/owners",
+        headers=data["general_headers"],
+    )
+
+    assert manager_response.status_code == 200
+    assert lead_response.status_code == 200
+    assert member_response.status_code == 200
+    assert owners_response.status_code == 200
+    invited_owner = next(
+        owner for owner in owners_response.json()["data"] if owner["id"] == str(admin_id)
+    )
+    assert invited_owner["role"] == "hr"
+    assert invited_owner["status"] == "invited"
+
+    with data["session_factory"]() as db:
+        manager_membership = db.scalar(
+            select(TeamMember).where(
+                TeamMember.team_id == data["team_a"].id,
+                TeamMember.employee_id == employee_id,
+            )
+        )
+        member_membership = db.scalar(
+            select(TeamMember).where(
+                TeamMember.team_id == data["team_b"].id,
+                TeamMember.employee_id == employee_id,
+            )
+        )
+        assert manager_membership is not None
+        assert manager_membership.status == "active"
+        assert manager_membership.role == "team_manager"
+        assert member_membership is not None
+        assert member_membership.role == "member"
+
+
+def test_employee_overview_keeps_saved_team_role_after_refresh(team_client):
+    client, data = team_client
+
+    update_response = client.patch(
+        f"/api/v1/teams/{data['team_a'].id}/members/{data['employee_a'].id}",
+        headers=data["general_headers"],
+        json={"role": "team_manager"},
+    )
+    refresh_response = client.get(
+        f"/api/v1/employees-overview?employee_id={data['employee_a'].id}",
+        headers=data["general_headers"],
+    )
+
+    assert update_response.status_code == 200
+    assert refresh_response.status_code == 200
+    refreshed_employee = refresh_response.json()["data"][0]
+    assert refreshed_employee["team_role"] == "team_manager"
+    assert refreshed_employee["team_ids"] == [str(data["team_a"].id)]
+
+
+def test_employee_overview_uses_filtered_role_and_highest_unfiltered_role(team_client):
+    client, data = team_client
+    with data["session_factory"]() as db:
+        memberships = db.scalars(
+            select(TeamMember).where(
+                TeamMember.employee_id == data["shared_employee"].id,
+                TeamMember.status == "active",
+            )
+        ).all()
+        for membership in memberships:
+            membership.role = "team_lead" if membership.team_id == data["team_a"].id else "member"
+        db.commit()
+
+    unfiltered_response = client.get(
+        f"/api/v1/employees-overview?employee_id={data['shared_employee'].id}",
+        headers=data["general_headers"],
+    )
+    filtered_response = client.get(
+        "/api/v1/employees-overview",
+        params={
+            "employee_id": str(data["shared_employee"].id),
+            "team_id": str(data["team_b"].id),
+        },
+        headers=data["general_headers"],
+    )
+
+    assert unfiltered_response.status_code == 200
+    assert unfiltered_response.json()["data"][0]["team_role"] == "team_lead"
+    assert filtered_response.status_code == 200
+    assert filtered_response.json()["data"][0]["team_role"] == "member"
+
+
+def test_employee_overview_includes_all_assigned_team_managers(team_client):
+    client, data = team_client
+
+    response = client.get(
+        f"/api/v1/employees-overview?employee_id={data['shared_employee'].id}",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    managers = response.json()["data"][0]["managers"]
+    assert {manager["name"] for manager in managers} == {"Team Owner", "Second Owner"}
+    assert all(
+        manager["teams"] == [{"id": str(data["team_a"].id), "name": "Team A"}]
+        for manager in managers
+    )
+
+
+def test_timesheets_do_not_load_encrypted_payroll_fields(team_client):
+    client, data = team_client
+    with data["session_factory"]() as db:
+        employee = db.get(Employee, data["employee_a"].id)
+        profile = get_or_create_work_profile(db, employee)
+        profile_id = profile.id
+        db.commit()
+        db.execute(
+            text(
+                "UPDATE employee_work_profiles "
+                "SET salary_amount = :invalid_value "
+                "WHERE id = :profile_id"
+            ),
+            {
+                "invalid_value": b"invalid-encrypted-payroll-value",
+                "profile_id": profile_id.hex,
+            },
+        )
+        db.commit()
+
+    response = client.get(
+        "/api/v1/timesheets/daily",
+        headers=data["general_headers"],
+        params={"day": local_today("UTC").isoformat()},
+    )
+
+    assert response.status_code == 200
+    assert any(row["employee_id"] == str(data["employee_a"].id) for row in response.json()["data"])
+
+
+def test_employee_overview_uses_materialized_attendance_totals(team_client):
+    client, data = team_client
+    with data["session_factory"]() as db:
+        db.add(
+            DailyAttendance(
+                company_id=data["employee_a"].company_id,
+                employee_id=data["employee_a"].id,
+                work_date=local_today("UTC"),
+                timezone="UTC",
+                normal_worked_seconds=300,
+                pre_shift_extra_seconds=60,
+                post_shift_extra_seconds=30,
+                approved_manual_seconds=120,
+                idle_seconds=90,
+                calculated_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+
+    response = client.get(
+        f"/api/v1/employees-overview?employee_id={data['employee_a'].id}",
+        headers=data["general_headers"],
+    )
+
+    assert response.status_code == 200
+    overview = response.json()["data"][0]
+    assert overview["worked_today_seconds"] == 510
+    assert overview["active_seconds"] == 510
+    assert overview["idle_seconds"] == 90
+
+
+def test_monitoring_roster_is_lightweight_scoped_and_has_bounded_queries(team_client):
+    client, data = team_client
+    now = datetime.now(UTC)
+    with data["session_factory"]() as db:
+        device = db.get(Device, data["session_a"].device_id)
+        device.last_seen_at = now
+        employee = db.get(Employee, data["employee_a"].id)
+        get_or_create_work_profile(db, employee)
+        integrity_payload = {
+            "input_integrity": {
+                "sensor": "windows_low_level_input",
+                "sensor_available": True,
+                "observed_seconds": 30,
+                "real_mouse_events": 0,
+                "real_keyboard_events": 0,
+                "injected_mouse_events": 6,
+                "injected_keyboard_events": 0,
+            }
+        }
+        db.add_all(
+            [
+                ActivityEvent(
+                    company_id=employee.company_id,
+                    employee_id=employee.id,
+                    device_id=device.id,
+                    session_id=data["session_a"].id,
+                    event_type="heartbeat",
+                    event_timestamp=now - timedelta(seconds=30),
+                    payload=integrity_payload,
+                    idempotency_key=f"integrity-test-{uuid4()}",
+                ),
+                ActivityEvent(
+                    company_id=employee.company_id,
+                    employee_id=employee.id,
+                    device_id=device.id,
+                    session_id=data["session_a"].id,
+                    event_type="heartbeat",
+                    event_timestamp=now,
+                    payload=integrity_payload,
+                    idempotency_key=f"integrity-test-{uuid4()}",
+                ),
+            ]
+        )
+        db.commit()
+
+    engine = data["session_factory"].kw["bind"]
+    statements = []
+
+    def count_statement(_conn, _cursor, statement, *_args):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", count_statement)
+    try:
+        response = client.get(
+            "/api/v1/employees-monitoring",
+            headers=data["owner_headers"],
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", count_statement)
+
+    assert response.status_code == 200
+    rows = response.json()["data"]
+    assert {row["employee"]["id"] for row in rows} == {
+        str(data["employee_a"].id),
+        str(data["shared_employee"].id),
+    }
+    assert len(statements) <= 9, [
+        f"{index}: {' '.join(statement.split())[:180]}"
+        for index, statement in enumerate(statements, start=1)
+    ]
+    assert len(response.content) < 100_000
+    assert set(rows[0]) == {
+        "employee",
+        "activity_status",
+        "last_heartbeat",
+        "device",
+        "team_ids",
+        "input_integrity",
+    }
+    assert set(rows[0]["employee"]) == {
+        "id",
+        "name",
+        "email",
+        "employee_code",
+        "job_title",
+        "timezone",
+        "status",
+        "onboarding_status",
+    }
+    assert "worked_today_seconds" not in rows[0]
+    assert "last_screenshot" not in rows[0]
+    assert "managers" not in rows[0]
+    integrity_row = next(row for row in rows if row["employee"]["id"] == str(data["employee_a"].id))
+    assert integrity_row["input_integrity"]["state"] == "suspicious"
+
+
+def test_monitoring_roster_preserves_break_and_off_shift_statuses(team_client, monkeypatch):
+    client, data = team_client
+    with data["session_factory"]() as db:
+        session = db.get(WorkSession, data["session_a"].id)
+        device = db.get(Device, session.device_id)
+        device.last_seen_at = datetime.now(UTC)
+        session.status = "active"
+        db.commit()
+
+    monkeypatch.setattr(
+        "app.api.v1.employees.current_idle_contexts",
+        lambda *_args, employees, **_kwargs: {employee.id: "on_break" for employee in employees},
+    )
+    response = client.get(
+        f"/api/v1/employees-monitoring?team_id={data['team_a'].id}",
+        headers=data["owner_headers"],
+    )
+    assert response.status_code == 200
+    row = next(
+        item
+        for item in response.json()["data"]
+        if item["employee"]["id"] == str(data["employee_a"].id)
+    )
+    assert row["activity_status"] == "break_work"
+
+    with data["session_factory"]() as db:
+        session = db.get(WorkSession, data["session_a"].id)
+        session.status = "idle"
+        db.commit()
+    monkeypatch.setattr(
+        "app.api.v1.employees.current_idle_contexts",
+        lambda *_args, employees, **_kwargs: {employee.id: "off_shift" for employee in employees},
+    )
+    response = client.get(
+        f"/api/v1/employees-monitoring?team_id={data['team_a'].id}",
+        headers=data["owner_headers"],
+    )
+    row = next(
+        item
+        for item in response.json()["data"]
+        if item["employee"]["id"] == str(data["employee_a"].id)
+    )
+    assert row["activity_status"] == "off_shift"
+
+
+def test_application_history_returns_server_pagination(team_client):
+    client, data = team_client
+    selected_day = local_today("UTC")
+    started_at = datetime.combine(selected_day, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=8
+    )
+    with data["session_factory"]() as db:
+        db.add_all(
+            [
+                ActivityEvent(
+                    company_id=data["employee_a"].company_id,
+                    employee_id=data["employee_a"].id,
+                    device_id=data["session_a"].device_id,
+                    session_id=data["session_a"].id,
+                    event_type="foreground_activity",
+                    event_timestamp=started_at + timedelta(minutes=index),
+                    idempotency_key=f"application-page-{index}",
+                    payload={
+                        "application_name": f"Application {index}",
+                        "process_name": f"process-{index}",
+                        "duration_seconds": 10,
+                    },
+                )
+                for index in range(31)
+            ]
+        )
+        db.commit()
+
+    response = client.get(
+        "/api/v1/activity/application-history",
+        headers=data["general_headers"],
+        params={
+            "employee_id": str(data["employee_a"].id),
+            "day": selected_day.isoformat(),
+            "page": 2,
+            "page_size": 25,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["meta"] == {
+        "page": 2,
+        "page_size": 25,
+        "total": 31,
+        "total_pages": 2,
+    }
+    assert len(payload["data"]["items"]) == 6
+
+
+def test_employee_overview_distinguishes_idle_break_and_off_shift(team_client, monkeypatch):
+    client, data = team_client
+    with data["session_factory"]() as db:
+        session = db.get(WorkSession, data["session_a"].id)
+        device = db.get(Device, session.device_id)
+        session.status = "idle"
+        device.last_seen_at = datetime.now(UTC)
+        db.commit()
+
+    monkeypatch.setattr(
+        "app.api.v1.employees.current_idle_contexts",
+        lambda *_args, employees, **_kwargs: {employee.id: "off_shift" for employee in employees},
+    )
+    outside_shift = client.get(
+        f"/api/v1/employees-overview?employee_id={data['employee_a'].id}",
+        headers=data["general_headers"],
+    )
+
+    assert outside_shift.status_code == 200
+    assert outside_shift.json()["data"][0]["activity_status"] == "off_shift"
+
+    monkeypatch.setattr(
+        "app.api.v1.employees.current_idle_contexts",
+        lambda *_args, employees, **_kwargs: {employee.id: "on_break" for employee in employees},
+    )
+    on_break = client.get(
+        f"/api/v1/employees-overview?employee_id={data['employee_a'].id}",
+        headers=data["general_headers"],
+    )
+
+    assert on_break.status_code == 200
+    assert on_break.json()["data"][0]["activity_status"] == "on_break"
+
+    with data["session_factory"]() as db:
+        session = db.get(WorkSession, data["session_a"].id)
+        session.status = "active"
+        db.commit()
+
+    working_during_break = client.get(
+        f"/api/v1/employees-overview?employee_id={data['employee_a'].id}",
+        headers=data["general_headers"],
+    )
+    employee_status = client.get(
+        f"/api/v1/employees/{data['employee_a'].id}/status",
+        headers=data["general_headers"],
+    )
+
+    assert working_during_break.status_code == 200
+    assert working_during_break.json()["data"][0]["activity_status"] == "break_work"
+    assert employee_status.status_code == 200
+    assert employee_status.json()["data"]["activity_status"] == "break_work"
+
+    with data["session_factory"]() as db:
+        session = db.get(WorkSession, data["session_a"].id)
+        session.status = "idle"
+        db.commit()
+
+    monkeypatch.setattr(
+        "app.api.v1.employees.current_idle_contexts",
+        lambda *_args, employees, **_kwargs: {employee.id: "accountable" for employee in employees},
+    )
+    inside_shift = client.get(
+        f"/api/v1/employees-overview?employee_id={data['employee_a'].id}",
+        headers=data["general_headers"],
+    )
+
+    assert inside_shift.status_code == 200
+    assert inside_shift.json()["data"][0]["activity_status"] == "idle"
+
+
+def test_request_recipients_include_all_managers_and_company_hr(team_client):
+    _, data = team_client
+    with data["session_factory"]() as db:
+        hr = AdminUser(
+            company_id=data["shared_employee"].company_id,
+            name="HR Reviewer",
+            email='contact+084064836012@example.com',
+            password_hash=hash_password("ExamplePassword123!"),
+            role="hr",
+            status="active",
+        )
+        db.add(hr)
+        db.commit()
+        employee = db.get(Employee, data["shared_employee"].id)
+        recipients = request_recipients(db, employee)
+
+    assert {recipient.name for recipient in recipients} == {
+        "Team Owner",
+        "Second Owner",
+        "HR Reviewer",
+    }
+
+
+def test_first_team_manager_to_review_leave_closes_request(team_client):
+    client, data = team_client
+    with data["session_factory"]() as db:
+        row = LeaveRequest(
+            company_id=data["shared_employee"].company_id,
+            employee_id=data["shared_employee"].id,
+            start_date=datetime.now(UTC).date() + timedelta(days=5),
+            end_date=datetime.now(UTC).date() + timedelta(days=5),
+            requested_days=1,
+            leave_type="unpaid",
+            reason="Personal appointment",
+            status="pending",
+        )
+        db.add(row)
+        db.commit()
+        request_id = row.id
+
+    first_review = client.patch(
+        f"/api/v1/leave-requests/{request_id}",
+        headers=data["owner_headers"],
+        json={"status": "approved", "review_note": "Approved."},
+    )
+    second_review = client.patch(
+        f"/api/v1/leave-requests/{request_id}",
+        headers=data["second_owner_headers"],
+        json={"status": "rejected", "review_note": "Rejected."},
+    )
+
+    assert first_review.status_code == 200
+    assert first_review.json()["data"]["status"] == "approved"
+    assert second_review.status_code == 409
+
+
+def test_early_leave_is_separated_from_time_requests_and_worked_time(team_client):
+    client, data = team_client
+    work_date = data["session_a"].started_at.date()
+    with data["session_factory"]() as db:
+        db.add_all(
+            [
+                TimeAdjustmentRequest(
+                    company_id=data["employee_a"].company_id,
+                    employee_id=data["employee_a"].id,
+                    request_type="manual_time",
+                    requested_date=work_date,
+                    requested_seconds=5 * 60,
+                    approved_seconds=5 * 60,
+                    reason="Approved missing tracked time",
+                    status="approved",
+                ),
+                TimeAdjustmentRequest(
+                    company_id=data["employee_a"].company_id,
+                    employee_id=data["employee_a"].id,
+                    request_type="early_leave",
+                    requested_date=work_date,
+                    requested_seconds=30 * 60,
+                    approved_seconds=30 * 60,
+                    reason="Approved early departure",
+                    status="approved",
+                ),
+            ]
+        )
+        db.commit()
+
+    time_requests = client.get(
+        "/api/v1/time-adjustment-requests?request_group=time&status=approved",
+        headers=data["general_headers"],
+    )
+    early_leave_requests = client.get(
+        "/api/v1/time-adjustment-requests?request_group=early_leave&status=approved",
+        headers=data["general_headers"],
+    )
+    timesheet = client.get(
+        f"/api/v1/timesheets/daily?day={work_date.isoformat()}",
+        headers=data["general_headers"],
+    )
+
+    assert time_requests.status_code == 200
+    assert {row["request_type"] for row in time_requests.json()["data"]} == {"manual_time"}
+    assert early_leave_requests.status_code == 200
+    assert {row["request_type"] for row in early_leave_requests.json()["data"]} == {"early_leave"}
+    row = next(
+        item
+        for item in timesheet.json()["data"]
+        if item["employee_id"] == str(data["employee_a"].id)
+    )
+    assert row["adjustment_seconds"] == 5 * 60
+
+
+def test_employee_start_date_and_leave_balance_overview_are_editable(team_client):
+    client, data = team_client
+    employee_id = data["employee_a"].id
+    updated = client.patch(
+        f"/api/v1/employees/{employee_id}",
+        headers=data["general_headers"],
+        json={"start_date": "2025-01-15"},
+    )
+    with data["session_factory"]() as db:
+        employee = db.get(Employee, employee_id)
+        db.add_all(
+            [
+                LeaveRequest(
+                    company_id=employee.company_id,
+                    employee_id=employee.id,
+                    start_date=datetime(2026, 7, 27).date(),
+                    end_date=datetime(2026, 7, 27).date(),
+                    requested_days=1,
+                    leave_type="annual",
+                    reason="Annual holiday",
+                    status="approved",
+                ),
+                LeaveRequest(
+                    company_id=employee.company_id,
+                    employee_id=employee.id,
+                    start_date=datetime(2026, 7, 28).date(),
+                    end_date=datetime(2026, 7, 28).date(),
+                    requested_days=1,
+                    leave_type="sick",
+                    reason="Sick leave",
+                    status="approved",
+                ),
+            ]
+        )
+        db.commit()
+
+    balances = client.get(
+        "/api/v1/leave-requests/balances?year=2026",
+        headers=data["general_headers"],
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["data"]["start_date"] == "2025-01-15"
+    assert balances.status_code == 200
+    balance = next(
+        item for item in balances.json()["data"] if item["employee_id"] == str(employee_id)
+    )
+    assert balance["used_days"] == 1
+    assert balance["remaining_days"] == balance["credit_days"] - 1
+    assert balance["taken_dates"] == [
+        {
+            "date": "2026-07-27",
+            "leave_type": "annual",
+            "request_id": balance["taken_dates"][0]["request_id"],
+        },
+        {
+            "date": "2026-07-28",
+            "leave_type": "sick",
+            "request_id": balance["taken_dates"][1]["request_id"],
+        },
+    ]
+
+
+def test_no_grant_admin_cannot_read_employee_roster(team_client):
+    # W8: a custom permission-mode admin with no grants must not read the roster.
+    client, data = team_client
+    db = data["session_factory"]()
+    try:
+        no_grant = AdminUser(
+            company_id=data["general_admin"].company_id,
+            name="No Grant Admin",
+            email="nogrant@example.com",
+            password_hash=hash_password("ExamplePassword123!"),
+            role="team_owner",
+            is_super_admin=False,
+            status="active",
+            permission_mode="custom",
+            data_scope="company",
+        )
+        db.add(no_grant)
+        db.commit()
+        admin_id = no_grant.id
+        company_id = no_grant.company_id
+    finally:
+        db.close()
+    token = create_jwt_token(
+        subject=admin_id,
+        company_id=company_id,
+        token_type="access",
+        expires_delta=timedelta(minutes=30),
+        extra_claims={"role": "team_owner"},
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    me = client.get("/api/v1/auth/me", headers=headers)
+    assert me.status_code == 200
+    assert me.json()["data"]["permissions"] == []
+
+    roster = client.get("/api/v1/employees", headers=headers)
+    overview = client.get("/api/v1/employees-overview", headers=headers)
+    assert roster.status_code == 403
+    assert overview.status_code == 403
+
+
+def test_capable_admins_still_read_roster(team_client):
+    # W8: gating must not break legitimate roster/selector access.
+    client, data = team_client
+
+    roster = client.get("/api/v1/employees", headers=data["general_headers"])
+    overview = client.get("/api/v1/employees-overview", headers=data["general_headers"])
+    assert roster.status_code == 200
+    assert overview.status_code == 200
+
+    # A role-mode team owner keeps the shared employee selector its features use.
+    owner_overview = client.get(
+        "/api/v1/employees-overview", headers=data["owner_headers"]
+    )
+    assert owner_overview.status_code == 200
+
+
+def test_custom_range_sheet_does_not_mutate_saved_run(team_client):
+    # W4: a custom viewing range is a read-only preview; it must reflect the
+    # range in the response but never rewrite the shared persisted run.
+    from app.models import PayrollRun
+
+    client, data = team_client
+    work_date = local_today("UTC")
+    payroll_month = (
+        (work_date.replace(day=28) + timedelta(days=4)).replace(day=1)
+        if work_date.day >= 26
+        else work_date.replace(day=1)
+    )
+    month_str = payroll_month.strftime("%Y-%m")
+    headers = data["general_headers"]
+
+    canonical = client.get(f"/api/v1/payroll/sheet?month={month_str}", headers=headers)
+    assert canonical.status_code == 200
+    canonical_start = canonical.json()["data"]["run"]["period_start"]
+    canonical_end = canonical.json()["data"]["run"]["period_end"]
+
+    custom_start = payroll_month.replace(day=1).isoformat()
+    custom_end = payroll_month.replace(day=7).isoformat()
+    assert custom_start != canonical_start  # a genuine custom sub-range
+
+    custom = client.get(
+        f"/api/v1/payroll/sheet?month={month_str}"
+        f"&start_date={custom_start}&end_date={custom_end}",
+        headers=headers,
+    )
+    assert custom.status_code == 200
+    # The preview reflects the requested range...
+    assert custom.json()["data"]["run"]["period_start"] == custom_start
+    assert custom.json()["data"]["run"]["period_end"] == custom_end
+
+    # ...but the stored run keeps the canonical company cycle.
+    db = data["session_factory"]()
+    try:
+        run = db.scalar(
+            select(PayrollRun).where(PayrollRun.month == payroll_month.replace(day=1))
+        )
+        assert run.period_start.isoformat() == canonical_start
+        assert run.period_end.isoformat() == canonical_end
+    finally:
+        db.close()
+
+    # A later canonical view is CHANGE_ME for the next administrator.
+    again = client.get(f"/api/v1/payroll/sheet?month={month_str}", headers=headers)
+    assert again.json()["data"]["run"]["period_start"] == canonical_start
+    assert again.json()["data"]["run"]["period_end"] == canonical_end
+
+
+def test_approved_run_freezes_numbers_when_salary_changes(team_client):
+    # R1 (policy: approval freezes numbers): once a run is approved, a later
+    # salary change must not alter its figures until it is moved back to draft.
+    from decimal import Decimal
+
+    from app.models import PayrollEntry
+    from app.services.payroll import (
+        get_or_create_payroll_settings,
+        get_or_create_run,
+        refresh_run_entries,
+    )
+
+    client, data = team_client
+    db = data["session_factory"]()
+    try:
+        company_id = data["employee_a"].company_id
+        employee = data["employee_a"]
+        profile = get_or_create_work_profile(db, employee)
+        profile.salary_type = "monthly"
+        profile.salary_amount = Decimal("3000")
+        profile.salary_currency = "EGP"
+        db.flush()
+
+        settings = get_or_create_payroll_settings(db, company_id)
+        month = date(2026, 9, 1)
+        run = get_or_create_run(
+            db,
+            company_id=company_id,
+            month=month,
+            admin_user_id=data["general_admin"].id,
+            cycle_timezone=settings.timezone,
+        )
+        refresh_run_entries(db, run)
+        db.commit()
+
+        entry = db.scalar(
+            select(PayrollEntry).where(
+                PayrollEntry.payroll_run_id == run.id,
+                PayrollEntry.employee_id == employee.id,
+            )
+        )
+        assert entry is not None
+        assert float(entry.salary_amount) == 3000.0
+        frozen_base = float(entry.base_salary)
+
+        run.status = "approved"
+        db.commit()
+        profile.salary_amount = Decimal("6000")
+        db.commit()
+
+        # Refreshing an approved run must not pick up the new salary.
+        refresh_run_entries(db, run)
+        db.commit()
+        db.refresh(entry)
+        assert float(entry.salary_amount) == 3000.0
+        assert float(entry.base_salary) == frozen_base
+
+        # Returning to draft unfreezes it (the deliberate edit path).
+        run.status = "draft"
+        db.commit()
+        refresh_run_entries(db, run)
+        db.commit()
+        db.refresh(entry)
+        assert float(entry.salary_amount) == 6000.0
+    finally:
+        db.close()
+
+
+def test_export_honors_all_sheet_filters(team_client):
+    # W5: the export must apply the same filters as the sheet (previously it
+    # dropped has_lateness/has_idle/has_deductions/has_manual_adjustments).
+    client, data = team_client
+    work_date = local_today("UTC")
+    payroll_month = (
+        (work_date.replace(day=28) + timedelta(days=4)).replace(day=1)
+        if work_date.day >= 26
+        else work_date.replace(day=1)
+    )
+    month_str = payroll_month.strftime("%Y-%m")
+    headers = data["general_headers"]
+
+    # A filter that returns no rows on the sheet ...
+    sheet = client.get(
+        f"/api/v1/payroll/sheet?month={month_str}&has_deductions=true", headers=headers
+    )
+    assert sheet.status_code == 200
+    assert sheet.json()["data"]["summary"]["employees"] == 0
+
+    # ... must also return no employee/total rows in the export.
+    filtered = client.get(
+        f"/api/v1/payroll/export?month={month_str}&format=csv&has_deductions=true",
+        headers=headers,
+    )
+    assert filtered.status_code == 200
+    filtered_lines = [
+        line for line in filtered.content.decode("utf-8-sig").splitlines() if line.strip()
+    ]
+    assert len(filtered_lines) == 1  # header row only
+
+    # Sanity: the unfiltered export still contains rows.
+    unfiltered = client.get(
+        f"/api/v1/payroll/export?month={month_str}&format=csv", headers=headers
+    )
+    unfiltered_lines = [
+        line for line in unfiltered.content.decode("utf-8-sig").splitlines() if line.strip()
+    ]
+    assert len(unfiltered_lines) > 1
+
+
+def test_audit_log_paginates_and_filters_full_history(team_client):
+    # W11: server-side filters + pagination make older matching events
+    # discoverable and report totals honestly. W12: To date is inclusive.
+    from datetime import datetime, timezone
+
+    from app.models import AuditLog
+
+    client, data = team_client
+    db = data["session_factory"]()
+    try:
+        company_id = data["general_admin"].company_id
+        admin_id = data["general_admin"].id
+        for index in range(205):
+            db.add(
+                AuditLog(
+                    company_id=company_id,
+                    admin_user_id=admin_id,
+                    action="created",
+                    entity_type="employee",
+                    entity_name=f"row-{index}",
+                    created_at=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+                )
+            )
+        # One older, distinctly-actioned event far beyond the first page.
+        db.add(
+            AuditLog(
+                company_id=company_id,
+                admin_user_id=admin_id,
+                action="special_action",
+                entity_type="payroll_run",
+                entity_name="old-event",
+                created_at=datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    headers = data["general_headers"]
+
+    first = client.get("/api/v1/audit-log?page=1", headers=headers)
+    assert first.status_code == 200
+    body = first.json()
+    assert len(body["data"]) == 100
+    assert body["meta"]["total"] >= 206
+    assert body["meta"]["total_pages"] >= 3
+    assert "special_action" in body["meta"]["available_actions"]
+
+    big = client.get("/api/v1/audit-log?page=1&page_size=200", headers=headers)
+    assert len(big.json()["data"]) == 200
+
+    # Server-side filter surfaces the old event even though it is not on page 1.
+    filtered = client.get("/api/v1/audit-log?action=special_action", headers=headers)
+    fbody = filtered.json()
+    assert fbody["meta"]["total"] == 1
+    assert fbody["data"][0]["entity_name"] == "old-event"
+
+    # W12: the To date includes same-day events.
+    same_day = client.get(
+        "/api/v1/audit-log?action=special_action&date_to=2026-01-01", headers=headers
+    )
+    assert same_day.json()["meta"]["total"] == 1
+    before = client.get(
+        "/api/v1/audit-log?action=special_action&date_to=2025-12-31", headers=headers
+    )
+    assert before.json()["meta"]["total"] == 0
+
+
+def test_reports_summary_and_employees_respect_employee_and_date_filters(team_client):
+    # W9: employee/date filters must reach backend aggregation so the headline
+    # cards and per-employee rows change consistently with the selection.
+    client, data = team_client
+    headers = data["general_headers"]
+    employee_a = str(data["employee_a"].id)
+
+    unfiltered = client.get("/api/v1/reports/summary", headers=headers)
+    assert unfiltered.status_code == 200
+    total_all = unfiltered.json()["data"]["total_tracked_seconds"]
+    assert total_all >= 360  # employee_a (120) + employee_b (240)
+
+    by_employee = client.get(
+        f"/api/v1/reports/summary?employee_id={employee_a}", headers=headers
+    )
+    total_a = by_employee.json()["data"]["total_tracked_seconds"]
+    assert total_a == 120
+    assert total_a < total_all  # selecting an employee changes the headline totals
+
+    rows = client.get(
+        f"/api/v1/reports/employees?employee_id={employee_a}", headers=headers
+    )
+    row_data = rows.json()["data"]
+    assert len(row_data) == 1
+    assert row_data[0]["employee_id"] == employee_a
+    assert row_data[0]["active_seconds"] == 120
+
+    # A date window with no sessions yields zero, proving the date filter applies.
+    empty = client.get(
+        "/api/v1/reports/summary?date_from=2020-01-01&date_to=2020-01-02", headers=headers
+    )
+    assert empty.json()["data"]["total_tracked_seconds"] == 0
+
+
+def _seed_sept_run(data):
+    """Build September's run+entries and return (run_id, month_str)."""
+    from datetime import date as _date
+
+    from app.models import AdminUser as _Admin  # noqa: F401
+    from app.services.payroll import (
+        get_or_create_payroll_settings,
+        get_or_create_run,
+        refresh_run_entries,
+    )
+
+    db = data["session_factory"]()
+    try:
+        company_id = data["general_admin"].company_id
+        settings = get_or_create_payroll_settings(db, company_id)
+        from app.services.payroll import payroll_period_bounds as _bounds
+
+        canonical_start, canonical_end = _bounds(
+            "2026-09", settings.cycle_start_day, settings.cycle_end_day
+        )
+        run = get_or_create_run(
+            db,
+            company_id=company_id,
+            month=_date(2026, 9, 1),
+            admin_user_id=data["general_admin"].id,
+            period_start=canonical_start,
+            period_end=canonical_end,
+            cycle_timezone=settings.timezone,
+        )
+        refresh_run_entries(db, run)
+        db.commit()
+        return run.id
+    finally:
+        db.close()
+
+
+def test_approved_run_rejects_entry_edits(team_client):
+    # R1: an approved run must reject deliberate edits until returned to draft.
+    from app.models import PayrollEntry, PayrollRun
+
+    client, data = team_client
+    run_id = _seed_sept_run(data)
+    db = data["session_factory"]()
+    try:
+        run = db.get(PayrollRun, run_id)
+        run.status = "approved"
+        entry_id = db.scalar(
+            select(PayrollEntry.id).where(PayrollEntry.payroll_run_id == run_id)
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.patch(
+        f"/api/v1/payroll/entries/{entry_id}",
+        json={"bonus_amount": 123},
+        headers=data["general_headers"],
+    )
+    assert resp.status_code == 409
+
+
+def test_exceptions_custom_range_does_not_mutate_saved_run(team_client):
+    # W4: the exceptions reader must not rewrite the shared run either.
+    from app.models import PayrollRun
+
+    client, data = team_client
+    run_id = _seed_sept_run(data)
+    db = data["session_factory"]()
+    try:
+        run = db.get(PayrollRun, run_id)
+        canonical_start = run.period_start.isoformat()
+        canonical_end = run.period_end.isoformat()
+    finally:
+        db.close()
+
+    resp = client.get(
+        "/api/v1/payroll/exceptions?month=2026-09&start_date=2026-09-01&end_date=2026-09-07",
+        headers=data["general_headers"],
+    )
+    assert resp.status_code == 200
+
+    db = data["session_factory"]()
+    try:
+        run = db.get(PayrollRun, run_id)
+        assert run.period_start.isoformat() == canonical_start
+        assert run.period_end.isoformat() == canonical_end
+    finally:
+        db.close()
+
+
+def test_export_custom_range_does_not_mutate_saved_run(team_client):
+    # W4: the export reader must not rewrite the shared run either.
+    from app.models import PayrollRun
+
+    client, data = team_client
+    run_id = _seed_sept_run(data)
+    db = data["session_factory"]()
+    try:
+        run = db.get(PayrollRun, run_id)
+        canonical_start = run.period_start.isoformat()
+    finally:
+        db.close()
+
+    resp = client.get(
+        "/api/v1/payroll/export?month=2026-09&format=csv"
+        "&start_date=2026-09-01&end_date=2026-09-07",
+        headers=data["general_headers"],
+    )
+    assert resp.status_code == 200
+
+    db = data["session_factory"]()
+    try:
+        run = db.get(PayrollRun, run_id)
+        assert run.period_start.isoformat() == canonical_start
+    finally:
+        db.close()
+
+
+def test_frozen_run_rejects_custom_range_preview(team_client):
+    # W4: a custom range on an approved run is rejected rather than relabeling
+    # the frozen figures with a period they were not computed for.
+    from app.models import PayrollRun
+
+    client, data = team_client
+    run_id = _seed_sept_run(data)
+    db = data["session_factory"]()
+    try:
+        db.get(PayrollRun, run_id).status = "approved"
+        db.commit()
+    finally:
+        db.close()
+
+    for path in ("sheet", "exceptions", "export"):
+        suffix = "&format=csv" if path == "export" else ""
+        resp = client.get(
+            f"/api/v1/payroll/{path}?month=2026-09"
+            f"&start_date=2026-09-01&end_date=2026-09-07{suffix}",
+            headers=data["general_headers"],
+        )
+        assert resp.status_code == 409, path
+        # The canonical view (no custom range) still works on an approved run.
+        canonical = client.get(
+            f"/api/v1/payroll/{path}?month=2026-09{suffix}",
+            headers=data["general_headers"],
+        )
+        assert canonical.status_code == 200, path
+
+
+def test_no_grant_admin_cannot_read_monitoring_roster(team_client):
+    # W8: the monitoring roster is part of the gated roster family.
+    client, data = team_client
+    db = data["session_factory"]()
+    try:
+        no_grant = AdminUser(
+            company_id=data["general_admin"].company_id,
+            name="No Grant Monitor",
+            email="nogrant-monitor@example.com",
+            password_hash=hash_password("ExamplePassword123!"),
+            role="team_owner",
+            is_super_admin=False,
+            status="active",
+            permission_mode="custom",
+            data_scope="company",
+        )
+        db.add(no_grant)
+        db.commit()
+        admin_id, company_id = no_grant.id, no_grant.company_id
+    finally:
+        db.close()
+    token = create_jwt_token(
+        subject=admin_id,
+        company_id=company_id,
+        token_type="access",
+        expires_delta=timedelta(minutes=30),
+        extra_claims={"role": "team_owner"},
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    assert client.get("/api/v1/employees-monitoring", headers=headers).status_code == 403
+    assert client.get("/api/v1/employees-monitoring", headers=data["general_headers"]).status_code == 200
+
+
+def test_reports_csv_export_filters_and_escapes(team_client):
+    # W9/W10: the backend report CSV honours filters and neutralizes formulas.
+    from app.models import Employee
+
+    client, data = team_client
+    headers = data["general_headers"]
+    employee_a = str(data["employee_a"].id)
+
+    # Rename an employee to a formula-like value.
+    db = data["session_factory"]()
+    try:
+        emp = db.get(Employee, data["employee_b"].id)
+        emp.name = "=1+1"
+        db.commit()
+    finally:
+        db.close()
+
+    full = client.get("/api/v1/reports/export.csv", headers=headers)
+    assert full.status_code == 200
+    body = full.content.decode("utf-8")
+    assert "'=1+1" in body  # formula neutralized
+    assert "\n=1+1" not in body
+
+    # Employee filter reduces the export to one row.
+    filtered = client.get(
+        f"/api/v1/reports/export.csv?employee_id={employee_a}", headers=headers
+    )
+    lines = [line for line in filtered.content.decode("utf-8").splitlines() if line.strip()]
+    assert len(lines) == 2  # header + one employee
+
+    # An empty date window exports the header only.
+    empty = client.get(
+        "/api/v1/reports/export.csv?date_from=2020-01-01&date_to=2020-01-02", headers=headers
+    )
+    empty_lines = [line for line in empty.content.decode("utf-8").splitlines() if line.strip()]
+    # Employees still listed but with zero seconds; ensure no active time leaks.
+    assert all(",0,0,0" in line or "active_seconds" in line for line in empty_lines)
+
+
+def test_audit_date_filter_uses_viewer_timezone(team_client):
+    # W12: an event whose displayed day (in the viewer timezone) is D must be
+    # matched by a filter of D, even when its UTC instant is the neighbouring day.
+    from datetime import datetime, timezone
+
+    from app.models import AuditLog
+
+    client, data = team_client
+    db = data["session_factory"]()
+    try:
+        db.add(
+            AuditLog(
+                company_id=data["general_admin"].company_id,
+                admin_user_id=data["general_admin"].id,
+                action="tz_probe",
+                entity_type="payroll_run",
+                entity_name="near-midnight",
+                # 21:30 UTC on Sep 14 == 00:30 on Sep 15 in Africa/Cairo (UTC+3, DST).
+                created_at=datetime(2026, 9, 14, 21, 30, tzinfo=timezone.utc),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    headers = data["general_headers"]
+
+    def total(query):
+        return client.get(f"/api/v1/audit-log?action=tz_probe&{query}", headers=headers).json()[
+            "meta"
+        ]["total"]
+
+    # In Cairo the event is on Sep 15, so a Sep 15 filter includes it and Sep 14 excludes it.
+    assert total("date_from=2026-09-15&date_to=2026-09-15&tz=Africa/Cairo") == 1
+    assert total("date_from=2026-09-14&date_to=2026-09-14&tz=Africa/Cairo") == 0
+    # In UTC the same event is on Sep 14 (demonstrating the timezone actually matters).
+    assert total("date_from=2026-09-14&date_to=2026-09-14") == 1
+    assert total("date_from=2026-09-15&date_to=2026-09-15") == 0

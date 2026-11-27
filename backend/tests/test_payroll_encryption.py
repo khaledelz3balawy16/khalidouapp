@@ -1,0 +1,112 @@
+from decimal import Decimal
+
+import pytest
+import sqlalchemy as sa
+
+from app.core.field_encryption import PREFIX, decrypt_text, encrypt_text
+from app.core.config import settings
+from app.database.encrypted_types import EncryptedDecimal, EncryptedJSON
+from app.services.audit import redact_financial_audit_details
+
+
+def test_authenticated_encryption_round_trip_and_tamper_detection():
+    encrypted = encrypt_text("15000.00")
+
+    assert encrypted.startswith(PREFIX)
+    assert "15000.00" not in encrypted
+    assert decrypt_text(encrypted) == "15000.00"
+
+    replacement = "A" if encrypted[-1] != "A" else "B"
+    with pytest.raises(RuntimeError, match="could not be decrypted"):
+        decrypt_text(encrypted[:-1] + replacement)
+
+
+def test_dedicated_salary_key_can_read_legacy_jwt_derived_ciphertext(monkeypatch):
+    monkeypatch.setattr(settings, "salary_encryption_key", "")
+    legacy_ciphertext = encrypt_text("15000.00")
+
+    monkeypatch.setattr(settings, "salary_encryption_key", "new-dedicated-salary-key-" + "x" * 32)
+    assert decrypt_text(legacy_ciphertext) == "15000.00"
+
+    new_ciphertext = encrypt_text("16000.00")
+    assert decrypt_text(new_ciphertext) == "16000.00"
+    assert new_ciphertext != legacy_ciphertext
+
+
+def test_existing_payroll_requires_original_salary_key(monkeypatch):
+    original_key = "original-test-only-salary-key-" + "a" * 32
+    monkeypatch.setattr(settings, "salary_encryption_key", original_key)
+    encrypted = encrypt_text("15000.00")
+    for unavailable_key in ("", "different-test-only-key-" + "b" * 32):
+        monkeypatch.setattr(settings, "salary_encryption_key", unavailable_key)
+        with pytest.raises(RuntimeError, match="could not be decrypted"):
+            decrypt_text(encrypted)
+    monkeypatch.setattr(settings, "salary_encryption_key", original_key)
+    assert decrypt_text(encrypted) == "15000.00"
+
+
+def test_overriding_jwt_secret_breaks_legacy_payroll_decryption(monkeypatch):
+    monkeypatch.setattr(settings, "salary_encryption_key", "")
+    original_jwt = "original-test-only-jwt-" + "j" * 32
+    monkeypatch.setattr(settings, "jwt_secret_key", original_jwt)
+    encrypted = encrypt_text("15000.00")
+    monkeypatch.setattr(settings, "jwt_secret_key", "your-dev-jwt-secret")
+    with pytest.raises(RuntimeError, match="could not be decrypted"):
+        decrypt_text(encrypted)
+    monkeypatch.setattr(settings, "jwt_secret_key", original_jwt)
+    assert decrypt_text(encrypted) == "15000.00"
+
+
+def test_encrypted_sqlalchemy_types_never_store_plain_payroll_values():
+    metadata = sa.MetaData()
+    records = sa.Table(
+        "encrypted_payroll_test",
+        metadata,
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("salary", EncryptedDecimal(), nullable=False),
+        sa.Column("snapshot", EncryptedJSON(), nullable=False),
+    )
+    engine = sa.create_engine('CHANGE_ME')
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            records.insert().values(
+                id=1,
+                salary=Decimal("15000.25"),
+                snapshot={"final_salary": 15000.25, "currency": "EGP"},
+            )
+        )
+        raw_salary, raw_snapshot = connection.exec_driver_sql(
+            "SELECT salary, snapshot FROM encrypted_payroll_test WHERE id = 1"
+        ).one()
+        salary, snapshot = connection.execute(
+            sa.select(records.c.salary, records.c.snapshot).where(records.c.id == 1)
+        ).one()
+
+    assert raw_salary.startswith(PREFIX)
+    assert raw_snapshot.startswith(PREFIX)
+    assert "15000" not in raw_salary
+    assert "15000" not in raw_snapshot
+    assert salary == Decimal("15000.25")
+    assert snapshot == {"currency": "EGP", "final_salary": 15000.25}
+
+
+def test_financial_audit_details_keep_context_without_compensation_values():
+    details = {
+        "old": {"salary_amount": "15000.25", "currency": "EGP"},
+        "new": {
+            "hourly_rate": "62.50",
+            "bonus_amount": "500",
+            "status": "approved",
+        },
+    }
+
+    redacted = redact_financial_audit_details(details)
+
+    assert "15000.25" not in str(redacted)
+    assert "62.50" not in str(redacted)
+    assert "500" not in str(redacted)
+    assert redacted["old"]["currency"] == "EGP"
+    assert redacted["new"]["status"] == "approved"
+    assert redacted["old"]["salary_amount"] == "[REDACTED_FINANCIAL_VALUE]"

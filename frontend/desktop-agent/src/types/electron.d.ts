@@ -1,0 +1,615 @@
+export type AgentStatus = {
+  serverTime?: string;
+  enrolled: boolean;
+  employeeName: string;
+  employeeEmail: string | null;
+  employeeAvatarUrl: string | null;
+  deviceName: string;
+  deviceId: string | null;
+  macAddress: string | null;
+  localIpAddress: string | null;
+  trackingStatus:
+    | "starting"
+    | "active"
+    | "idle"
+    | "locked"
+    | "sleeping"
+    | "paused"
+    | "offline"
+    | "error";
+  trackingPaused: boolean;
+  sessionStartedAt: string | null;
+  workedTodaySeconds: number;
+  activeSeconds: number;
+  idleSeconds: number;
+  currentIdleSeconds: number;
+  // The scheduled break running right now, if any (idle during it is paid break).
+  scheduledBreak?: { name: string; endsAt: string } | null;
+  eligibleIdleSeconds: number;
+  connectionStatus: "online" | "offline";
+  lastScreenshotAt: string | null;
+  screenshotMonitoringEnabled: boolean;
+  screenshotCaptureActive: boolean;
+  powerSource: "ac" | "battery";
+  lastSuccessfulSyncAt: string | null;
+  agentVersion: string;
+  privacyNotice: string;
+  tasks: AgentTask[];
+  projects: AgentProject[];
+  selectedTask: AgentTask | null;
+  timeAdjustmentRequests: TimeAdjustmentRequest[];
+  leaveRequests: LeaveRequestsPayload | null;
+  requestPolicy: RequestPolicy | null;
+  timeSummary: {
+    today: AgentPeriodSummary;
+    week: AgentPeriodSummary;
+    month: AgentPeriodSummary;
+  } | null;
+  dailyTargetSeconds: number;
+  dailyTargetProgressPercent: number;
+  activityPercent: number;
+  normalSeconds: number;
+  extraSeconds: number;
+  overtimeEnabled: boolean;
+  extraTimeStatus: "none" | "pending_overtime" | "recorded_not_counted";
+  paidPauseEndsAt: string | null;
+  paidPauseRemainingSeconds: number;
+  paidPauseBalanceRemainingSeconds: number | null;
+  recentTasks: AgentTask[];
+  todayTimeline: WorkdayTimeline | null;
+  idleRequestPeriods: IdleRequestPeriod[];
+  lastIdleAlert: IdleAlert | null;
+  locallyEndedIdleAt: string | null;
+  updateStatus:
+    | "idle"
+    | "checking"
+    | "available"
+    | "downloading"
+    | "ready"
+    | "installing"
+    | "up-to-date"
+    | "error";
+  updateVersion: string | null;
+  updatePercent: number | null;
+  updateRequired?: boolean;
+  trackingMovedToDevice?: string | null;
+  // Away while saved break minutes pay for it: no idle popup until they run out.
+  savedBreakCover?: { startedAt: string; endsAt: string } | null;
+  activeMeeting: ActiveMeeting | null;
+  meetings: MeetingSummary[];
+  breakBank: BreakBank | null;
+  /** Flexible staff only: progress toward the daily hours and the break bank. */
+  flexibleDay?: FlexibleDay | null;
+  /** This week's attendance days; null until loaded or on older servers. */
+  attendanceWeek?: AttendanceWeek | null;
+  diagnostics?: RuntimeDiagnostics | null;
+  /** e.g. "Windows 11 Pro · 64-bit"; absent outside the desktop runtime. */
+  platformLabel?: string;
+  screenshotIntervalMinutes?: number;
+};
+
+export type RuntimeDiagnostics = {
+  buildIdentifier: string;
+  environment: "packaged" | "development";
+  processId: number;
+  userDataPath: string;
+  apiBaseUrl: string;
+};
+
+export type FlexibleDay = {
+  required_seconds: number;
+  normal_seconds: number;
+  paid_break_seconds: number;
+  payable_seconds: number;
+  extra_seconds: number;
+  break_bank_seconds: number;
+  break_bank_remaining_seconds: number;
+  target_reached_at: string | null;
+  window_start: string;
+  window_end: string;
+};
+
+export type AttendanceDay = {
+  date: string;
+  start_time: string | null;
+  end_time: string | null;
+  session_count: number;
+  active_seconds: number;
+  idle_seconds: number;
+  payable_seconds: number;
+  leave_status: string | null;
+  status: string | null;
+  raw_late_seconds: number;
+  deductible_late_seconds: number;
+  sign_out_at: string | null;
+};
+
+export type AttendanceWeek = {
+  week_start: string;
+  week_end: string;
+  month_start: string;
+  month_end: string;
+  late_grace_minutes: number;
+  working_days: number[] | null;
+  enrolled_at: string | null;
+  days: AttendanceDay[];
+};
+
+export type BreakBank = {
+  policy_active: boolean;
+  worked_break_seconds: number;
+  earned_seconds: number;
+  /** Saved seconds already used to cover idle (missing on older servers). */
+  used_seconds?: number;
+  approved_seconds: number;
+  reserved_seconds: number;
+  remaining_seconds: number;
+  paid_late_allowance_seconds: number;
+};
+
+export type MeetingSyncState =
+  | "start_pending"
+  | "start_synced"
+  | "end_pending"
+  | "synced"
+  | "start_error"
+  | "end_error";
+
+export type ActiveMeeting = {
+  deviceId: string;
+  idempotencyKey: string;
+  title: string;
+  reason: string;
+  startedAt: string;
+  expectedEndAt: string;
+  workSessionId: string | null;
+  projectId: string | null;
+  taskId: string | null;
+  syncState: MeetingSyncState;
+  lastError: string | null;
+};
+
+export type MeetingSummary = {
+  id: string;
+  idempotencyKey: string | null;
+  title: string;
+  reason: string;
+  startedAt: string;
+  expectedEndAt: string;
+  endedAt: string | null;
+  lifecycleState: "active" | "ended";
+  status: "pending" | "approved" | "rejected";
+  recordedSeconds: number;
+  approvedSeconds: number | null;
+  syncState: MeetingSyncState | null;
+  lastError: string | null;
+};
+
+export type AgentPeriodSummary = {
+  active_seconds: number;
+  tracked_active_seconds: number;
+  idle_seconds: number;
+  eligible_idle_seconds?: number;
+  tracked_seconds: number;
+  adjustment_seconds: number;
+  manual_approved_seconds: number;
+  manual_pending_seconds: number;
+  manual_rejected_seconds: number;
+  deducted_seconds: number;
+  screenshot_count: number;
+  points: number;
+};
+
+export type WorkdayTimeline = {
+  date: string;
+  timezone: string;
+  first_started_at: string | null;
+  last_ended_at: string | null;
+  last_activity_at: string | null;
+  is_running: boolean;
+  continued_from_previous_day?: boolean;
+  continued_session_started_at?: string | null;
+  worked_seconds: number;
+  idle_seconds: number;
+  locked_seconds: number;
+  sleeping_seconds: number;
+  untracked_seconds?: number;
+  break_seconds?: number;
+  manual_seconds?: number;
+  approved_leave?: boolean;
+  leave_seconds?: number;
+  intervals: Array<{
+    type: "worked" | "idle" | "locked" | "sleeping" | "untracked" | "break" | "manual";
+    started_at: string;
+    ended_at: string | null;
+    duration_seconds: number;
+    session_id: string | null;
+    project_name: string | null;
+    task_name: string | null;
+    is_current: boolean;
+    work_category?: "extra" | "break_work" | null;
+    break_paid?: boolean | null;
+    // Idle paid from the employee's saved break minutes.
+    saved_break_cover?: boolean;
+  }>;
+};
+
+export type IdleRequestPeriod = {
+  work_session_id: string;
+  started_at: string;
+  ended_at: string;
+  duration_seconds: number;
+  available_seconds: number;
+  project_name: string | null;
+  task_name: string | null;
+};
+
+export type AgentTask = {
+  id: string;
+  name: string;
+  description: string | null;
+  stage:
+    | "new_requests"
+    | "backlog"
+    | "assigned"
+    | "in_progress"
+    | "ready_for_review"
+    | "completed"
+    | "blocked"
+    | "rejected"
+    | "cancelled";
+  canUpdateStage: boolean;
+  projectId: string;
+  projectName: string;
+  teamId: string;
+  teamName: string;
+  reviewNote: string | null;
+  completionNote: string | null;
+  checklist: Array<{
+    id: string;
+    title: string;
+    completed: boolean;
+    position: number;
+    assigneeEmployeeId: string | null;
+  }>;
+  activeSeconds: number;
+  idleSeconds: number;
+  trackedSeconds: number;
+  priority?: "low" | "medium" | "high" | "urgent" | null;
+  deadline?: string | null;
+};
+
+export type RequestPolicy = {
+  timezone: string;
+  shift_start: string | null;
+  shift_end: string | null;
+  working_days: number[];
+  break_rules?: Array<{
+    name: string;
+    minutes: number;
+    paid: boolean;
+    start_time?: string | null;
+    end_time?: string | null;
+    // "dhuhr" / "asr": starts at today's adhan (times already filled in).
+    anchor?: "fixed" | "dhuhr" | "asr" | null;
+  }>;
+  approved_leave_today?: boolean;
+  approved_early_leave_from?: string | null;
+  // Flexible staff owe required_daily_minutes anywhere between shift_start and
+  // shift_end (their allowed window); older servers omit these (fixed shift).
+  schedule_type?: "fixed" | "flexible";
+  required_daily_minutes?: number;
+  break_bank_minutes?: number;
+  weekly_early_leave_minutes: number;
+  weekly_early_leave_used_minutes: number;
+  weekly_early_leave_remaining_minutes: number;
+};
+
+export type AgentProject = {
+  id: string;
+  name: string;
+  team_id: string;
+  team_name: string;
+};
+
+export type TimeAdjustmentRequest = {
+  id: string;
+  request_type: "idle_time" | "early_leave" | "manual_time";
+  requested_date: string;
+  source_start_at: string | null;
+  source_end_at: string | null;
+  work_session_id: string | null;
+  requested_minutes: number;
+  approved_minutes: number | null;
+  reason: string;
+  status: "pending" | "approved" | "rejected";
+  reviewed_at: string | null;
+  admin_note: string | null;
+  created_at: string;
+};
+
+export type LeaveRequest = {
+  id: string;
+  start_date: string;
+  end_date: string;
+  requested_days: number;
+  leave_type: "annual" | "sick" | "unpaid";
+  reason?: string | null;
+  status: "pending" | "approved" | "rejected";
+  reviewed_by_name?: string | null;
+  reviewed_at?: string | null;
+  created_at?: string;
+};
+
+export type LeaveBalance = {
+  year: number;
+  credit_days: number;
+  used_days: number;
+  pending_days: number;
+  remaining_days: number;
+};
+
+export type ShiftRescheduleRequest = {
+  id: string;
+  employee_id: string;
+  work_date: string;
+  requested_start: string;
+  requested_end: string;
+  original_start: string;
+  original_end: string;
+  duration_minutes: number;
+  reason: string;
+  status: "pending" | "approved" | "rejected" | "cancelled" | "expired";
+  source: "employee" | "admin";
+  reviewed_by_name: string | null;
+  reviewed_at: string | null;
+  review_reason: string | null;
+  created_at: string | null;
+};
+
+export type ShiftReschedulesPayload = {
+  policy: {
+    timezone: string;
+    notice_days: number;
+    earliest_date: string;
+    working_days: number[];
+    weekly_off_days: number[];
+  };
+  requests: ShiftRescheduleRequest[];
+};
+
+export type ShiftRescheduleDay = {
+  date: string;
+  scheduled_day: boolean;
+  shift_start: string | null;
+  shift_end: string | null;
+  shift_minutes: number;
+};
+
+export type LeaveRequestsPayload = {
+  balance: LeaveBalance;
+  requests: LeaveRequest[];
+};
+
+export type IdleAlert = {
+  id: string;
+  // "idle_started" is shown the moment idle is detected (at the threshold),
+  // without waiting for input to return, so a mistaken detection can be
+  // corrected immediately. "idle_return" is the legacy on-return review.
+  kind: "idle_return" | "tracking_start" | "idle_started" | "manual_pause_reminder";
+  lostSeconds: number;
+  eligibleLostSeconds: number;
+  outsideScheduledShift: boolean;
+  endedAt: string;
+};
+
+export type RecentScreenshot = {
+  id: string;
+  capturedAt: string;
+  displayName: string | null;
+  dataUrl: string;
+};
+
+export type DiagnosticsSnapshot = {
+  capturedAt: string;
+  appVersion: string;
+  environment: string;
+  platform: string;
+  apiBaseUrl: string;
+  employeeName: string;
+  deviceName: string;
+  enrolled: boolean;
+  connectionStatus: "online" | "offline";
+  lastSuccessfulSyncAt: string | null;
+  network: {
+    requests: number;
+    failures: number;
+    retries: number;
+    recoveredByRetry: number;
+    lastSuccessAt: string | null;
+    lastFailureAt: string | null;
+    lastErrorCode: string | null;
+  };
+  unsynced: {
+    pendingEvents: number;
+    pendingScreenshots: number;
+    openSessions: number;
+  };
+  logFile: string;
+};
+
+declare global {
+  interface Window {
+    khaliduo?: {
+      getAgentStatus: () => Promise<AgentStatus>;
+      syncNow: () => Promise<{ success: boolean }>;
+      onStatusChanged: (callback: (status: AgentStatus) => void) => () => void;
+      enrollWithCredentials: (
+        email: string,
+        password: string,
+      ) => Promise<{ success: boolean; message?: string }>;
+      pauseTracking: (options?: {
+        requestedMinutes?: number;
+        reason?: string;
+        source?: "tracker_control" | "tray" | "window_close" | "idle_alert";
+      }) => Promise<{ success: boolean; message?: string }>;
+      resumeTracking: () => Promise<{ success: boolean; message?: string }>;
+      resumeAutomaticIdle: () => Promise<{
+        success: boolean;
+        message?: string;
+      }>;
+      startMeeting: (input: {
+        title: string;
+        reason: string;
+        expectedEndMinutes: number;
+        projectId?: string | null;
+        taskId?: string | null;
+      }) => Promise<{ success: boolean; message?: string }>;
+      endMeeting: () => Promise<{ success: boolean; message?: string }>;
+      refreshMeetings: () => Promise<MeetingSummary[]>;
+      retryMeetingSync: () => Promise<{ success: boolean }>;
+      confirmTrackingStart: () => Promise<{
+        success: boolean;
+        message?: string;
+      }>;
+      declineTrackingStart: () => Promise<{
+        success: boolean;
+        message?: string;
+      }>;
+      logout: () => Promise<{ success: boolean; message?: string }>;
+      openEmployeeDashboard: (section?: "screenshots") => Promise<{
+        success: boolean;
+        message?: string;
+      }>;
+      getRecentScreenshots: () => Promise<{
+        success: boolean;
+        message?: string;
+        screenshots: RecentScreenshot[];
+      }>;
+      setCurrentTask: (taskId: string | null) => Promise<{
+        success: boolean;
+        message?: string;
+        status?: AgentStatus;
+      }>;
+      createTask: (options: {
+        name: string;
+        projectId?: string;
+        description?: string;
+        stage?: "assigned";
+        startDate?: string;
+        deadline?: string;
+        estimatedMinutes?: number;
+      }) => Promise<{
+        success: boolean;
+        message?: string;
+        status?: AgentStatus;
+      }>;
+      updateTaskStage: (
+        taskId: string,
+        stage: "assigned" | "in_progress" | "ready_for_review" | "blocked",
+        note?: string,
+      ) => Promise<{
+        success: boolean;
+        message?: string;
+        status?: AgentStatus;
+      }>;
+      createTaskChecklistItem: (
+        taskId: string,
+        title: string,
+      ) => Promise<{
+        success: boolean;
+        message?: string;
+        status?: AgentStatus;
+      }>;
+      updateTaskChecklistItem: (
+        taskId: string,
+        itemId: string,
+        completed: boolean,
+      ) => Promise<{
+        success: boolean;
+        message?: string;
+        status?: AgentStatus;
+      }>;
+      deleteTaskChecklistItems: (
+        taskId: string,
+        itemIds: string[],
+      ) => Promise<{
+        success: boolean;
+        message?: string;
+        status?: AgentStatus;
+      }>;
+      onIdleAlert: (callback: (alert: IdleAlert) => void) => () => void;
+      onRequiredUpdate: (
+        callback: (update: { version: string | null }) => void,
+      ) => () => void;
+      installUpdate: () => Promise<{ success: boolean; message?: string }>;
+      createTimeAdjustmentRequest: (input: {
+        requestedMinutes: number;
+        reason: string;
+        requestType?: "idle_time" | "early_leave" | "manual_time" | "delayed_break";
+        requestedDate?: string;
+        workSessionId?: string;
+        sourceStartAt?: string;
+        sourceEndAt?: string;
+        requestedLeaveTime?: string;
+      }) => Promise<{
+        success: boolean;
+        message?: string;
+        request?: TimeAdjustmentRequest;
+        status?: AgentStatus;
+      }>;
+      createLeaveRequest: (input: {
+        startDate: string;
+        endDate: string;
+        leaveType?: "annual" | "sick" | "unpaid";
+        reason?: string;
+      }) => Promise<{
+        success: boolean;
+        message?: string;
+        request?: LeaveRequest;
+        status?: AgentStatus;
+      }>;
+      listShiftReschedules: () => Promise<{
+        success: boolean;
+        message?: string;
+        data?: ShiftReschedulesPayload;
+      }>;
+      getShiftRescheduleDay: (workDate: string) => Promise<{
+        success: boolean;
+        message?: string;
+        data?: ShiftRescheduleDay;
+      }>;
+      createShiftReschedule: (input: {
+        workDate: string;
+        requestedStart: string;
+        requestedEnd: string;
+        reason: string;
+      }) => Promise<{
+        success: boolean;
+        message?: string;
+        request?: ShiftRescheduleRequest;
+      }>;
+      cancelShiftReschedule: (requestId: string) => Promise<{
+        success: boolean;
+        message?: string;
+        request?: ShiftRescheduleRequest;
+      }>;
+      setIdleAlertAttention: (active: boolean) => void;
+      setUpdateAttention: (active: boolean) => void;
+      diagnosticsConfig: () => Promise<{ enabled: boolean; trigger: string }>;
+      diagnosticsUnlock: (
+        passcode: string,
+      ) => Promise<{ ok: boolean; snapshot?: DiagnosticsSnapshot }>;
+      diagnosticsSnapshot: () => Promise<DiagnosticsSnapshot | null>;
+      diagnosticsResync: () => Promise<{
+        success: boolean;
+        snapshot?: DiagnosticsSnapshot;
+      }>;
+      diagnosticsExportLogs: () => Promise<{ saved: boolean; path?: string }>;
+      minimizeWindow: () => Promise<void>;
+      toggleMaximizeWindow: () => Promise<void>;
+      closeWindow: () => Promise<void>;
+      checkForUpdates: () => Promise<{ success: boolean; message?: string }>;
+    };
+  }
+}

@@ -1,0 +1,46 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { csvCell, formatAttendanceStart, formatDurationSeconds, formatSessionStatus } from "./format.ts";
+
+test("a historical recovery never replaces today's attendance start", () => {
+  assert.equal(formatAttendanceStart(
+    "2026-11-25T07:32:27.126Z", "Africa/Cairo", true, "2026-08-04T08:40:22.692Z",
+  ), "9:32 AM");
+  assert.equal(formatAttendanceStart(
+    "2026-11-22T08:26:06.898Z", "Africa/Cairo", true, "2026-08-04T07:35:14.694Z",
+  ), "10:26 AM");
+});
+
+test("short recorded intervals remain visible instead of rounding to zero minutes", () => {
+  assert.equal(formatDurationSeconds(0), "0m");
+  assert.equal(formatDurationSeconds(1), "1s");
+  assert.equal(formatDurationSeconds(59), "59s");
+  assert.equal(formatDurationSeconds(60), "1m");
+  assert.equal(formatDurationSeconds(3665), "1h 1m");
+});
+
+test("an open session is never presented as a morning sign-out", () => {
+  assert.equal(formatSessionStatus(true, null, "Africa/Cairo"), "Still running - no sign-out yet");
+  assert.equal(formatSessionStatus(false, null, "Africa/Cairo"), "No sign-out recorded");
+  assert.equal(formatSessionStatus(false, "2026-08-03T09:30:00Z", "UTC"), "Signed out 9:30 AM");
+});
+
+
+test("csvCell neutralizes spreadsheet formula injection (W10)", () => {
+  assert.equal(csvCell("=1+1"), "'=1+1");
+  assert.equal(csvCell("+1+1"), "'+1+1");
+  assert.equal(csvCell("@SUM(A1:A9)"), "'@SUM(A1:A9)");
+  assert.equal(csvCell("-1+1"), "'-1+1");
+  // Formula lead + embedded quote: prefix, then standard CSV quote-doubling.
+  assert.equal(csvCell('=HYPERLINK("x")'), `"'=HYPERLINK(""x"")"`);
+});
+
+test("csvCell preserves genuine numbers, negatives, and dates (W10)", () => {
+  assert.equal(csvCell(-100.5), "-100.5");
+  assert.equal(csvCell("-100.5"), "-100.5");
+  assert.equal(csvCell(1234), "1234");
+  assert.equal(csvCell("2026-09-14"), "2026-09-14");
+  assert.equal(csvCell("Acme, Inc"), '"Acme, Inc"');
+  assert.equal(csvCell(null), "");
+});

@@ -1,0 +1,426 @@
+import {
+  Activity,
+  CalendarDays,
+  CircleCheck,
+  Coffee,
+  LockKeyhole,
+  Moon,
+  WifiOff,
+} from "lucide-react";
+
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import type { WorkdayIntervalType, WorkdayTimeline as WorkdayTimelineData } from "@/types";
+import {
+  formatAttendanceStart,
+  formatClock,
+  formatDurationSeconds,
+  formatSessionStatus,
+} from "@/lib/format";
+
+type DisplayIntervalType = WorkdayIntervalType | "break_work" | "extra" | "leave" | "saved_break";
+
+const intervalStyles: Record<
+  DisplayIntervalType,
+  { label: string; bar: string; badge: string; icon: typeof Activity }
+> = {
+  worked: {
+    label: "Worked",
+    bar: "bg-emerald-500",
+    badge: "bg-emerald-500/10 text-emerald-700",
+    icon: Activity,
+  },
+  extra: {
+    label: "Overtime",
+    bar: "bg-fuchsia-500 dark:bg-pink-400",
+    badge: "bg-fuchsia-500/15 text-fuchsia-700 dark:bg-pink-500/15 dark:text-pink-300",
+    icon: Activity,
+  },
+  break_work: {
+    label: "Worked during break",
+    bar: "bg-violet-500",
+    badge: "bg-violet-500/15 text-violet-800",
+    icon: Activity,
+  },
+  idle: {
+    label: "Idle",
+    bar: "bg-amber-400",
+    badge: "bg-amber-400/15 text-amber-800",
+    icon: Coffee,
+  },
+  saved_break: {
+    label: "Saved break used",
+    bar: "bg-teal-500",
+    badge: "bg-teal-500/15 text-teal-700 dark:text-teal-300",
+    icon: Coffee,
+  },
+  break: {
+    label: "Break",
+    bar: "bg-violet-400",
+    badge: "bg-violet-500/15 text-violet-700 dark:text-violet-300",
+    icon: Coffee,
+  },
+  manual: {
+    label: "Manual approved",
+    bar: "bg-sky-500",
+    badge: "bg-sky-500/15 text-sky-700 dark:text-sky-300",
+    icon: CircleCheck,
+  },
+  locked: {
+    label: "Locked",
+    bar: "bg-slate-400",
+    badge: "bg-slate-500/10 text-slate-700",
+    icon: LockKeyhole,
+  },
+  sleeping: {
+    label: "Sleeping",
+    bar: "bg-indigo-400",
+    badge: "bg-indigo-500/10 text-indigo-700",
+    icon: Moon,
+  },
+  untracked: {
+    label: "Untracked",
+    bar: "bg-rose-500",
+    badge: "bg-rose-500/10 text-rose-700 dark:text-rose-300",
+    icon: WifiOff,
+  },
+  leave: {
+    label: "Leave",
+    bar: "bg-sky-400",
+    badge: "bg-sky-500/10 text-sky-700",
+    icon: CalendarDays,
+  },
+};
+
+function resolveDisplayType(
+  intervalType: WorkdayIntervalType,
+  workCategory: "extra" | "break_work" | null | undefined,
+  approvedLeave: boolean,
+  savedBreakCover?: boolean,
+): DisplayIntervalType {
+  if (approvedLeave) {
+    return intervalType === "worked" ? "extra" : "leave";
+  }
+  if (intervalType === "idle" && savedBreakCover) {
+    return "saved_break";
+  }
+  if (intervalType === "worked" && workCategory === "break_work") {
+    return "break_work";
+  }
+  if (intervalType === "worked" && workCategory === "extra") {
+    return "extra";
+  }
+  return intervalType;
+}
+
+export type PayableBreakdown = {
+  paidLateAllowanceSeconds: number;
+  deductibleLateSeconds: number;
+  approvedDelayedBreakSeconds: number;
+  approvedMeetingSeconds: number;
+  pendingMeetingSeconds: number;
+};
+
+type BreakdownSegment = {
+  key: string;
+  label: string;
+  seconds: number;
+  bar: string;
+  badge: string;
+  paid: boolean;
+};
+
+// Phase-1 financial-policy classifications are derived daily-attendance
+// overlays (not exclusive per-second intervals), so they render as their own
+// proportional breakdown bar rather than mixing into the activity timeline.
+function buildBreakdownSegments(financials: PayableBreakdown): BreakdownSegment[] {
+  return [
+    {
+      key: "paid_late",
+      label: "Paid late allowance",
+      seconds: financials.paidLateAllowanceSeconds,
+      bar: "bg-teal-500",
+      badge: "bg-teal-500/15 text-teal-700 dark:text-teal-300",
+      paid: true,
+    },
+    {
+      key: "delayed_break",
+      label: "Delayed break (paid)",
+      seconds: financials.approvedDelayedBreakSeconds,
+      bar: "bg-violet-500",
+      badge: "bg-violet-500/15 text-violet-800 dark:text-violet-300",
+      paid: true,
+    },
+    {
+      key: "meeting_approved",
+      label: "Meeting (approved)",
+      seconds: financials.approvedMeetingSeconds,
+      bar: "bg-blue-500",
+      badge: "bg-blue-500/15 text-blue-700 dark:text-blue-300",
+      paid: true,
+    },
+    {
+      key: "meeting_pending",
+      label: "Meeting (pending)",
+      seconds: financials.pendingMeetingSeconds,
+      bar: "bg-blue-300 dark:bg-blue-400/60",
+      badge: "bg-blue-400/15 text-blue-600 dark:text-blue-300",
+      paid: true,
+    },
+    {
+      key: "excess_late",
+      label: "Excess lateness (unpaid)",
+      seconds: financials.deductibleLateSeconds,
+      bar: "bg-rose-500",
+      badge: "bg-rose-500/15 text-rose-700 dark:text-rose-300",
+      paid: false,
+    },
+  ].filter((segment) => segment.seconds > 0);
+}
+
+function PayableBreakdownBar({ financials }: { financials: PayableBreakdown }) {
+  const segments = buildBreakdownSegments(financials);
+  if (segments.length === 0) {
+    return null;
+  }
+  const totalSeconds = Math.max(
+    1,
+    segments.reduce((total, segment) => total + segment.seconds, 0),
+  );
+  return (
+    <div className="space-y-2">
+      <span className="block text-xs font-medium text-muted-foreground">Payable adjustments</span>
+      <div
+        className="flex h-3 overflow-hidden rounded-sm bg-muted"
+        aria-label="Payable adjustments bar"
+      >
+        {segments.map((segment) => (
+          <span
+            key={segment.key}
+            className={segment.bar}
+            style={{ width: `${(segment.seconds / totalSeconds) * 100}%` }}
+            title={`${segment.label}: ${formatDurationSeconds(segment.seconds)}`}
+          />
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {segments.map((segment) => (
+          <span
+            key={segment.key}
+            className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-xs font-medium ${segment.badge}`}
+          >
+            <span className={`h-2 w-2 rounded-full ${segment.bar}`} />
+            {segment.label}
+            <strong className="font-mono">{formatDurationSeconds(segment.seconds)}</strong>
+          </span>
+        ))}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        These are payable-policy overlays on the activity above: paid late allowance, delayed-break
+        claims, and approved/pending meeting time are paid; excess lateness is the unpaid remainder
+        after the allowance.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * The day's activity as one proportional bar. Hovering (or focusing) a part
+ * shows what it was, when it ran, how long it lasted and the task worked on.
+ */
+export function WorkdayActivityBar({
+  timeline,
+  className = "h-3",
+}: {
+  timeline: WorkdayTimelineData;
+  className?: string;
+}) {
+  const visibleSeconds = Math.max(
+    1,
+    timeline.intervals.reduce((total, interval) => total + interval.durationSeconds, 0),
+  );
+  return (
+    <TooltipProvider delayDuration={0} disableHoverableContent>
+      <div
+        className={`flex overflow-hidden rounded-sm bg-muted ${className}`}
+        aria-label="Workday activity bar"
+      >
+        {timeline.intervals.map((interval, index) => {
+          const displayType = resolveDisplayType(
+            interval.type,
+            interval.workCategory,
+            timeline.approvedLeave,
+            interval.savedBreakCover,
+          );
+          const style = intervalStyles[displayType];
+          const Icon = style.icon;
+          const showsTask =
+            displayType === "worked" || displayType === "extra" || displayType === "break_work";
+          const taskLabel = showsTask ? (interval.taskName ?? interval.projectName) : undefined;
+          return (
+            <Tooltip key={`${interval.sessionId}-${interval.startedAt}-${index}`}>
+              <TooltipTrigger asChild>
+                <span
+                  tabIndex={0}
+                  aria-label={`${style.label}: ${formatDurationSeconds(interval.durationSeconds)}`}
+                  className={`${style.bar} h-full transition-opacity hover:opacity-75 focus-visible:opacity-75 focus-visible:outline-none`}
+                  style={{ width: `${(interval.durationSeconds / visibleSeconds) * 100}%` }}
+                />
+              </TooltipTrigger>
+              <TooltipContent className="border bg-popover text-popover-foreground shadow-md">
+                <span
+                  className={`inline-flex items-center gap-1.5 rounded px-1.5 py-0.5 font-medium ${style.badge}`}
+                >
+                  <Icon className="h-3.5 w-3.5" />
+                  {style.label}
+                </span>
+                <span className="mt-1.5 block font-mono">
+                  {formatClock(interval.startedAt, timeline.timezone)} –{" "}
+                  {interval.endedAt
+                    ? formatClock(interval.endedAt, timeline.timezone)
+                    : "Until now"}
+                  <strong className="ml-2">
+                    {formatDurationSeconds(interval.durationSeconds)}
+                  </strong>
+                </span>
+                {taskLabel && (
+                  <span className="mt-0.5 block max-w-64 truncate text-muted-foreground">
+                    {taskLabel}
+                  </span>
+                )}
+              </TooltipContent>
+            </Tooltip>
+          );
+        })}
+      </div>
+    </TooltipProvider>
+  );
+}
+
+export function WorkdayTimeline({
+  timeline,
+  financials,
+}: {
+  timeline?: WorkdayTimelineData;
+  financials?: PayableBreakdown;
+}) {
+  if (!timeline || timeline.intervals.length === 0) {
+    if (timeline?.approvedLeave) {
+      return (
+        <div className="rounded-md border border-sky-200 bg-sky-50 px-3 py-3 text-sm text-sky-800">
+          Approved leave · no tracked activity for this day.
+        </div>
+      );
+    }
+    return (
+      <p className="py-8 text-center text-sm text-muted-foreground">
+        No tracked activity for this day.
+      </p>
+    );
+  }
+
+  const overtimeSeconds = timeline.intervals.reduce(
+    (total, interval) =>
+      total +
+      (interval.type === "worked" && interval.workCategory === "extra"
+        ? interval.durationSeconds
+        : 0),
+    0,
+  );
+  const regularWorkedSeconds = Math.max(0, timeline.workedSeconds - overtimeSeconds);
+
+  return (
+    <div className="space-y-4">
+      <div
+        className={`grid grid-cols-2 gap-3 text-sm ${
+          overtimeSeconds > 0 ? "md:grid-cols-7" : "md:grid-cols-6"
+        }`}
+      >
+        <Metric
+          label="First start"
+          value={formatAttendanceStart(
+            timeline.firstStartedAt,
+            timeline.timezone,
+            timeline.continuedFromPreviousDay,
+            timeline.continuedSessionStartedAt,
+          )}
+        />
+        <Metric
+          label="Last activity"
+          value={formatClock(timeline.lastActivityAt, timeline.timezone)}
+        />
+        <Metric
+          label="Session"
+          value={formatSessionStatus(timeline.isRunning, timeline.lastEndedAt, timeline.timezone)}
+        />
+        <Metric label="Regular worked" value={formatDurationSeconds(regularWorkedSeconds)} />
+        {overtimeSeconds > 0 && (
+          <Metric label="Overtime" value={formatDurationSeconds(overtimeSeconds)} />
+        )}
+        <Metric
+          label={timeline.approvedLeave ? "Leave" : "Timeline idle"}
+          value={formatDurationSeconds(
+            timeline.approvedLeave ? timeline.leaveSeconds : timeline.idleSeconds,
+          )}
+        />
+        <Metric label="Untracked" value={formatDurationSeconds(timeline.untrackedSeconds)} />
+      </div>
+
+      <WorkdayActivityBar timeline={timeline} />
+
+      <p className="text-xs text-muted-foreground">
+        Untracked is a gap with no device evidence, so it is not counted as worked or idle. Timeline
+        idle shows recorded device inactivity; requestable or deductible idle can be lower because
+        paid grace, breaks, off-shift time, and periods shorter than one minute are excluded.
+      </p>
+
+      {financials && <PayableBreakdownBar financials={financials} />}
+
+      <div className="divide-y rounded-md border">
+        {timeline.intervals.map((interval, index) => {
+          const displayType = resolveDisplayType(
+            interval.type,
+            interval.workCategory,
+            timeline.approvedLeave,
+            interval.savedBreakCover,
+          );
+          const style = intervalStyles[displayType];
+          const Icon = style.icon;
+          return (
+            <div
+              key={`${interval.sessionId}-${interval.startedAt}-${index}`}
+              className="grid min-h-14 items-center gap-2 px-3 py-2 text-sm sm:grid-cols-[150px_110px_1fr_70px]"
+            >
+              <span className="font-mono text-xs">
+                {formatClock(interval.startedAt, timeline.timezone)} -{" "}
+                {interval.endedAt ? formatClock(interval.endedAt, timeline.timezone) : "Until now"}
+              </span>
+              <span
+                className={`inline-flex w-fit items-center gap-1.5 rounded px-2 py-1 text-xs font-medium ${style.badge}`}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {style.label}
+              </span>
+              <span className="min-w-0 truncate text-muted-foreground">
+                {displayType === "worked" || displayType === "extra" || displayType === "break_work"
+                  ? (interval.taskName ?? interval.projectName ?? "-")
+                  : "-"}
+              </span>
+              <strong className="text-right text-xs">
+                {formatDurationSeconds(interval.durationSeconds)}
+              </strong>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <span className="block text-xs text-muted-foreground">{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}

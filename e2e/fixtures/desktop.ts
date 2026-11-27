@@ -1,0 +1,266 @@
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { _electron, expect, type ElectronApplication, type Page } from "@playwright/test";
+import { DEAD_PORT, DESKTOP_API_URL, DESKTOP_DIR, PROXY_PORT, SEED_FILE, WEB_URL, assertIsolated, readJson } from "../lib/env.ts";
+
+const ELECTRON_EXE = path.join(DESKTOP_DIR, "node_modules", "electron", "dist", "electron.exe");
+const MAIN_JS = path.join(DESKTOP_DIR, "dist-electron-khaliduo", "main.js");
+
+/** A throwaway Windows profile for one simulated computer (kept across relaunches). */
+export function newDesktopProfile(name: string) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `khaliduo-e2e-${name}-`));
+  const dirs = {
+    root,
+    userData: path.join(root, "userData"),
+    appData: path.join(root, "AppData", "Roaming"),
+    localAppData: path.join(root, "AppData", "Local"),
+  };
+  for (const dir of Object.values(dirs)) fs.mkdirSync(dir, { recursive: true });
+  return dirs;
+}
+export type DesktopProfile = ReturnType<typeof newDesktopProfile>;
+
+export type Desktop = Awaited<ReturnType<typeof launchDesktop>>;
+
+/** Everything `_electron.launch` needs to start the app on `profile`. */
+export function desktopLaunchOptions(profile: DesktopProfile, extraEnv: Record<string, string> = {}) {
+  if (!fs.existsSync(MAIN_JS)) {
+    throw new Error("Desktop app is not built. Run `npm run build:desktop` in e2e/ first.");
+  }
+  if (!fs.existsSync(ELECTRON_EXE)) throw new Error("Electron runtime is missing. Run the unified runner or node frontend/desktop-agent/node_modules/electron/install.js.");
+  const env: Record<string, string> = {
+    SYSTEMROOT: process.env.SYSTEMROOT ?? "C:\\Windows",
+    SystemDrive: process.env.SystemDrive ?? "C:",
+    WINDIR: process.env.WINDIR ?? "C:\\Windows",
+    COMSPEC: process.env.COMSPEC ?? "C:\\Windows\\System32\\cmd.exe",
+    ProgramData: process.env.ProgramData ?? "C:\\ProgramData",
+    PATHEXT: process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD",
+    PATH: process.env.PATH ?? "",
+    TEMP: process.env.TEMP ?? os.tmpdir(),
+    TMP: process.env.TMP ?? os.tmpdir(),
+    USERPROFILE: profile.root,
+    APPDATA: profile.appData,
+    LOCALAPPDATA: profile.localAppData,
+    KHALIDUO_E2E_USER_DATA_DIR: profile.userData,
+    KHALIDUO_E2E_DISABLE_INPUT_PROBE: "1",
+    // The localhost geolocation service cannot verify a country. Match the
+    // seeded shift zone explicitly instead of inheriting the CI VM's UTC zone.
+    // TZ affects this Electron process only; Windows settings stay CHANGE_ME.
+    TZ: readJson<{ timezone: string }>(SEED_FILE).timezone,
+    // Every key in frontend/desktop-agent/.env is set here: dotenv never
+    // overrides a variable that already exists, so the dev .env cannot leak in.
+    VITE_API_BASE_URL: DESKTOP_API_URL,
+    KHALIDUO_EMPLOYEE_PORTAL_URL: `${WEB_URL}/employee`,
+    KHALIDUO_UPDATE_URL: `http://127.0.0.1:${DEAD_PORT}`,
+    UPDATE_CHECK_INTERVAL_MINUTES: "1440",
+    HEARTBEAT_INTERVAL_SECONDS: "10",
+    CONFIG_REFRESH_INTERVAL_MINUTES: "1",
+    LOG_LEVEL: "info",
+    ...extraEnv,
+  };
+  assertIsolated({ VITE_API_BASE_URL: env.VITE_API_BASE_URL, KHALIDUO_EMPLOYEE_PORTAL_URL: env.KHALIDUO_EMPLOYEE_PORTAL_URL });
+  return {
+    executablePath: ELECTRON_EXE,
+    args: ["--disable-features=CalculateNativeWinOcclusion", "--disable-renderer-backgrounding", "--disable-background-timer-throttling", DESKTOP_DIR],
+    cwd: DESKTOP_DIR, env, timeout: 60_000,
+  };
+}
+
+export async function launchDesktop(profile: DesktopProfile, extraEnv: Record<string, string> = {}) {
+  const options = desktopLaunchOptions(profile, extraEnv);
+  const app = await _electron.launch(options);
+  expect(await app.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone),
+    "Electron timezone must match the explicit test fixture").toBe(options.env.TZ);
+  // Install the native seams before the app's first idle poll (250 ms).
+  await installSeams(app, process.env.E2E_FOREGROUND !== "1");
+  const window = await app.firstWindow({ timeout: 30_000 });
+  await app.evaluate(({ BrowserWindow }) => {
+    for (const win of BrowserWindow.getAllWindows()) win.webContents.setBackgroundThrottling(false);
+  });
+  const pageErrors: string[] = [];
+  const consoleLog: string[] = [];
+  window.on("pageerror", (error) => pageErrors.push(error.message));
+  window.on("console", (message) => consoleLog.push(`${new Date().toISOString()} ${message.type()}: ${message.text()}`));
+  await window.waitForLoadState("domcontentloaded");
+  await expect(window.locator("#root")).not.toBeEmpty({ timeout: 20_000 });
+  const testBadge = () => window.evaluate(() => {
+    document.title = "KHALIDUO TEST — Local test account";
+    if (document.getElementById("khaliduo-test-badge")) return;
+    const badge = document.createElement("div");
+    badge.id = "khaliduo-test-badge";
+    badge.textContent = "TEST ONLY · Local database · حساب تجريبي منفصل عن حسابك الحقيقي";
+    Object.assign(badge.style, { position: "fixed", bottom: "0", left: "0", right: "0", zIndex: "2147483647", background: "#fbbf24", color: "#111827", textAlign: "center", font: "bold 14px sans-serif", padding: "7px", pointerEvents: "none" });
+    document.body.appendChild(badge);
+  });
+  window.on("load", () => void testBadge().catch(() => {}));
+  await testBadge();
+  await app.context().tracing.start({ screenshots: true, snapshots: true, sources: true });
+  // Diagnostics: every idle/tracking alert the main process raises, with the
+  // renderer clock, lands in consoleLog (attached to failing tests).
+  // Re-registered on every load: the renderer reloads after sign-in.
+  const logAlerts = () =>
+    window
+      .evaluate(() =>
+        (window as any).khaliduo.onIdleAlert?.((alert: unknown) => console.log(`[e2e] idle-alert ${JSON.stringify(alert)}`)),
+      )
+      .catch(() => {});
+  window.on("load", () => void logAlerts());
+  await logAlerts();
+
+  const desktop = {
+    app,
+    window,
+    profile,
+    pageErrors,
+    consoleLog,
+    /** Runtime status straight from the main process (window.khaliduo bridge). */
+    status: () => window.evaluate(() => (window as any).khaliduo.getAgentStatus()) as Promise<any>,
+    syncNow: () => window.evaluate(() => (window as any).khaliduo.syncNow()),
+    /** Simulate the user walking away `alreadyIdleSeconds` ago; idle keeps growing. */
+    goIdle: (alreadyIdleSeconds: number) =>
+      app.evaluate((_electron, seconds) => {
+        (globalThis as any).__e2eIdleSince = Date.now() - seconds * 1000;
+      }, alreadyIdleSeconds),
+    /** Simulate keyboard/mouse input: OS idle time drops to zero and stays there. */
+    becomeActive: () =>
+      app.evaluate(() => {
+        (globalThis as any).__e2eIdleSince = null;
+      }),
+    powerEvent: (name: "lock-screen" | "unlock-screen" | "suspend" | "resume") =>
+      app.evaluate(({ powerMonitor }, event) => powerMonitor.emit(event), name),
+    /** Answer the next native message box with button `index`. */
+    answerNextDialog: (index: number) =>
+      app.evaluate((_electron, response) => {
+        (globalThis as any).__e2eDialogAnswers.push(response);
+      }, index),
+    openedUrls: () => app.evaluate(() => [...(globalThis as any).__e2eOpenedUrls] as string[]),
+    dialogLog: () => app.evaluate(() => [...(globalThis as any).__e2eDialogLog] as any[]),
+    saveTrace: (tracePath: string) => app.context().tracing.stop({ path: tracePath }),
+    isWindowVisible: () => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().some((w: { isVisible(): boolean }) => w.isVisible())),
+    showWindow: () =>
+      app.evaluate(({ BrowserWindow }) => {
+        const w = BrowserWindow.getAllWindows()[0];
+        w?.show();
+        w?.focus();
+      }),
+    /** Quit the way the tray's "Quit Khaliduo" does, then wait for the process to exit. */
+    quit: async (timeoutMs = 25_000) => {
+      const child = app.process();
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      await app.evaluate(({ app: electronApp }) => electronApp.quit()).catch(() => {});
+      await Promise.race([exited, new Promise((_, reject) => setTimeout(() => reject(new Error("desktop did not quit in time")), timeoutMs))]);
+    },
+    /** Hard stop for teardown (the app's before-quit handler can defer a graceful close). */
+    kill: () => killTree(app),
+  };
+  return desktop;
+}
+
+async function installSeams(app: ElectronApplication, background: boolean) {
+  await app.evaluate(({ powerMonitor, dialog, shell, BrowserWindow, app: electronApp }, suppressFocus) => {
+    const g = globalThis as any;
+    if (g.__e2eSeams) return;
+    g.__e2eSeams = true;
+    if (suppressFocus) {
+      // Keep local test windows behind the developer's real app. The dedicated
+      // CI VM sets E2E_FOREGROUND=1 to exercise the actual activation behavior.
+      const showInactive = BrowserWindow.prototype.showInactive;
+      BrowserWindow.prototype.show = function () {
+        this.setFocusable(false);
+        this.setIgnoreMouseEvents(true);
+        showInactive.call(this);
+      };
+      BrowserWindow.prototype.focus = () => {};
+      BrowserWindow.prototype.moveTop = () => {};
+      BrowserWindow.prototype.setAlwaysOnTop = () => {};
+      electronApp.focus = () => {};
+      // Showing inactive alone does not prevent a renderer click or Windows
+      // activation from delivering the developer's Enter key to an idle alert.
+      // CDP input still drives the tests; physical input stays with the real app.
+      for (const win of BrowserWindow.getAllWindows()) {
+        win.setFocusable(false);
+        win.setIgnoreMouseEvents(true);
+        win.blur();
+      }
+    }
+    // OS idle clock (used when the native input probe is absent, as in a dev build).
+    g.__e2eIdleSince = null;
+    powerMonitor.getSystemIdleTime = () =>
+      g.__e2eIdleSince == null ? 0 : Math.max(0, Math.floor((Date.now() - g.__e2eIdleSince) / 1000));
+    // Native, blocking message boxes cannot be clicked by Playwright; answer them.
+    g.__e2eDialogAnswers = [] as number[];
+    g.__e2eDialogLog = [] as unknown[];
+    const answer = (...args: any[]) => {
+      const options = args.find((a) => a && typeof a === "object" && "buttons" in a) ?? args[args.length - 1];
+      g.__e2eDialogLog.push({ title: options?.title, message: options?.message, buttons: options?.buttons });
+      const response = g.__e2eDialogAnswers.length ? g.__e2eDialogAnswers.shift() : (options?.cancelId ?? 0);
+      return { response, checkboxChecked: false };
+    };
+    dialog.showMessageBox = (async (...args: any[]) => answer(...args)) as any;
+    dialog.showMessageBoxSync = ((...args: any[]) => answer(...args).response) as any;
+    // Links the app opens in the system browser are recorded, not opened; the
+    // test replays them in its own browser (e.g. the employee-portal handoff).
+    g.__e2eOpenedUrls = [] as string[];
+    shell.openExternal = (async (url: string) => {
+      g.__e2eOpenedUrls.push(url);
+    }) as any;
+  }, background);
+}
+
+export function killTree(app: ElectronApplication) {
+  const pid = app.process()?.pid;
+  if (!pid) return;
+  try {
+    execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+  } catch {
+    /* already gone */
+  }
+}
+
+// ---------------------------------------------------------------- UI helpers
+
+export async function signIn(window: Page, email: string, password: string) {
+  await window.locator('input[type="email"]').fill(email);
+  await window.locator('input[type="password"]').fill(password);
+  await window.getByRole("button", { name: "Sign in and link device" }).click();
+}
+
+/** The SweetAlert2 popup currently on screen. */
+export function swal(window: Page) {
+  const popup = window.locator(".swal2-popup.swal2-show, .swal2-popup:visible").first();
+  return {
+    popup,
+    title: popup.locator(".swal2-title"),
+    click: async (name: string | RegExp) => {
+      try {
+        await popup.getByRole("button", { name }).click();
+      } catch (error) {
+        // beforeAll failures otherwise lose the Electron DOM/status diagnostics.
+        console.error("[e2e] dialog failure", await window.evaluate(async () => ({
+          body: document.body.innerText,
+          status: await (window as any).khaliduo.getAgentStatus(),
+        })).catch(() => "renderer unavailable"));
+        throw error;
+      }
+    },
+  };
+}
+
+export async function nav(window: Page, view: "Tracker" | "Tasks" | "Requests" | "Meeting" | "Settings") {
+  // A request dialog stays open after submitting and covers the header; close it first.
+  const openDialog = window.locator(".k-request-form-shell");
+  if (await openDialog.count()) {
+    await openDialog.getByRole("button", { name: "Close request" }).first().click();
+    await expect(openDialog).toHaveCount(0);
+  }
+  await window.getByRole("navigation", { name: "Primary navigation" }).getByRole("button", { name: view, exact: true }).click();
+}
+
+// ---------------------------------------------------------------- network switch
+
+export async function setNetwork(mode: { kind: "online" } | { kind: "offline" } | { kind: "status"; status: number; pathPrefix: string } | { kind: "drop_response"; pathPrefix: string; remaining: number }) {
+  const response = await fetch(`http://127.0.0.1:${PROXY_PORT}/__e2e/mode`, { method: "POST", body: JSON.stringify(mode) });
+  return response.json();
+}
